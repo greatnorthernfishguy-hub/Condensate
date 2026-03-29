@@ -30,7 +30,7 @@ GRAPH = None
 MODEL_NAME = "gpt2-large"
 
 
-@spaces.GPU(duration=120)
+@spaces.GPU(duration=180)
 def load_and_train():
     """Load model + train predictor in a single GPU call."""
     global MODEL, TOKENIZER, MEMBRANE, PREDICTOR, GRAPH
@@ -45,10 +45,7 @@ def load_and_train():
         TOKENIZER.pad_token = TOKENIZER.eos_token
 
     # Load model directly to GPU
-    MODEL = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.float32,
-    )
+    MODEL = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
     MODEL.eval()
     MODEL.to("cuda")
 
