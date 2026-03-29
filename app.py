@@ -150,13 +150,16 @@ def run_analysis(prompt, max_tokens=30):
     elapsed_ms = (time.monotonic() - start) * 1000
     generated_text = TOKENIZER.decode(outputs[0], skip_special_tokens=True)
 
-    activation_map = MEMBRANE.get_activation_map()
+    # Layer-level analysis
     potential = MEMBRANE.get_condensation_potential()
+
+    # Head-level analysis
+    head_potential = MEMBRANE.get_head_condensation_potential()
 
     log = MEMBRANE.to_access_log()
     pred_result = PREDICTOR.score(log)
 
-    # Build comparison output
+    # Build comparison output — showing BOTH granularities
     comparison = []
     comparison.append("=" * 55)
     comparison.append("  BASELINE vs CONDENSATE")
@@ -164,49 +167,103 @@ def run_analysis(prompt, max_tokens=30):
     comparison.append(f"\n  Generated: {generated_text}")
     comparison.append(f"  Time: {elapsed_ms:.0f}ms\n")
 
-    baseline_mb = potential['total_mb']
-    condensed_mb = potential['hot_mb']
-    saved_pct = potential['savings_pct']
+    # Layer-level (the floor)
+    layer_baseline = potential['total_mb']
+    layer_saved_pct = potential['savings_pct']
 
     comparison.append(f"  WITHOUT Condensate:")
-    comparison.append(f"    All {potential['total_layers']} layers in RAM:  {baseline_mb:.2f} MB")
-    comparison.append(f"    (Every weight loaded, whether needed or not)\n")
+    comparison.append(f"    All params in RAM:  {layer_baseline:.2f} MB\n")
 
-    comparison.append(f"  WITH Condensate:")
-    comparison.append(f"    {potential['hot_layers']} HOT layers in RAM:   {condensed_mb:.2f} MB")
-    comparison.append(f"    {potential['cold_layers']} COLD layers paged:   {potential['cold_mb']:.2f} MB saved")
-    comparison.append(f"    (Cold layers compressed or on disk,")
-    comparison.append(f"     pre-staged back to RAM before needed)\n")
+    comparison.append(f"  ── Layer-Level (v1 floor) ──")
+    comparison.append(f"    HOT layers: {potential['hot_layers']}  "
+                     f"COLD layers: {potential['cold_layers']}")
+    comparison.append(f"    Savings: {potential['cold_mb']:.2f} MB ({layer_saved_pct:.1f}%)\n")
 
-    comparison.append(f"  ┌─────────────────────────────────────┐")
-    comparison.append(f"  │  RAM REDUCTION: {saved_pct:.1f}%                │")
-    comparison.append(f"  │  {baseline_mb:.2f} MB → {condensed_mb:.2f} MB             │")
-    comparison.append(f"  │  Same output. Same quality.         │")
-    comparison.append(f"  └─────────────────────────────────────┘\n")
+    # Head-level (the real number)
+    if head_potential['total_heads'] > 0:
+        comparison.append(f"  ── Head-Level (v2) ──")
+        comparison.append(f"    HOT heads: {head_potential['hot_heads']}  "
+                         f"COLD heads: {head_potential['cold_heads']}  "
+                         f"(of {head_potential['total_heads']} total)")
+        comparison.append(f"    Cold attention:    {head_potential['attn_cold_mb']:.2f} MB")
+        comparison.append(f"    Cold non-attention: {head_potential['non_attn_cold_mb']:.2f} MB")
+        comparison.append(f"    Total cold:         {head_potential['cold_mb']:.2f} MB\n")
 
-    comparison.append(f"  Prediction accuracy: {pred_result['accuracy']}%")
+        comparison.append(f"  ┌─────────────────────────────────────────┐")
+        comparison.append(f"  │  HEAD-LEVEL RAM REDUCTION:              │")
+        comparison.append(f"  │  {head_potential['savings_pct']:.1f}% "
+                         f"({head_potential['cold_mb']:.2f} MB saved)"
+                         + " " * max(0, 14 - len(f"{head_potential['savings_pct']:.1f}% ({head_potential['cold_mb']:.2f} MB saved)"))
+                         + "│")
+        comparison.append(f"  │  {head_potential['total_mb']:.2f} MB → "
+                         f"{head_potential['hot_mb']:.2f} MB"
+                         + " " * max(0, 19 - len(f"{head_potential['total_mb']:.2f} MB → {head_potential['hot_mb']:.2f} MB"))
+                         + "│")
+        comparison.append(f"  │  Same output. Same quality.             │")
+        comparison.append(f"  └─────────────────────────────────────────┘\n")
+
+        comparison.append(f"  Layer-level floor:  {layer_saved_pct:.1f}%")
+        comparison.append(f"  Head-level actual:  {head_potential['savings_pct']:.1f}%")
+    else:
+        comparison.append(f"  ┌─────────────────────────────────────┐")
+        comparison.append(f"  │  RAM REDUCTION: {layer_saved_pct:.1f}%                │")
+        comparison.append(f"  │  (Layer-level only — no heads found)│")
+        comparison.append(f"  └─────────────────────────────────────┘\n")
+
+    comparison.append(f"\n  Prediction accuracy: {pred_result['accuracy']}%")
     comparison.append(f"  Access events: {len(log)}")
 
-    # Build analysis output
+    # Build analysis output — head-level detail
     analysis = []
-    analysis.append("=" * 55)
-    analysis.append("  LAYER ACTIVATION MAP")
-    analysis.append("=" * 55)
-    analysis.append(f"\n  {'Layer':<35} {'Fwd':>4} {'Activation':>10} {'MB':>6} {'Tier':>5}")
-    analysis.append(f"  {'-'*35} {'-'*4} {'-'*10} {'-'*6} {'-'*5}")
 
-    for layer in activation_map[:40]:
-        name = layer['name']
-        if len(name) > 35:
-            name = "..." + name[-32:]
-        attn = " [A]" if layer['is_attention'] else ""
-        analysis.append(f"  {name:<35} {layer['forward_count']:>4} "
-                       f"{layer['avg_activation']:>10.3f} "
-                       f"{layer['param_mb']:>6.3f} "
-                       f"{layer['temperature']:>5}{attn}")
+    head_map = MEMBRANE.get_head_map()
+    cold_heads = MEMBRANE.get_cold_heads()
+    hot_heads = [h for h in head_map if h['temperature'] == 'HOT']
 
-    if len(activation_map) > 40:
-        analysis.append(f"  ... and {len(activation_map) - 40} more layers")
+    if head_map:
+        analysis.append("=" * 55)
+        analysis.append("  HEAD-LEVEL ACTIVATION MAP")
+        analysis.append("=" * 55)
+        analysis.append(f"\n  {head_potential['total_heads']} heads tracked")
+        analysis.append(f"  {head_potential['hot_heads']} HOT / "
+                       f"{head_potential['cold_heads']} COLD\n")
+
+        # Show coldest heads
+        if cold_heads:
+            analysis.append(f"  COLDEST HEADS (condensable):")
+            analysis.append(f"  {'Head':<35} {'AvgAct':>10} {'MB':>6}")
+            analysis.append(f"  {'-'*35} {'-'*10} {'-'*6}")
+            for h in cold_heads[:20]:
+                name = h['key'] if len(h['key']) <= 35 else "..." + h['key'][-32:]
+                analysis.append(f"  {name:<35} {h['avg_activation']:>10.4f} "
+                               f"{h['param_mb']:>6.4f}")
+            if len(cold_heads) > 20:
+                analysis.append(f"  ... and {len(cold_heads) - 20} more cold heads")
+
+        # Show hottest for comparison
+        if hot_heads:
+            analysis.append(f"\n  HOTTEST HEADS (must stay in RAM):")
+            analysis.append(f"  {'Head':<35} {'AvgAct':>10} {'MB':>6}")
+            analysis.append(f"  {'-'*35} {'-'*10} {'-'*6}")
+            for h in hot_heads[:10]:
+                name = h['key'] if len(h['key']) <= 35 else "..." + h['key'][-32:]
+                analysis.append(f"  {name:<35} {h['avg_activation']:>10.4f} "
+                               f"{h['param_mb']:>6.4f}")
+    else:
+        # Fall back to layer-level
+        analysis.append("=" * 55)
+        analysis.append("  LAYER ACTIVATION MAP")
+        analysis.append("=" * 55)
+        activation_map = MEMBRANE.get_activation_map()
+        analysis.append(f"\n  {'Layer':<35} {'Fwd':>4} {'Activation':>10} {'MB':>6} {'Tier':>5}")
+        analysis.append(f"  {'-'*35} {'-'*4} {'-'*10} {'-'*6} {'-'*5}")
+        for layer in activation_map[:40]:
+            name = layer['name'] if len(layer['name']) <= 35 else "..." + layer['name'][-32:]
+            attn = " [A]" if layer['is_attention'] else ""
+            analysis.append(f"  {name:<35} {layer['forward_count']:>4} "
+                           f"{layer['avg_activation']:>10.3f} "
+                           f"{layer['param_mb']:>6.3f} "
+                           f"{layer['temperature']:>5}{attn}")
 
     return "\n".join(comparison), "\n".join(analysis)
 
@@ -298,8 +355,8 @@ with gr.Blocks(title="Condensate — Do More With Less") as demo:
     Condensate uses a neural substrate with causal spike propagation
     to learn memory access patterns and dynamically condense RAM usage.
 
-    **Live Model tab:** Runs a real transformer (distilgpt2) on ZeroGPU
-    and shows which layers are HOT vs COLD for your input.
+    **Live Model tab:** Runs GPT-2 Large (774M params) on ZeroGPU
+    and shows which layers AND attention heads are HOT vs COLD for your input.
 
     **Synthetic tab:** Runs the full 4-layer pipeline on configurable
     simulated workloads (no GPU needed).
