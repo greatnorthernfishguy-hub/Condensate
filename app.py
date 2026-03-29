@@ -44,9 +44,8 @@ GRAPH = None
 MODEL_NAME = "gpt2-large"
 
 
-@spaces.GPU
 def load_model():
-    """Load model and install membrane."""
+    """Load model on CPU — ZeroGPU moves to GPU when needed."""
     global MODEL, TOKENIZER, MEMBRANE
 
     _ensure_torch()
@@ -58,19 +57,17 @@ def load_model():
 
     MODEL = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float32,
-        output_attentions=True,
+        dtype=torch.float32,
     )
     MODEL.eval()
-    MODEL.to("cuda")
 
     MEMBRANE = TorchMembrane(MODEL)
 
     param_count = sum(p.numel() for p in MODEL.parameters()) / 1e6
-    return f"Loaded {MODEL_NAME} ({param_count:.1f}M params) on ZeroGPU"
+    return f"Loaded {MODEL_NAME} ({param_count:.1f}M params)"
 
 
-@spaces.GPU
+@spaces.GPU(duration=120)
 def train_predictor(num_prompts=5):
     """Run several prompts to train the predictor on access patterns."""
     global PREDICTOR, GRAPH, MEMBRANE
@@ -80,6 +77,7 @@ def train_predictor(num_prompts=5):
     if MODEL is None:
         load_model()
 
+    MODEL.to("cuda")
     MEMBRANE.reset()
 
     training_prompts = [
@@ -88,9 +86,6 @@ def train_predictor(num_prompts=5):
         "Machine learning models can be optimized by",
         "The capital of France is Paris and the",
         "Once upon a time in a land far far",
-        "Artificial intelligence will transform the way we",
-        "The most important thing about programming is",
-        "When the sun sets over the mountains the",
     ][:num_prompts]
 
     for prompt in training_prompts:
@@ -98,7 +93,7 @@ def train_predictor(num_prompts=5):
         with torch.no_grad():
             MODEL.generate(
                 **inputs,
-                max_new_tokens=20,
+                max_new_tokens=15,
                 do_sample=False,
                 pad_token_id=TOKENIZER.pad_token_id,
             )
@@ -120,7 +115,7 @@ def train_predictor(num_prompts=5):
             f"Clusters (proto-hyperedges): {len(GRAPH.clusters)}")
 
 
-@spaces.GPU
+@spaces.GPU(duration=120)
 def run_analysis(prompt, max_tokens=30):
     """Run inference, show activation map + condensation potential."""
     global MEMBRANE, PREDICTOR
@@ -132,6 +127,7 @@ def run_analysis(prompt, max_tokens=30):
     if PREDICTOR is None:
         train_predictor()
 
+    MODEL.to("cuda")
     MEMBRANE.reset()
 
     inputs = TOKENIZER(prompt, return_tensors="pt", padding=True).to("cuda")
