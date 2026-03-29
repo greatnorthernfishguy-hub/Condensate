@@ -1,0 +1,5 @@
+torch
+transformers
+numpy
+lz4
+gradio
