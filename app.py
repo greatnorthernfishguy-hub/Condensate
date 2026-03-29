@@ -359,7 +359,7 @@ with gr.Blocks(title="Condensate — Do More With Less") as demo:
                 with gr.Column():
                     syn_output = gr.Textbox(
                         label="Results", lines=25,
-                        interactive=False, show_copy_button=True,
+                        interactive=False,
                     )
 
             syn_btn.click(
