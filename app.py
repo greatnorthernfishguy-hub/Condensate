@@ -21,20 +21,6 @@ from membrane import Membrane
 from graph_builder import GraphBuilder
 from predictor import Predictor
 
-# Lazy imports for heavy deps
-torch = None
-TorchMembrane = None
-
-
-def _ensure_torch():
-    global torch, TorchMembrane
-    if torch is None:
-        import torch as _torch
-        torch = _torch
-        from torch_membrane import TorchMembrane as _TM
-        TorchMembrane = _TM
-
-
 # --- Global state ---
 MODEL = None
 TOKENIZER = None
@@ -44,49 +30,42 @@ GRAPH = None
 MODEL_NAME = "gpt2-large"
 
 
-def load_model():
-    """Load model on CPU — ZeroGPU moves to GPU when needed."""
-    global MODEL, TOKENIZER, MEMBRANE
+@spaces.GPU(duration=120)
+def load_and_train():
+    """Load model + train predictor in a single GPU call."""
+    global MODEL, TOKENIZER, MEMBRANE, PREDICTOR, GRAPH
 
-    _ensure_torch()
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from torch_membrane import TorchMembrane
 
+    # Load tokenizer
     TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
     if TOKENIZER.pad_token is None:
         TOKENIZER.pad_token = TOKENIZER.eos_token
 
+    # Load model directly to GPU
     MODEL = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        dtype=torch.float32,
+        torch_dtype=torch.float32,
     )
     MODEL.eval()
-
-    MEMBRANE = TorchMembrane(MODEL)
+    MODEL.to("cuda")
 
     param_count = sum(p.numel() for p in MODEL.parameters()) / 1e6
-    return f"Loaded {MODEL_NAME} ({param_count:.1f}M params)"
 
-
-@spaces.GPU(duration=120)
-def train_predictor(num_prompts=5):
-    """Run several prompts to train the predictor on access patterns."""
-    global PREDICTOR, GRAPH, MEMBRANE
-
-    _ensure_torch()
-
-    if MODEL is None:
-        load_model()
-
-    MODEL.to("cuda")
+    # Install membrane
+    MEMBRANE = TorchMembrane(MODEL)
     MEMBRANE.reset()
 
+    # Train on diverse prompts
     training_prompts = [
         "The quick brown fox jumps over the lazy",
         "In the beginning there was darkness and then",
         "Machine learning models can be optimized by",
         "The capital of France is Paris and the",
         "Once upon a time in a land far far",
-    ][:num_prompts]
+    ]
 
     for prompt in training_prompts:
         inputs = TOKENIZER(prompt, return_tensors="pt", padding=True).to("cuda")
@@ -98,6 +77,7 @@ def train_predictor(num_prompts=5):
                 pad_token_id=TOKENIZER.pad_token_id,
             )
 
+    # Build graph and predictor
     log = MEMBRANE.to_access_log()
 
     GRAPH = GraphBuilder(causal_window_ns=5_000_000)
@@ -108,11 +88,12 @@ def train_predictor(num_prompts=5):
 
     result = PREDICTOR.score(log)
 
-    return (f"Trained on {len(training_prompts)} prompts, "
-            f"{len(log)} access events observed.\n"
+    return (f"Loaded {MODEL_NAME} ({param_count:.1f}M params)\n"
+            f"Trained on {len(training_prompts)} prompts, "
+            f"{len(log)} access events.\n"
             f"Prediction accuracy: {result['accuracy']}%\n"
-            f"Causal chains discovered: {len(GRAPH.get_causal_chains())}\n"
-            f"Clusters (proto-hyperedges): {len(GRAPH.clusters)}")
+            f"Chains: {len(GRAPH.get_causal_chains())} | "
+            f"Clusters: {len(GRAPH.clusters)}")
 
 
 @spaces.GPU(duration=120)
@@ -120,12 +101,10 @@ def run_analysis(prompt, max_tokens=30):
     """Run inference, show activation map + condensation potential."""
     global MEMBRANE, PREDICTOR
 
-    _ensure_torch()
+    import torch
 
-    if MODEL is None:
-        load_model()
-    if PREDICTOR is None:
-        train_predictor()
+    if MODEL is None or PREDICTOR is None:
+        return "Please click 'Load & Train' first.", ""
 
     MODEL.to("cuda")
     MEMBRANE.reset()
@@ -155,7 +134,7 @@ def run_analysis(prompt, max_tokens=30):
     log = MEMBRANE.to_access_log()
     pred_result = PREDICTOR.score(log)
 
-    # Build comparison output — showing BOTH granularities
+    # Build comparison output
     comparison = []
     comparison.append("=" * 55)
     comparison.append("  BASELINE vs CONDENSATE")
@@ -163,55 +142,52 @@ def run_analysis(prompt, max_tokens=30):
     comparison.append(f"\n  Generated: {generated_text}")
     comparison.append(f"  Time: {elapsed_ms:.0f}ms\n")
 
-    # Layer-level (the floor)
     layer_baseline = potential['total_mb']
     layer_saved_pct = potential['savings_pct']
 
     comparison.append(f"  WITHOUT Condensate:")
     comparison.append(f"    All params in RAM:  {layer_baseline:.2f} MB\n")
 
-    comparison.append(f"  ── Layer-Level (v1 floor) ──")
+    comparison.append(f"  -- Layer-Level (v1 floor) --")
     comparison.append(f"    HOT layers: {potential['hot_layers']}  "
                      f"COLD layers: {potential['cold_layers']}")
     comparison.append(f"    Savings: {potential['cold_mb']:.2f} MB ({layer_saved_pct:.1f}%)\n")
 
-    # Head-level (the real number)
     if head_potential['total_heads'] > 0:
-        comparison.append(f"  ── Head-Level (v2) ──")
+        comparison.append(f"  -- Head-Level (v2) --")
         comparison.append(f"    HOT heads: {head_potential['hot_heads']}  "
                          f"COLD heads: {head_potential['cold_heads']}  "
                          f"(of {head_potential['total_heads']} total)")
-        comparison.append(f"    Cold attention:    {head_potential['attn_cold_mb']:.2f} MB")
+        comparison.append(f"    Cold attention:     {head_potential['attn_cold_mb']:.2f} MB")
         comparison.append(f"    Cold non-attention: {head_potential['non_attn_cold_mb']:.2f} MB")
         comparison.append(f"    Total cold:         {head_potential['cold_mb']:.2f} MB\n")
 
-        comparison.append(f"  ┌─────────────────────────────────────────┐")
-        comparison.append(f"  │  HEAD-LEVEL RAM REDUCTION:              │")
-        comparison.append(f"  │  {head_potential['savings_pct']:.1f}% "
+        comparison.append(f"  +-------------------------------------------+")
+        comparison.append(f"  |  HEAD-LEVEL RAM REDUCTION:                |")
+        comparison.append(f"  |  {head_potential['savings_pct']:.1f}% "
                          f"({head_potential['cold_mb']:.2f} MB saved)"
-                         + " " * max(0, 14 - len(f"{head_potential['savings_pct']:.1f}% ({head_potential['cold_mb']:.2f} MB saved)"))
-                         + "│")
-        comparison.append(f"  │  {head_potential['total_mb']:.2f} MB → "
+                         + " " * max(0, 18 - len(f"{head_potential['savings_pct']:.1f}% ({head_potential['cold_mb']:.2f} MB saved)"))
+                         + "|")
+        comparison.append(f"  |  {head_potential['total_mb']:.2f} MB -> "
                          f"{head_potential['hot_mb']:.2f} MB"
-                         + " " * max(0, 19 - len(f"{head_potential['total_mb']:.2f} MB → {head_potential['hot_mb']:.2f} MB"))
-                         + "│")
-        comparison.append(f"  │  Same output. Same quality.             │")
-        comparison.append(f"  └─────────────────────────────────────────┘\n")
+                         + " " * max(0, 22 - len(f"{head_potential['total_mb']:.2f} MB -> {head_potential['hot_mb']:.2f} MB"))
+                         + "|")
+        comparison.append(f"  |  Same output. Same quality.              |")
+        comparison.append(f"  +-------------------------------------------+\n")
 
         comparison.append(f"  Layer-level floor:  {layer_saved_pct:.1f}%")
         comparison.append(f"  Head-level actual:  {head_potential['savings_pct']:.1f}%")
     else:
-        comparison.append(f"  ┌─────────────────────────────────────┐")
-        comparison.append(f"  │  RAM REDUCTION: {layer_saved_pct:.1f}%                │")
-        comparison.append(f"  │  (Layer-level only — no heads found)│")
-        comparison.append(f"  └─────────────────────────────────────┘\n")
+        comparison.append(f"  +-------------------------------------------+")
+        comparison.append(f"  |  RAM REDUCTION: {layer_saved_pct:.1f}%                   |")
+        comparison.append(f"  |  (Layer-level only)                       |")
+        comparison.append(f"  +-------------------------------------------+\n")
 
     comparison.append(f"\n  Prediction accuracy: {pred_result['accuracy']}%")
     comparison.append(f"  Access events: {len(log)}")
 
-    # Build analysis output — head-level detail
+    # Build head-level analysis output
     analysis = []
-
     head_map = MEMBRANE.get_head_map()
     cold_heads = MEMBRANE.get_cold_heads()
     hot_heads = [h for h in head_map if h['temperature'] == 'HOT']
@@ -224,7 +200,6 @@ def run_analysis(prompt, max_tokens=30):
         analysis.append(f"  {head_potential['hot_heads']} HOT / "
                        f"{head_potential['cold_heads']} COLD\n")
 
-        # Show coldest heads
         if cold_heads:
             analysis.append(f"  COLDEST HEADS (condensable):")
             analysis.append(f"  {'Head':<35} {'AvgAct':>10} {'MB':>6}")
@@ -236,7 +211,6 @@ def run_analysis(prompt, max_tokens=30):
             if len(cold_heads) > 20:
                 analysis.append(f"  ... and {len(cold_heads) - 20} more cold heads")
 
-        # Show hottest for comparison
         if hot_heads:
             analysis.append(f"\n  HOTTEST HEADS (must stay in RAM):")
             analysis.append(f"  {'Head':<35} {'AvgAct':>10} {'MB':>6}")
@@ -246,7 +220,6 @@ def run_analysis(prompt, max_tokens=30):
                 analysis.append(f"  {name:<35} {h['avg_activation']:>10.4f} "
                                f"{h['param_mb']:>6.4f}")
     else:
-        # Fall back to layer-level
         analysis.append("=" * 55)
         analysis.append("  LAYER ACTIVATION MAP")
         analysis.append("=" * 55)
@@ -264,10 +237,10 @@ def run_analysis(prompt, max_tokens=30):
     return "\n".join(comparison), "\n".join(analysis)
 
 
-# --- Also keep the synthetic demo for comparison ---
+# --- Synthetic demo (no GPU needed) ---
 
 def run_synthetic_demo(num_layers, num_hot, num_iterations):
-    """Run the PoC pipeline on synthetic data (no GPU needed)."""
+    """Run the PoC pipeline on synthetic data."""
     from condenser import Condenser
 
     num_layers = int(num_layers)
@@ -292,7 +265,6 @@ def run_synthetic_demo(num_layers, num_hot, num_iterations):
     output.append(f"\n  {num_layers} regions x 64KB = {total_mb:.1f} MB total")
     output.append(f"  {num_hot} hot / {num_layers - num_hot} cold")
 
-    # Membrane + Graph + Predictor
     Membrane.clear()
     wrapped = Membrane.wrap(state.copy(), "model")
     for _ in range(num_iterations):
@@ -314,7 +286,6 @@ def run_synthetic_demo(num_layers, num_hot, num_iterations):
     output.append(f"  Clusters: {len(graph.clusters)}")
     output.append(f"  Causal chains: {len(graph.get_causal_chains())}")
 
-    # Condenser
     def workload_fn(w):
         for i in range(num_layers):
             if i in hot_set:
@@ -351,8 +322,8 @@ with gr.Blocks(title="Condensate — Do More With Less") as demo:
     Condensate uses a neural substrate with causal spike propagation
     to learn memory access patterns and dynamically condense RAM usage.
 
-    **Live Model tab:** Runs GPT-2 Large (774M params) on ZeroGPU
-    and shows which layers AND attention heads are HOT vs COLD for your input.
+    **Live Model tab:** Runs GPT-2 Large (774M, 36 layers, 20 heads)
+    on ZeroGPU. Shows layer-level AND head-level activation analysis.
 
     **Synthetic tab:** Runs the full 4-layer pipeline on configurable
     simulated workloads (no GPU needed).
@@ -362,9 +333,11 @@ with gr.Blocks(title="Condensate — Do More With Less") as demo:
         with gr.TabItem("Live Model (ZeroGPU)"):
             with gr.Row():
                 with gr.Column():
-                    status = gr.Textbox(label="Status", interactive=False, lines=3)
-                    load_btn = gr.Button("1. Load Model", variant="primary")
-                    train_btn = gr.Button("2. Train Predictor", variant="primary")
+                    status = gr.Textbox(label="Status", interactive=False, lines=5)
+                    load_train_btn = gr.Button(
+                        "1. Load Model & Train Predictor (uses GPU)",
+                        variant="primary"
+                    )
 
             with gr.Row():
                 with gr.Column():
@@ -377,22 +350,21 @@ with gr.Blocks(title="Condensate — Do More With Less") as demo:
                         minimum=10, maximum=100, value=30, step=5,
                         label="Max tokens"
                     )
-                    run_btn = gr.Button("3. Run & Analyze", variant="primary")
+                    run_btn = gr.Button("2. Run & Analyze (uses GPU)", variant="primary")
 
             with gr.Row():
                 with gr.Column():
                     comparison_output = gr.Textbox(
                         label="Baseline vs Condensate",
-                        lines=25, interactive=False,
+                        lines=30, interactive=False,
                     )
                 with gr.Column():
                     analysis_output = gr.Textbox(
-                        label="Layer Activation Map",
-                        lines=25, interactive=False,
+                        label="Head-Level Activation Map",
+                        lines=30, interactive=False,
                     )
 
-            load_btn.click(fn=load_model, outputs=status)
-            train_btn.click(fn=train_predictor, outputs=status)
+            load_train_btn.click(fn=load_and_train, outputs=status)
             run_btn.click(
                 fn=run_analysis,
                 inputs=[prompt_input, max_tokens],
