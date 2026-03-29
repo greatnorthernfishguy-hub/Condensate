@@ -9,16 +9,13 @@ Compares baseline vs condensed inference.
 """
 
 import gradio as gr
-import torch
 import numpy as np
 import time
-import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from torch_membrane import TorchMembrane
 from graph_builder import GraphBuilder
 from predictor import Predictor
 
@@ -36,7 +33,9 @@ def load_model():
     """Load model and install membrane."""
     global MODEL, TOKENIZER, MEMBRANE
 
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from torch_membrane import TorchMembrane
 
     TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
     if TOKENIZER.pad_token is None:
@@ -57,6 +56,8 @@ def load_model():
 def train_predictor(num_prompts=5):
     """Run several prompts to train the predictor on access patterns."""
     global PREDICTOR, GRAPH, MEMBRANE
+
+    import torch
 
     if MODEL is None:
         load_model()
@@ -107,6 +108,8 @@ def train_predictor(num_prompts=5):
 def run_inference(prompt, max_tokens=30):
     """Run inference and show activation map + condensation potential."""
     global MEMBRANE, PREDICTOR
+
+    import torch
 
     if MODEL is None:
         load_model()
