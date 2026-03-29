@@ -41,7 +41,7 @@ TOKENIZER = None
 MEMBRANE = None
 PREDICTOR = None
 GRAPH = None
-MODEL_NAME = "gpt2-medium"
+MODEL_NAME = "gpt2-large"
 
 
 @spaces.GPU
