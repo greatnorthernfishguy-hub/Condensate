@@ -30,32 +30,41 @@ GRAPH = None
 MODEL_NAME = "gpt2-large"
 
 
-@spaces.GPU(duration=180)
-def load_and_train():
-    """Load model + train predictor in a single GPU call."""
-    global MODEL, TOKENIZER, MEMBRANE, PREDICTOR, GRAPH
+def load_model():
+    """Load model on CPU. No GPU needed — just downloads and loads weights."""
+    global MODEL, TOKENIZER, MEMBRANE
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from torch_membrane import TorchMembrane
 
-    # Load tokenizer
     TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
     if TOKENIZER.pad_token is None:
         TOKENIZER.pad_token = TOKENIZER.eos_token
 
-    # Load model directly to GPU
     MODEL = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
     MODEL.eval()
-    MODEL.to("cuda")
 
     param_count = sum(p.numel() for p in MODEL.parameters()) / 1e6
 
-    # Install membrane
     MEMBRANE = TorchMembrane(MODEL)
+
+    return f"Loaded {MODEL_NAME} ({param_count:.1f}M params) on CPU. Ready to train."
+
+
+@spaces.GPU(duration=120)
+def train_predictor():
+    """Train the predictor — needs GPU for inference passes."""
+    global PREDICTOR, GRAPH, MEMBRANE
+
+    import torch
+
+    if MODEL is None:
+        return "Please load the model first."
+
+    MODEL.to("cuda")
     MEMBRANE.reset()
 
-    # Train on diverse prompts
     training_prompts = [
         "The quick brown fox jumps over the lazy",
         "In the beginning there was darkness and then",
@@ -74,7 +83,6 @@ def load_and_train():
                 pad_token_id=TOKENIZER.pad_token_id,
             )
 
-    # Build graph and predictor
     log = MEMBRANE.to_access_log()
 
     GRAPH = GraphBuilder(causal_window_ns=5_000_000)
@@ -85,8 +93,7 @@ def load_and_train():
 
     result = PREDICTOR.score(log)
 
-    return (f"Loaded {MODEL_NAME} ({param_count:.1f}M params)\n"
-            f"Trained on {len(training_prompts)} prompts, "
+    return (f"Trained on {len(training_prompts)} prompts, "
             f"{len(log)} access events.\n"
             f"Prediction accuracy: {result['accuracy']}%\n"
             f"Chains: {len(GRAPH.get_causal_chains())} | "
@@ -100,8 +107,10 @@ def run_analysis(prompt, max_tokens=30):
 
     import torch
 
-    if MODEL is None or PREDICTOR is None:
-        return "Please click 'Load & Train' first.", ""
+    if MODEL is None:
+        return "Please click 'Load Model' first.", ""
+    if PREDICTOR is None:
+        return "Please click 'Train Predictor' first.", ""
 
     MODEL.to("cuda")
     MEMBRANE.reset()
@@ -331,10 +340,8 @@ with gr.Blocks(title="Condensate — Do More With Less") as demo:
             with gr.Row():
                 with gr.Column():
                     status = gr.Textbox(label="Status", interactive=False, lines=5)
-                    load_train_btn = gr.Button(
-                        "1. Load Model & Train Predictor (uses GPU)",
-                        variant="primary"
-                    )
+                    load_btn = gr.Button("1. Load Model (CPU, no quota)", variant="primary")
+                    train_btn = gr.Button("2. Train Predictor (uses GPU)", variant="primary")
 
             with gr.Row():
                 with gr.Column():
@@ -347,7 +354,7 @@ with gr.Blocks(title="Condensate — Do More With Less") as demo:
                         minimum=10, maximum=100, value=30, step=5,
                         label="Max tokens"
                     )
-                    run_btn = gr.Button("2. Run & Analyze (uses GPU)", variant="primary")
+                    run_btn = gr.Button("3. Run & Analyze (uses GPU)", variant="primary")
 
             with gr.Row():
                 with gr.Column():
@@ -361,7 +368,8 @@ with gr.Blocks(title="Condensate — Do More With Less") as demo:
                         lines=30, interactive=False,
                     )
 
-            load_train_btn.click(fn=load_and_train, outputs=status)
+            load_btn.click(fn=load_model, outputs=status)
+            train_btn.click(fn=train_predictor, outputs=status)
             run_btn.click(
                 fn=run_analysis,
                 inputs=[prompt_input, max_tokens],
