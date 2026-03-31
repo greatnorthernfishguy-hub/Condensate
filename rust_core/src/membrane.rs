@@ -15,10 +15,12 @@
 //! This data feeds the AccessGraph for pattern discovery.
 
 use libc::{c_void, size_t};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::collections::HashMap;
 use std::time::Instant;
+
+use crate::pipeline::{Pipeline, PipelineConfig};
 
 /// Global state for the membrane
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -250,6 +252,14 @@ impl MembraneSummary {
 static MEMBRANE: std::sync::LazyLock<Mutex<MembraneState>> =
     std::sync::LazyLock::new(|| Mutex::new(MembraneState::new()));
 
+/// Global pipeline — the living loop
+static PIPELINE: std::sync::LazyLock<Mutex<Pipeline>> =
+    std::sync::LazyLock::new(|| Mutex::new(Pipeline::new(PipelineConfig::default())));
+
+/// Scan counter — run condenser scan every N allocs
+static SCAN_COUNTER: AtomicU64 = AtomicU64::new(0);
+const SCAN_INTERVAL: u64 = 10_000; // scan every 10,000 allocs
+
 // --- LD_PRELOAD hook functions ---
 
 /// Get the original malloc function
@@ -272,7 +282,7 @@ unsafe fn real_free(ptr: *mut c_void) {
     }
 }
 
-/// Hooked malloc — records the allocation, then calls real malloc
+/// Hooked malloc — records the allocation, feeds the pipeline, calls real malloc
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     let ptr = unsafe { real_malloc(size) };
@@ -283,8 +293,22 @@ pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
         }
         r.set(true);
 
+        // Feed membrane state (observation/stats)
         if let Ok(mut state) = MEMBRANE.try_lock() {
             state.record_alloc(ptr as usize, size);
+        }
+
+        // Feed the living pipeline (learn → predict → act)
+        if let Ok(mut pipeline) = PIPELINE.try_lock() {
+            pipeline.process_alloc(ptr as usize, size);
+        }
+
+        // Periodic compression scan
+        let count = SCAN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if count > 0 && count % SCAN_INTERVAL == 0 {
+            if let Ok(mut pipeline) = PIPELINE.try_lock() {
+                pipeline.scan();
+            }
         }
 
         r.set(false);
@@ -293,7 +317,7 @@ pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     ptr
 }
 
-/// Hooked free — records the deallocation, then calls real free
+/// Hooked free — records the deallocation, updates pipeline, calls real free
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     if ptr.is_null() {
@@ -310,17 +334,26 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
             state.record_free(ptr as usize);
         }
 
+        if let Ok(mut pipeline) = PIPELINE.try_lock() {
+            pipeline.process_free(ptr as usize);
+        }
+
         r.set(false);
     });
 
     unsafe { real_free(ptr) }
 }
 
-/// Print summary on process exit
+/// Print full pipeline summary on process exit
 #[unsafe(no_mangle)]
 pub extern "C" fn condensate_summary() {
+    // Membrane stats
     if let Ok(state) = MEMBRANE.lock() {
         state.summary().print();
+    }
+    // Pipeline stats (the living loop)
+    if let Ok(pipeline) = PIPELINE.lock() {
+        pipeline.summary().print();
     }
 }
 
@@ -330,7 +363,7 @@ pub extern "C" fn condensate_summary() {
 static INIT: extern "C" fn() = {
     extern "C" fn init() {
         INITIALIZED.store(true, Ordering::SeqCst);
-        eprintln!("[condensate] Membrane active — tracking memory allocations");
+        eprintln!("[condensate] Living pipeline active — membrane → graph → predictor → condenser");
 
         unsafe { libc::atexit(condensate_summary) };
     }
