@@ -295,7 +295,7 @@ impl RustPredictor {
     }
 
     /// Check if predictor has learned.
-    fn is_learned(&self) -> bool {
+    pub fn is_learned(&self) -> bool {
         self.learned
     }
 }

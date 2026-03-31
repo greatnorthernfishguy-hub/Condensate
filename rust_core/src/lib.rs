@@ -13,6 +13,7 @@ pub mod graph;
 pub mod predictor;
 pub mod membrane;
 pub mod condenser;
+pub mod pipeline;
 mod bench;
 
 #[cfg(feature = "python")]
