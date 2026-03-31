@@ -15,6 +15,7 @@ use std::time::Instant;
 use crate::graph::AccessGraph;
 use crate::predictor::RustPredictor;
 use crate::condenser::{Condenser, CondenserConfig};
+use crate::lenia::LeniaField;
 
 /// Pipeline configuration
 pub struct PipelineConfig {
@@ -60,7 +61,7 @@ pub enum EventType {
     Free,
 }
 
-/// The living pipeline — connects membrane → graph → predictor → condenser
+/// The living pipeline — connects membrane → graph → predictor → condenser → lenia
 pub struct Pipeline {
     config: PipelineConfig,
 
@@ -73,11 +74,21 @@ pub struct Pipeline {
     /// The condenser compresses cold, promotes hot
     condenser: Condenser,
 
+    /// The Lenia field — continuous thermal dynamics
+    /// Replaces hard idle thresholds with physics
+    field: LeniaField,
+
     /// Accumulated events for graph rebuilding
     event_buffer: Vec<(u64, String, u64)>,
 
     /// Address → path mapping (for graph node identity)
     address_to_path: std::collections::HashMap<usize, String>,
+
+    /// Address → Lenia region ID mapping
+    address_to_field_id: std::collections::HashMap<usize, u32>,
+
+    /// Next Lenia field ID
+    next_field_id: u32,
 
     /// Path counter for generating unique paths
     path_counter: u64,
@@ -85,12 +96,16 @@ pub struct Pipeline {
     /// Start time
     start: Instant,
 
+    /// Lenia step counter (step every N events)
+    field_step_counter: u64,
+
     /// Stats
     pub events_processed: u64,
     pub predictions_fired: u64,
     pub predictions_acted: u64,
     pub graph_rebuilds: u64,
     pub compressions: u64,
+    pub lenia_steps: u64,
 }
 
 impl Pipeline {
@@ -101,19 +116,27 @@ impl Pipeline {
             ..Default::default()
         };
 
+        // RAM budget for Lenia field — default 1024 MB
+        let field = LeniaField::new(1024.0);
+
         Self {
             graph: AccessGraph::new(config.causal_window_ns, config.cluster_threshold),
             predictor: RustPredictor::new(),
             condenser: Condenser::new(condenser_config),
+            field,
             event_buffer: Vec::with_capacity(config.graph_rebuild_interval),
             address_to_path: std::collections::HashMap::with_capacity(1000),
+            address_to_field_id: std::collections::HashMap::with_capacity(1000),
+            next_field_id: 0,
             path_counter: 0,
             start: Instant::now(),
+            field_step_counter: 0,
             events_processed: 0,
             predictions_fired: 0,
             predictions_acted: 0,
             graph_rebuilds: 0,
             compressions: 0,
+            lenia_steps: 0,
             config,
         }
     }
@@ -159,10 +182,12 @@ impl Pipeline {
     /// Process a single allocation event through the full pipeline.
     ///
     /// This is the heartbeat. Every malloc flows here:
-    /// 1. Register with condenser (for tier management)
-    /// 2. Record in event buffer (for graph learning)
-    /// 3. If graph is learned, predict what's next
-    /// 4. Pre-promote predicted regions
+    /// 1. Register with condenser + Lenia field
+    /// 2. Heat the Lenia field (access = energy injection)
+    /// 3. Record in event buffer (for graph learning)
+    /// 4. If graph is learned, predict what's next
+    /// 5. Pre-promote predicted regions
+    /// 6. Periodically step the Lenia field (continuous dynamics)
     pub fn process_alloc(&mut self, address: usize, size: usize) {
         self.events_processed += 1;
         let ts = self.elapsed_ns();
@@ -172,25 +197,31 @@ impl Pipeline {
             return;
         }
 
-        // 1. Register with condenser
+        // 1. Register with condenser AND Lenia field
         self.condenser.register(address, size);
+        let field_id = self.get_or_create_field_id(address, size as u64);
 
-        // 2. Record for graph learning
+        // 2. Heat the field — this access injects energy
+        self.field.access(field_id);
+
+        // 3. Record for graph learning
         let path = self.get_path(address, size);
         self.event_buffer.push((ts, path.clone(), size as u64));
 
-        // 3. If predictor is learned, fire predictions
+        // 4. If predictor is learned, fire predictions
         if self.predictor.is_learned() {
             let predictions = self.predictor.predict(&path, 5);
             self.predictions_fired += predictions.len() as u64;
 
             for pred in &predictions {
                 if pred.confidence >= self.config.prediction_threshold {
-                    // Find the address for this predicted path
-                    // and pre-promote it in the condenser
                     for (&addr, p) in &self.address_to_path {
                         if *p == pred.path {
                             self.condenser.pre_promote(addr);
+                            // Also heat the predicted region in the field
+                            if let Some(&fid) = self.address_to_field_id.get(&addr) {
+                                self.field.access(fid);
+                            }
                             self.predictions_acted += 1;
                             break;
                         }
@@ -199,16 +230,49 @@ impl Pipeline {
             }
         }
 
-        // 4. Periodically rebuild graph and retrain predictor
+        // 5. Periodically step the Lenia field
+        self.field_step_counter += 1;
+        if self.field_step_counter % 100 == 0 {
+            self.field.step();
+            self.lenia_steps += 1;
+
+            // Use Lenia's cold regions to drive condenser compression
+            let cold = self.field.get_cold_regions();
+            for (cold_id, _temp) in &cold {
+                // Find the address for this cold field region
+                for (&addr, &fid) in &self.address_to_field_id {
+                    if fid == *cold_id {
+                        // Tell condenser this region is cold
+                        self.condenser.touch(addr); // mark for idle detection
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 6. Periodically rebuild graph and retrain predictor
         if self.event_buffer.len() >= self.config.graph_rebuild_interval {
             self.rebuild_graph();
         }
+    }
+
+    /// Get or create a Lenia field ID for an address
+    fn get_or_create_field_id(&mut self, address: usize, size_bytes: u64) -> u32 {
+        if let Some(&id) = self.address_to_field_id.get(&address) {
+            return id;
+        }
+        let id = self.next_field_id;
+        self.next_field_id += 1;
+        self.field.add_region(id, size_bytes);
+        self.address_to_field_id.insert(address, id);
+        id
     }
 
     /// Process a free event
     pub fn process_free(&mut self, address: usize) {
         self.condenser.unregister(address);
         self.address_to_path.remove(&address);
+        self.address_to_field_id.remove(&address);
     }
 
     /// Rebuild the graph from accumulated events and retrain the predictor
@@ -250,6 +314,7 @@ impl Pipeline {
     /// Get pipeline summary
     pub fn summary(&self) -> PipelineSummary {
         let condenser_summary = self.condenser.summary();
+        let lenia_summary = self.field.summary();
 
         PipelineSummary {
             events_processed: self.events_processed,
@@ -259,7 +324,9 @@ impl Pipeline {
             graph_rebuilds: self.graph_rebuilds,
             predictions_fired: self.predictions_fired,
             predictions_acted: self.predictions_acted,
+            lenia_steps: self.lenia_steps,
             condenser: condenser_summary,
+            lenia: lenia_summary,
         }
     }
 }
@@ -274,7 +341,9 @@ pub struct PipelineSummary {
     pub graph_rebuilds: u64,
     pub predictions_fired: u64,
     pub predictions_acted: u64,
+    pub lenia_steps: u64,
     pub condenser: crate::condenser::CondenserSummary,
+    pub lenia: crate::lenia::LeniaSummary,
 }
 
 impl PipelineSummary {
@@ -319,6 +388,18 @@ impl PipelineSummary {
             eprintln!("  |  Same data. Same output. Less RAM.       |");
             eprintln!("  +-------------------------------------------+");
         }
+
+        eprintln!("\n  LENIA FIELD (thermal dynamics):");
+        eprintln!("    Steps:  {}", self.lenia_steps);
+        eprintln!("    Energy: {:.1} / {:.1} ({:.1}% of budget)",
+                 self.lenia.total_energy, self.lenia.max_energy, self.lenia.energy_pct);
+        eprintln!("    HOT  (>{:.0}%): {} regions, {:.1} MB",
+                 self.lenia.hot_threshold * 100.0, self.lenia.hot, self.lenia.hot_mb);
+        eprintln!("    WARM ({:.0}%-{:.0}%): {} regions, {:.1} MB",
+                 self.lenia.cold_threshold * 100.0, self.lenia.hot_threshold * 100.0,
+                 self.lenia.warm, self.lenia.warm_mb);
+        eprintln!("    COLD (<{:.0}%): {} regions, {:.1} MB",
+                 self.lenia.cold_threshold * 100.0, self.lenia.cold, self.lenia.cold_mb);
 
         eprintln!("{}\n", "=".repeat(55));
     }
