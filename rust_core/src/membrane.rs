@@ -258,7 +258,7 @@ static PIPELINE: std::sync::LazyLock<Mutex<Pipeline>> =
 
 /// Scan counter — run condenser scan every N allocs
 static SCAN_COUNTER: AtomicU64 = AtomicU64::new(0);
-const SCAN_INTERVAL: u64 = 10_000; // scan every 10,000 allocs
+const SCAN_INTERVAL: u64 = 1_000; // scan every 1,000 allocs
 
 // --- LD_PRELOAD hook functions ---
 

@@ -37,10 +37,10 @@ impl Default for PipelineConfig {
         Self {
             causal_window_ns: 5_000_000,        // 5ms
             cluster_threshold: 0.7,
-            idle_threshold_ns: 5_000_000_000,   // 5 seconds
+            idle_threshold_ns: 1_000_000_000,   // 1 second (was 5 — too conservative)
             min_manage_size: 4_096,             // 4KB
             graph_rebuild_interval: 500,         // rebuild graph every 500 events
-            prediction_threshold: 0.5,           // act on predictions with >50% confidence
+            prediction_threshold: 0.3,           // act on predictions with >30% confidence
         }
     }
 }
@@ -123,29 +123,35 @@ impl Pipeline {
     }
 
     /// Get or create a path name for an address.
-    /// Paths are how the graph identifies nodes.
-    /// We bucket by size class for better pattern learning —
-    /// "all 64KB allocations" behave similarly regardless of address.
+    ///
+    /// ADAPTIVE IDENTITY — inspired by Gaussian splatting's density control.
+    /// Just as splats represent regions, not points, allocations are
+    /// identified by their SIZE CLASS, not their address. All 64KB allocs
+    /// share the path "large" — the graph learns that "large follows large"
+    /// which IS the pattern. Specific addresses are tracked separately
+    /// for the condenser to manage, but the graph sees classes.
+    ///
+    /// This is Law 7 applied: raw size enters the substrate, no
+    /// classification beyond the physical size bucket. The graph
+    /// discovers which buckets co-occur and in what order.
     fn get_path(&mut self, address: usize, size: usize) -> String {
-        if let Some(path) = self.address_to_path.get(&address) {
-            return path.clone();
-        }
-
-        // Name by size bucket — the graph learns that "64KB allocs"
-        // follow "64KB allocs", not that address 0x1234 follows 0x5678.
-        // This is the key insight: allocation SIZE PATTERNS are what
-        // repeat, not specific addresses.
-        let bucket = match size {
-            0..=63 => "tiny",
-            64..=1023 => "small",
-            1024..=65535 => "med",
-            65536..=1048575 => "large",
-            1048576..=67108863 => "huge",
-            _ => "massive",
+        // Size-class identity — all allocs of similar size share a path
+        // This makes predictions transferable across allocations
+        let path = match size {
+            0..=63 => "tiny".to_string(),
+            64..=1023 => "small".to_string(),
+            1024..=4095 => "med.1k".to_string(),
+            4096..=16383 => "med.4k".to_string(),
+            16384..=65535 => "med.16k".to_string(),
+            65536..=262143 => "large.64k".to_string(),
+            262144..=1048575 => "large.256k".to_string(),
+            1048576..=4194303 => "huge.1m".to_string(),
+            4194304..=16777215 => "huge.4m".to_string(),
+            16777216..=67108863 => "huge.16m".to_string(),
+            _ => "massive".to_string(),
         };
 
-        self.path_counter += 1;
-        let path = format!("{}.{}", bucket, self.path_counter);
+        // Map address to path for condenser lookups
         self.address_to_path.insert(address, path.clone());
         path
     }

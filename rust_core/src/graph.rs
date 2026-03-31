@@ -364,8 +364,9 @@ impl AccessGraph {
     /// Get cluster members for a node by path.
     pub fn get_cluster_members(&self, path: &str) -> Option<&[u32]> {
         let &id = self.path_to_id.get(path)?;
-        let cluster_id = self.cluster_map[id as usize]?;
-        Some(&self.clusters[cluster_id as usize].member_ids)
+        let cluster_id = self.cluster_map.get(id as usize)?.as_ref()?;
+        self.clusters.get(*cluster_id as usize)
+            .map(|c| c.member_ids.as_slice())
     }
 
     /// Get path for a node ID.
