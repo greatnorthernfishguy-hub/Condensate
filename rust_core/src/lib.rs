@@ -14,6 +14,7 @@ pub mod predictor;
 pub mod membrane;
 pub mod condenser;
 pub mod pipeline;
+pub mod lenia;
 mod bench;
 
 #[cfg(feature = "python")]
