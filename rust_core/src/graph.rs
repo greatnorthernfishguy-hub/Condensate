@@ -5,6 +5,7 @@
 //!
 //! This replaces the Python GraphBuilder with sub-microsecond performance.
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
@@ -84,7 +85,7 @@ pub struct NodeInfo {
 /// The access graph — learns memory access topology.
 ///
 /// Exposed to Python via PyO3.
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 pub struct AccessGraph {
     /// Path → node ID mapping
     path_to_id: HashMap<String, u32>,
@@ -106,10 +107,10 @@ pub struct AccessGraph {
     cluster_map: Vec<Option<u32>>,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl AccessGraph {
-    #[new]
-    #[pyo3(signature = (causal_window_ns=5_000_000, cluster_threshold=0.7))]
+    #[cfg_attr(feature = "python", new)]
+    #[cfg_attr(feature = "python", pyo3(signature = (causal_window_ns=5_000_000, cluster_threshold=0.7)))]
     pub fn new(causal_window_ns: u64, cluster_threshold: f64) -> Self {
         Self {
             path_to_id: HashMap::new(),

@@ -4,26 +4,27 @@
 //! When a path is accessed, spikes propagate to predicted-next
 //! paths via direct successors, causal chains, and cluster co-activation.
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use crate::graph::AccessGraph;
 
 /// A single prediction: what will be accessed, when, how confident.
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Debug)]
 pub struct Prediction {
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub path: String,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub confidence: f64,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub expected_delta_ms: f64,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub source_path: String,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub chain_depth: u32,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl Prediction {
     fn __repr__(&self) -> String {
         format!(
@@ -34,22 +35,22 @@ impl Prediction {
 }
 
 /// Scoring results from prediction evaluation.
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Debug)]
 pub struct ScoreResult {
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub predictions_made: u32,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub hits: u32,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub misses: u32,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub accuracy: f64,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub direct_hits: u32,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub chain_hits: u32,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub cluster_hits: u32,
 }
 
@@ -57,7 +58,7 @@ pub struct ScoreResult {
 ///
 /// This is the proto-SNN. Production replaces this with real NeuroGraph
 /// spike propagation.
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 pub struct RustPredictor {
     /// Reference to the graph we learned from
     /// (We store a copy of the data we need)
@@ -80,9 +81,9 @@ pub struct RustPredictor {
     score_window_ns: u64,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl RustPredictor {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     pub fn new() -> Self {
         Self {
             learned: false,
@@ -146,7 +147,7 @@ impl RustPredictor {
     /// Predict what will be accessed next after `path`.
     ///
     /// Returns top-K predictions sorted by confidence.
-    #[pyo3(signature = (path, top_k=10))]
+    #[cfg_attr(feature = "python", pyo3(signature = (path, top_k=10)))]
     pub fn predict(&self, path: &str, top_k: usize) -> Vec<Prediction> {
         if !self.learned {
             return Vec::new();

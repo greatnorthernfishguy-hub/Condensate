@@ -2,16 +2,25 @@
 name = "condensate_core"
 version = "0.1.0"
 edition = "2024"
-description = "Living memory manager — Rust core with PyO3 bindings"
+description = "Living memory manager — Rust core with PyO3 bindings + LD_PRELOAD membrane"
 license = "AGPL-3.0"
 
 [lib]
 name = "condensate_core"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "condensate_cli"
+path = "src/cli.rs"
+
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"] }
+pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
 lz4_flex = "0.11"
+libc = "0.2"
+
+[features]
+default = ["python"]
+python = ["pyo3"]
 
 [profile.release]
 opt-level = 3
