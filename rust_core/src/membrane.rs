@@ -403,18 +403,149 @@ impl MembraneSummary {
 #[cfg(feature = "preload")]
 mod preload_hooks {
 use super::*;
+use std::sync::atomic::AtomicUsize;
 
-/// Global membrane state behind a mutex
+/// Event type tag for the ring buffer
+const EVENT_ALLOC: u8 = 1;
+const EVENT_FREE: u8 = 2;
+const EVENT_EMPTY: u8 = 0;
+
+/// Single event in the lock-free ring buffer.
+/// Sized for cache-line alignment (32 bytes).
+#[repr(C)]
+struct RingEvent {
+    tag: std::sync::atomic::AtomicU8,  // EVENT_EMPTY, EVENT_ALLOC, EVENT_FREE
+    _pad: u8,
+    size_kb: u16,                       // size in KB (enough for up to 64MB)
+    address: u32,                       // lower 32 bits of address (unique enough for tracking)
+    timestamp_ns: u64,                  // monotonic time
+    _reserved: [u8; 16],               // pad to 32 bytes
+}
+
+/// Lock-free ring buffer capacity — must be power of 2
+const RING_SIZE: usize = 65536; // 64K slots × 32 bytes = 2MB ring
+
+/// The ring buffer — malloc/free push events here with no locks.
+/// The background drain thread reads them.
+static RING: std::sync::LazyLock<Box<[RingEvent]>> = std::sync::LazyLock::new(|| {
+    let mut v = Vec::with_capacity(RING_SIZE);
+    for _ in 0..RING_SIZE {
+        v.push(RingEvent {
+            tag: std::sync::atomic::AtomicU8::new(EVENT_EMPTY),
+            _pad: 0,
+            size_kb: 0,
+            address: 0,
+            timestamp_ns: 0,
+            _reserved: [0; 16],
+        });
+    }
+    v.into_boxed_slice()
+});
+
+/// Write cursor — atomically incremented by malloc/free hooks
+static WRITE_POS: AtomicUsize = AtomicUsize::new(0);
+
+/// Global membrane state — only accessed by drain thread
 static MEMBRANE: std::sync::LazyLock<Mutex<MembraneState>> =
     std::sync::LazyLock::new(|| Mutex::new(MembraneState::new()));
 
-/// Global pipeline — the living loop
+/// Global pipeline — only accessed by drain thread
 static PIPELINE: std::sync::LazyLock<Mutex<Pipeline>> =
     std::sync::LazyLock::new(|| Mutex::new(Pipeline::new(PipelineConfig::default())));
 
+/// Drain thread handle
+static DRAIN_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Scan counter — run condenser scan every N allocs
 static SCAN_COUNTER: AtomicU64 = AtomicU64::new(0);
-const SCAN_INTERVAL: u64 = 1_000; // scan every 1,000 allocs
+const SCAN_INTERVAL: u64 = 1_000;
+
+/// Start the background drain thread (called once from init)
+fn start_drain_thread() {
+    if DRAIN_STARTED.swap(true, Ordering::SeqCst) {
+        return; // already started
+    }
+    std::thread::Builder::new()
+        .name("condensate-drain".to_string())
+        .spawn(|| {
+            let mut read_pos: usize = 0;
+            loop {
+                let mut drained = 0;
+                // Drain up to 1024 events per batch
+                for _ in 0..1024 {
+                    let slot = &RING[read_pos & (RING_SIZE - 1)];
+                    let tag = slot.tag.load(Ordering::Acquire);
+                    if tag == EVENT_EMPTY {
+                        break;
+                    }
+
+                    let address = slot.address as usize;
+                    let size = slot.size_kb as usize * 1024;
+
+                    match tag {
+                        EVENT_ALLOC => {
+                            if let Ok(mut state) = MEMBRANE.try_lock() {
+                                state.record_alloc(address, size);
+                            }
+                            if let Ok(mut pipeline) = PIPELINE.try_lock() {
+                                pipeline.process_alloc(address, size);
+                            }
+                            let count = SCAN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                            if count > 0 && count % SCAN_INTERVAL == 0 {
+                                if let Ok(mut pipeline) = PIPELINE.try_lock() {
+                                    pipeline.scan();
+                                }
+                            }
+                        }
+                        EVENT_FREE => {
+                            if let Ok(mut state) = MEMBRANE.try_lock() {
+                                state.record_free(address);
+                            }
+                            if let Ok(mut pipeline) = PIPELINE.try_lock() {
+                                pipeline.process_free(address);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // Mark slot as consumed
+                    slot.tag.store(EVENT_EMPTY, Ordering::Release);
+                    read_pos += 1;
+                    drained += 1;
+                }
+
+                if drained == 0 {
+                    // Nothing to drain — sleep briefly to avoid busy-spin
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        })
+        .expect("Failed to spawn condensate drain thread");
+}
+
+/// Push an event to the ring buffer — lock-free, ~10ns
+#[inline(always)]
+fn push_event(tag: u8, address: usize, size: usize) {
+    let pos = WRITE_POS.fetch_add(1, Ordering::Relaxed);
+    let slot = &RING[pos & (RING_SIZE - 1)];
+
+    // If slot isn't empty, drain thread is behind — drop this event.
+    // Better to lose an event than to stall malloc.
+    if slot.tag.load(Ordering::Relaxed) != EVENT_EMPTY {
+        return;
+    }
+
+    // Write payload before tag (tag is the release fence)
+    // SAFETY: We're the only writer to this slot (unique pos from atomic increment).
+    // The drain thread won't read until tag is set.
+    let slot_ptr = slot as *const RingEvent as *mut RingEvent;
+    unsafe {
+        (*slot_ptr).address = address as u32;
+        (*slot_ptr).size_kb = (size / 1024).min(u16::MAX as usize) as u16;
+    }
+    slot.tag.store(tag, Ordering::Release);
+}
 
 /// Get the original malloc function
 unsafe fn real_malloc(size: size_t) -> *mut c_void {
@@ -436,7 +567,7 @@ unsafe fn real_free(ptr: *mut c_void) {
     }
 }
 
-/// Hooked malloc — records the allocation, feeds the pipeline, calls real malloc
+/// Hooked malloc — pushes event to ring buffer, no locks, no pipeline on hot path
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     let ptr = unsafe { real_malloc(size) };
@@ -446,32 +577,14 @@ pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
             return;
         }
         r.set(true);
-
-        // Feed membrane state (observation/stats)
-        if let Ok(mut state) = MEMBRANE.try_lock() {
-            state.record_alloc(ptr as usize, size);
-        }
-
-        // Feed the living pipeline (learn → predict → act)
-        if let Ok(mut pipeline) = PIPELINE.try_lock() {
-            pipeline.process_alloc(ptr as usize, size);
-        }
-
-        // Periodic compression scan
-        let count = SCAN_COUNTER.fetch_add(1, Ordering::Relaxed);
-        if count > 0 && count % SCAN_INTERVAL == 0 {
-            if let Ok(mut pipeline) = PIPELINE.try_lock() {
-                pipeline.scan();
-            }
-        }
-
+        push_event(EVENT_ALLOC, ptr as usize, size);
         r.set(false);
     });
 
     ptr
 }
 
-/// Hooked free — records the deallocation, updates pipeline, calls real free
+/// Hooked free — pushes event to ring buffer, no locks
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     if ptr.is_null() {
@@ -483,15 +596,7 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
             return;
         }
         r.set(true);
-
-        if let Ok(mut state) = MEMBRANE.try_lock() {
-            state.record_free(ptr as usize);
-        }
-
-        if let Ok(mut pipeline) = PIPELINE.try_lock() {
-            pipeline.process_free(ptr as usize);
-        }
-
+        push_event(EVENT_FREE, ptr as usize, 0);
         r.set(false);
     });
 
@@ -532,8 +637,12 @@ pub extern "C" fn condensate_summary() {
 static INIT: extern "C" fn() = {
     extern "C" fn init() {
         INITIALIZED.store(true, Ordering::SeqCst);
-        // Silent startup — don't spam every short-lived command
-        // Long-lived processes get their summary on exit
+
+        // Force ring buffer allocation before any malloc hooks fire
+        let _ = &*RING;
+
+        // Start the background drain thread
+        start_drain_thread();
 
         unsafe { libc::atexit(condensate_summary) };
     }
