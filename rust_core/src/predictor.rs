@@ -9,22 +9,18 @@ use pyo3::prelude::*;
 use crate::graph::AccessGraph;
 
 /// A single prediction: what will be accessed, when, how confident.
-#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "python", pyclass(get_all))]
 pub struct Prediction {
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub path: String,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub confidence: f64,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub expected_delta_ms: f64,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub source_path: String,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub chain_depth: u32,
 }
 
-#[cfg_attr(feature = "python", pymethods)]
+#[cfg(feature = "python")]
+#[pymethods]
 impl Prediction {
     fn __repr__(&self) -> String {
         format!(
@@ -35,22 +31,15 @@ impl Prediction {
 }
 
 /// Scoring results from prediction evaluation.
-#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "python", pyclass(get_all))]
 pub struct ScoreResult {
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub predictions_made: u32,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub hits: u32,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub misses: u32,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub accuracy: f64,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub direct_hits: u32,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub chain_hits: u32,
-    #[cfg_attr(feature = "python", pyo3(get))]
     pub cluster_hits: u32,
 }
 
@@ -81,9 +70,7 @@ pub struct RustPredictor {
     score_window_ns: u64,
 }
 
-#[cfg_attr(feature = "python", pymethods)]
 impl RustPredictor {
-    #[cfg_attr(feature = "python", new)]
     pub fn new() -> Self {
         Self {
             learned: false,
@@ -147,7 +134,6 @@ impl RustPredictor {
     /// Predict what will be accessed next after `path`.
     ///
     /// Returns top-K predictions sorted by confidence.
-    #[cfg_attr(feature = "python", pyo3(signature = (path, top_k=10)))]
     pub fn predict(&self, path: &str, top_k: usize) -> Vec<Prediction> {
         if !self.learned {
             return Vec::new();
@@ -297,6 +283,35 @@ impl RustPredictor {
     /// Check if predictor has learned.
     pub fn is_learned(&self) -> bool {
         self.learned
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl RustPredictor {
+    #[new]
+    fn py_new() -> Self {
+        Self::new()
+    }
+
+    #[pyo3(name = "learn")]
+    fn py_learn(&mut self, graph: &AccessGraph) {
+        self.learn(graph);
+    }
+
+    #[pyo3(name = "predict", signature = (path, top_k=10))]
+    fn py_predict(&self, path: &str, top_k: usize) -> Vec<Prediction> {
+        self.predict(path, top_k)
+    }
+
+    #[pyo3(name = "score")]
+    fn py_score(&self, events: Vec<(u64, String, u64)>) -> ScoreResult {
+        self.score(events)
+    }
+
+    #[pyo3(name = "is_learned")]
+    fn py_is_learned(&self) -> bool {
+        self.is_learned()
     }
 }
 

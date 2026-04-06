@@ -19,8 +19,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::collections::HashMap;
 use std::time::Instant;
+use std::fs;
+use std::io::Write;
 
 use crate::pipeline::{Pipeline, PipelineConfig};
+
+/// Operating mode for the membrane
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MembraneMode {
+    /// Record observations but don't feed the condenser
+    ObserveOnly,
+    /// Full condensation — observation + active pipeline feeding
+    Active,
+}
 
 /// Global state for the membrane
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -73,10 +84,51 @@ pub struct MembraneState {
     sample_counter: u32,
     /// Minimum allocation size to track (skip tiny allocs)
     min_track_size: usize,
+
+    // --- Observe-only mode ---
+    /// Current operating mode (starts ObserveOnly)
+    pub mode: MembraneMode,
+
+    // --- Process identification ---
+    /// Name of this process (from /proc/self/exe)
+    pub process_name: String,
+    /// PID of this process
+    pub process_id: u32,
+
+    // --- Confidence gating ---
+    /// Number of observation cycles recorded
+    pub observation_cycles: u64,
+    /// Minimum cycles before mode can become Active
+    pub min_observation_cycles: u64,
+
+    // --- Self-interference detection ---
+    /// Timestamp (ns) when we transitioned from ObserveOnly → Active
+    pub engagement_timestamp_ns: Option<u64>,
+
+    // --- Canary system ---
+    /// Path to the active canary file (if armed)
+    pub canary_file: Option<String>,
+    /// How long (seconds) before a canary is considered expired
+    pub canary_timeout_s: u64,
+
+    // --- Quiet mode ---
+    /// Suppress all stdout/stderr output when true
+    pub quiet: bool,
 }
 
 impl MembraneState {
     pub fn new() -> Self {
+        // Resolve process name from /proc/self/exe; fallback to "unknown"
+        let process_name = std::fs::read_link("/proc/self/exe")
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let process_id = std::process::id();
+
+        // Quiet mode: suppress output when CONDENSATE_QUIET is set
+        let quiet = std::env::var("CONDENSATE_QUIET").is_ok();
+
         Self {
             start: Instant::now(),
             active: HashMap::with_capacity(10_000),
@@ -95,10 +147,107 @@ impl MembraneState {
             sample_rate: 100,  // Track 1 in 100 allocs by default
             sample_counter: 0,
             min_track_size: 4096, // Skip allocs under 4KB
+            mode: MembraneMode::ObserveOnly,
+            process_name,
+            process_id,
+            observation_cycles: 0,
+            min_observation_cycles: 1000,
+            engagement_timestamp_ns: None,
+            canary_file: None,
+            canary_timeout_s: 60,
+            quiet,
         }
     }
 
-    fn elapsed_ns(&self) -> u64 {
+    // --- Observe-only mode ---
+
+    /// Return the current operating mode
+    pub fn mode(&self) -> MembraneMode {
+        self.mode
+    }
+
+    /// Set the operating mode directly
+    pub fn set_mode(&mut self, mode: MembraneMode) {
+        self.mode = mode;
+    }
+
+    // --- Confidence gating ---
+
+    /// Increment the observation cycle counter
+    pub fn record_cycle(&mut self) {
+        self.observation_cycles += 1;
+    }
+
+    /// True once enough cycles have been observed to trust the data
+    pub fn is_confident(&self) -> bool {
+        self.observation_cycles >= self.min_observation_cycles
+    }
+
+    // --- Self-interference detection ---
+
+    /// Report this process as potentially dangerous; append to the blacklist file
+    pub fn report_crash(&self) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/condensate_blacklist")
+        {
+            let _ = writeln!(f, "{}", self.process_name);
+        }
+    }
+
+    /// True if this process's name appears in the blacklist file
+    pub fn is_blacklisted(&self) -> bool {
+        fs::read_to_string("/tmp/condensate_blacklist")
+            .map(|contents| {
+                contents.lines().any(|line| line == self.process_name)
+            })
+            .unwrap_or(false)
+    }
+
+    // --- Canary system ---
+
+    /// Arm the canary: write a file with the engagement timestamp and timeout.
+    /// Also records engagement_timestamp_ns on the state and transitions to Active.
+    pub fn arm_canary(&mut self) {
+        let now_ns = self.elapsed_ns();
+        self.engagement_timestamp_ns = Some(now_ns);
+        self.mode = MembraneMode::Active;
+
+        let path = format!("/tmp/condensate_canary_{}", self.process_id);
+        if let Ok(mut f) = fs::File::create(&path) {
+            let _ = writeln!(f, "engagement_ns={}", now_ns);
+            let _ = writeln!(f, "timeout_s={}", self.canary_timeout_s);
+        }
+        self.canary_file = Some(path);
+    }
+
+    /// Confirm health: delete the canary file
+    pub fn confirm_canary(&mut self) {
+        if let Some(ref path) = self.canary_file {
+            let _ = fs::remove_file(path);
+        }
+        self.canary_file = None;
+    }
+
+    /// True if the canary was armed and has now exceeded its timeout
+    pub fn check_canary_expired(&self, now_ns: u64) -> bool {
+        match self.engagement_timestamp_ns {
+            Some(ts) => {
+                let elapsed_s = now_ns.saturating_sub(ts) / 1_000_000_000;
+                elapsed_s >= self.canary_timeout_s
+            }
+            None => false,
+        }
+    }
+
+    /// Rollback: revert to ObserveOnly and clean up the canary file
+    pub fn rollback(&mut self) {
+        self.mode = MembraneMode::ObserveOnly;
+        self.confirm_canary(); // deletes the canary file if present
+    }
+
+    pub fn elapsed_ns(&self) -> u64 {
         self.start.elapsed().as_nanos() as u64
     }
 
@@ -248,6 +397,13 @@ impl MembraneSummary {
     }
 }
 
+// --- LD_PRELOAD hook functions ---
+// Only compiled when building the standalone preload .so.
+// NOT active during tests or when used as a Python module.
+#[cfg(feature = "preload")]
+mod preload_hooks {
+use super::*;
+
 /// Global membrane state behind a mutex
 static MEMBRANE: std::sync::LazyLock<Mutex<MembraneState>> =
     std::sync::LazyLock::new(|| Mutex::new(MembraneState::new()));
@@ -259,8 +415,6 @@ static PIPELINE: std::sync::LazyLock<Mutex<Pipeline>> =
 /// Scan counter — run condenser scan every N allocs
 static SCAN_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SCAN_INTERVAL: u64 = 1_000; // scan every 1,000 allocs
-
-// --- LD_PRELOAD hook functions ---
 
 /// Get the original malloc function
 unsafe fn real_malloc(size: size_t) -> *mut c_void {
@@ -344,9 +498,24 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
     unsafe { real_free(ptr) }
 }
 
-/// Print full pipeline summary on process exit
+/// Print full pipeline summary on process exit — only if process ran long enough
 #[unsafe(no_mangle)]
 pub extern "C" fn condensate_summary() {
+    // Only print for long-lived processes (>5 seconds)
+    // Short-lived commands (ls, grep, cat) shouldn't flood stderr
+    let (elapsed, quiet) = MEMBRANE.try_lock()
+        .map(|s| (s.elapsed_ns(), s.quiet))
+        .unwrap_or((0, false));
+
+    if elapsed < 5_000_000_000 {
+        return; // process ran < 5 seconds, skip summary
+    }
+
+    // Honour quiet mode — suppress all output
+    if quiet {
+        return;
+    }
+
     // Membrane stats
     if let Ok(state) = MEMBRANE.lock() {
         state.summary().print();
@@ -363,12 +532,15 @@ pub extern "C" fn condensate_summary() {
 static INIT: extern "C" fn() = {
     extern "C" fn init() {
         INITIALIZED.store(true, Ordering::SeqCst);
-        eprintln!("[condensate] Living pipeline active — membrane → graph → predictor → condenser");
+        // Silent startup — don't spam every short-lived command
+        // Long-lived processes get their summary on exit
 
         unsafe { libc::atexit(condensate_summary) };
     }
     init
 };
+
+} // mod preload_hooks
 
 #[cfg(test)]
 mod tests {
@@ -420,5 +592,106 @@ mod tests {
         // Check that buckets have counts
         let total_bucket_count: u64 = summary.buckets.iter().map(|b| b.count).sum();
         assert_eq!(total_bucket_count, 5);
+    }
+
+    #[test]
+    fn test_observe_only_mode() {
+        let state = MembraneState::new();
+        assert_eq!(state.mode(), MembraneMode::ObserveOnly);
+    }
+
+    #[test]
+    fn test_confidence_gating() {
+        let mut state = MembraneState::new();
+        state.min_observation_cycles = 5;
+
+        // Before enough cycles: not confident
+        assert!(!state.is_confident());
+
+        for _ in 0..4 {
+            state.record_cycle();
+        }
+        assert!(!state.is_confident());
+
+        // After reaching min_observation_cycles: confident
+        state.record_cycle();
+        assert!(state.is_confident());
+    }
+
+    #[test]
+    fn test_mode_transition() {
+        let mut state = MembraneState::new();
+        state.min_observation_cycles = 3;
+
+        assert_eq!(state.mode(), MembraneMode::ObserveOnly);
+
+        for _ in 0..3 {
+            state.record_cycle();
+        }
+        assert!(state.is_confident());
+
+        state.set_mode(MembraneMode::Active);
+        assert_eq!(state.mode(), MembraneMode::Active);
+    }
+
+    #[test]
+    fn test_quiet_mode() {
+        // Without the env var set, quiet should be false
+        std::env::remove_var("CONDENSATE_QUIET");
+        let state = MembraneState::new();
+        assert!(!state.quiet);
+
+        // With the env var set, quiet should be true
+        std::env::set_var("CONDENSATE_QUIET", "1");
+        let state_quiet = MembraneState::new();
+        assert!(state_quiet.quiet);
+
+        // Clean up
+        std::env::remove_var("CONDENSATE_QUIET");
+    }
+
+    #[test]
+    fn test_canary_arm_and_confirm() {
+        let mut state = MembraneState::new();
+
+        // Before arming: no canary file
+        assert!(state.canary_file.is_none());
+
+        state.arm_canary();
+
+        // After arming: file should exist on disk
+        let path = state.canary_file.clone().expect("canary_file should be set after arm_canary");
+        assert!(std::path::Path::new(&path).exists(), "canary file should exist after arm_canary");
+        // Mode transitions to Active
+        assert_eq!(state.mode(), MembraneMode::Active);
+        // engagement timestamp is recorded
+        assert!(state.engagement_timestamp_ns.is_some());
+
+        state.confirm_canary();
+
+        // After confirming: file should be gone and canary_file cleared
+        assert!(state.canary_file.is_none());
+        assert!(!std::path::Path::new(&path).exists(), "canary file should be removed after confirm_canary");
+    }
+
+    #[test]
+    fn test_canary_expiry() {
+        let mut state = MembraneState::new();
+        state.canary_timeout_s = 2; // 2-second timeout
+
+        state.arm_canary();
+
+        let armed_ns = state.engagement_timestamp_ns.unwrap();
+
+        // A timestamp just before expiry should not be expired
+        let before_expiry_ns = armed_ns + 1_000_000_000; // 1 second later
+        assert!(!state.check_canary_expired(before_expiry_ns));
+
+        // A timestamp past the timeout should report expired
+        let after_expiry_ns = armed_ns + 3_000_000_000; // 3 seconds later
+        assert!(state.check_canary_expired(after_expiry_ns));
+
+        // Clean up the canary file
+        state.confirm_canary();
     }
 }

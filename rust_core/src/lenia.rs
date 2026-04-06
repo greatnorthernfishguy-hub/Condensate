@@ -26,6 +26,8 @@ use std::collections::HashMap;
 pub struct FieldRegion {
     /// Unique identifier (size-class path from pipeline)
     pub id: u32,
+    /// Process that owns this region
+    pub process_id: u32,
     /// Current temperature: 0.0 (frozen/cold) to 1.0 (fully hot)
     pub temperature: f64,
     /// Temperature at last step (for delta computation)
@@ -38,18 +40,22 @@ pub struct FieldRegion {
     pub size_bytes: u64,
     /// Number of times accessed
     pub access_count: u64,
+    /// Whether this region is priority (temperature floor at 0.5)
+    pub priority: bool,
 }
 
 impl FieldRegion {
     pub fn new(id: u32, size_bytes: u64) -> Self {
         Self {
             id,
+            process_id: 0,
             temperature: 1.0, // start hot (just allocated)
             prev_temperature: 1.0,
             access_weight: 1.0,
             decay_rate: 0.05, // 5% decay per step
             size_bytes,
             access_count: 1,
+            priority: false,
         }
     }
 
@@ -114,6 +120,9 @@ pub struct LeniaField {
     /// (RAM budget expressed as field energy)
     max_total_energy: f64,
 
+    /// RAM budget in MB (kept in sync with max_total_energy)
+    ram_budget_mb: usize,
+
     /// Current total energy
     total_energy: f64,
 
@@ -128,6 +137,15 @@ pub struct LeniaField {
 
     /// Time step size (controls how fast the field evolves)
     dt: f64,
+
+    /// Accumulated page fault count since last tune
+    page_fault_count: u64,
+
+    /// Steps since last adaptive tune
+    steps_since_tune: u64,
+
+    /// How many steps between adaptive tuning checks
+    tune_interval: u64,
 }
 
 impl LeniaField {
@@ -145,17 +163,22 @@ impl LeniaField {
             },
             decay_rate: 0.02,   // 2% cooling per step
             max_total_energy: max_energy,
+            ram_budget_mb: ram_budget_mb as usize,
             total_energy: 0.0,
             cold_threshold: 0.2,  // below 20% = compress
             hot_threshold: 0.7,   // above 70% = fully materialized
             steps: 0,
             dt: 0.1,  // time step
+            page_fault_count: 0,
+            steps_since_tune: 0,
+            tune_interval: 100,
         }
     }
 
-    /// Add a region to the field
-    pub fn add_region(&mut self, id: u32, size_bytes: u64) {
-        let region = FieldRegion::new(id, size_bytes);
+    /// Add a region to the field with explicit process ownership
+    pub fn add_region(&mut self, id: u32, size_bytes: usize, process_id: u32) {
+        let mut region = FieldRegion::new(id, size_bytes as u64);
+        region.process_id = process_id;
         let energy = region.temperature * (size_bytes as f64 / (1024.0 * 1024.0));
         self.total_energy += energy;
         self.regions.insert(id, region);
@@ -164,6 +187,46 @@ impl LeniaField {
     /// Set neighborhood connections from graph edges
     pub fn set_neighbors(&mut self, id: u32, neighbors: Vec<(u32, f64)>) {
         self.neighbors.insert(id, neighbors);
+    }
+
+    /// Update the RAM budget directly (in MB)
+    pub fn set_budget(&mut self, budget_mb: usize) {
+        self.ram_budget_mb = budget_mb;
+        self.max_total_energy = budget_mb as f64;
+    }
+
+    /// Read /proc/meminfo and update budget from MemAvailable
+    /// Silently no-ops if the file cannot be read or parsed
+    pub fn update_budget_from_system(&mut self) {
+        let contents = match std::fs::read_to_string("/proc/meminfo") {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for line in contents.lines() {
+            if line.starts_with("MemAvailable:") {
+                // Format: "MemAvailable:   12345678 kB"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<usize>() {
+                        let mb = kb / 1024;
+                        self.set_budget(mb);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /// Record a page fault event for adaptive growth tuning
+    pub fn record_page_fault(&mut self) {
+        self.page_fault_count += 1;
+    }
+
+    /// Set whether a region is priority (temperature clamped to >= 0.5)
+    pub fn set_priority(&mut self, id: u32, priority: bool) {
+        if let Some(region) = self.regions.get_mut(&id) {
+            region.priority = priority;
+        }
     }
 
     /// Record an access — heats up the region
@@ -185,8 +248,11 @@ impl LeniaField {
     /// 2. Apply growth function (determines if region heats or cools)
     /// 3. Apply natural decay (everything cools)
     /// 4. Enforce mass conservation (total energy bounded)
+    /// 5. Clamp priority regions to >= 0.5
+    /// 6. Adaptive growth tuning every tune_interval steps
     pub fn step(&mut self) {
         self.steps += 1;
+        self.steps_since_tune += 1;
 
         // Phase 1: Compute new temperatures
         let mut new_temps: HashMap<u32, f64> = HashMap::new();
@@ -210,13 +276,19 @@ impl LeniaField {
             new_temps.insert(id, new_temp);
         }
 
-        // Phase 2: Apply new temperatures
+        // Phase 2: Apply new temperatures and clamp priority regions
         self.total_energy = 0.0;
         for (&id, region) in self.regions.iter_mut() {
             region.prev_temperature = region.temperature;
             if let Some(&new_temp) = new_temps.get(&id) {
                 region.temperature = new_temp;
             }
+
+            // Priority floor: if priority and dropped below 0.5, clamp up
+            if region.priority && region.temperature < 0.5 {
+                region.temperature = 0.5;
+            }
+
             // Accumulate energy (temperature * size in MB)
             self.total_energy += region.temperature
                 * (region.size_bytes as f64 / (1024.0 * 1024.0));
@@ -230,8 +302,44 @@ impl LeniaField {
             let scale = self.max_total_energy / self.total_energy;
             for region in self.regions.values_mut() {
                 region.temperature *= scale;
+                // Re-apply priority floor after scaling
+                if region.priority && region.temperature < 0.5 {
+                    region.temperature = 0.5;
+                }
             }
             self.total_energy = self.max_total_energy;
+        }
+
+        // Phase 4: Adaptive growth tuning (Gaussian only)
+        if self.steps_since_tune >= self.tune_interval {
+            let fault_rate = if self.steps_since_tune > 0 {
+                self.page_fault_count as f64 / self.steps_since_tune as f64
+            } else {
+                0.0
+            };
+
+            if let GrowthFunction::Gaussian { ref mut center, ref mut sigma } = self.growth {
+                if fault_rate > 0.01 {
+                    // Over-cooling: too many faults — widen sigma, raise center
+                    *sigma = (*sigma * 1.05).min(0.5);
+                    *center = (*center * 1.02).min(0.8);
+                } else if fault_rate < 0.001 {
+                    // Under-cooling: check if usage > 80% budget
+                    let usage_pct = if self.max_total_energy > 0.0 {
+                        self.total_energy / self.max_total_energy
+                    } else {
+                        0.0
+                    };
+                    if usage_pct > 0.80 {
+                        *sigma = (*sigma * 0.95).max(0.05);
+                        *center = (*center * 0.98).max(0.2);
+                    }
+                }
+            }
+
+            // Reset counters
+            self.page_fault_count = 0;
+            self.steps_since_tune = 0;
         }
     }
 
@@ -316,6 +424,75 @@ impl LeniaField {
             hot_threshold: self.hot_threshold,
         }
     }
+
+    /// Serialize the field state to bytes.
+    ///
+    /// Format: 4-byte region count (u32 LE), then per region:
+    ///   u32 id, u32 process_id, f32 temperature, u64 size_bytes,
+    ///   f32 decay_rate, u8 priority
+    /// = 25 bytes per region + 4 header
+    pub fn serialize(&self) -> Vec<u8> {
+        let count = self.regions.len() as u32;
+        let mut buf = Vec::with_capacity(4 + count as usize * 25);
+
+        buf.extend_from_slice(&count.to_le_bytes());
+
+        // Sort by id for deterministic output
+        let mut ids: Vec<u32> = self.regions.keys().copied().collect();
+        ids.sort_unstable();
+
+        for id in ids {
+            let r = &self.regions[&id];
+            buf.extend_from_slice(&r.id.to_le_bytes());
+            buf.extend_from_slice(&r.process_id.to_le_bytes());
+            buf.extend_from_slice(&(r.temperature as f32).to_le_bytes());
+            buf.extend_from_slice(&r.size_bytes.to_le_bytes());
+            buf.extend_from_slice(&(r.decay_rate as f32).to_le_bytes());
+            buf.push(if r.priority { 1u8 } else { 0u8 });
+        }
+
+        buf
+    }
+
+    /// Deserialize a field from bytes produced by `serialize`.
+    /// Returns None if the data is malformed or truncated.
+    pub fn deserialize(data: &[u8], ram_budget_mb: usize) -> Option<Self> {
+        if data.len() < 4 {
+            return None;
+        }
+
+        let count = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+        let expected_len = 4 + count * 25;
+        if data.len() < expected_len {
+            return None;
+        }
+
+        let mut field = LeniaField::new(ram_budget_mb as f64);
+
+        let mut offset = 4usize;
+        for _ in 0..count {
+            let id         = u32::from_le_bytes(data[offset..offset+4].try_into().ok()?);
+            let process_id = u32::from_le_bytes(data[offset+4..offset+8].try_into().ok()?);
+            let temperature = f32::from_le_bytes(data[offset+8..offset+12].try_into().ok()?) as f64;
+            let size_bytes  = u64::from_le_bytes(data[offset+12..offset+20].try_into().ok()?);
+            let decay_rate  = f32::from_le_bytes(data[offset+20..offset+24].try_into().ok()?) as f64;
+            let priority    = data[offset+24] != 0;
+            offset += 25;
+
+            let mut region = FieldRegion::new(id, size_bytes);
+            region.process_id = process_id;
+            region.temperature = temperature;
+            region.prev_temperature = temperature;
+            region.decay_rate = decay_rate;
+            region.priority = priority;
+
+            let energy = temperature * (size_bytes as f64 / (1024.0 * 1024.0));
+            field.total_energy += energy;
+            field.regions.insert(id, region);
+        }
+
+        Some(field)
+    }
 }
 
 /// Field summary
@@ -361,13 +538,15 @@ impl LeniaSummary {
 mod tests {
     use super::*;
 
+    // ── existing tests (unchanged behaviour) ─────────────────────────────────
+
     #[test]
     fn test_field_creation() {
         let mut field = LeniaField::new(100.0); // 100MB budget
 
-        field.add_region(0, 1_048_576);  // 1MB
-        field.add_region(1, 1_048_576);
-        field.add_region(2, 1_048_576);
+        field.add_region(0, 1_048_576, 0);
+        field.add_region(1, 1_048_576, 0);
+        field.add_region(2, 1_048_576, 0);
 
         assert_eq!(field.regions.len(), 3);
 
@@ -379,7 +558,7 @@ mod tests {
     fn test_decay_makes_cold() {
         let mut field = LeniaField::new(100.0);
 
-        field.add_region(0, 1_048_576);
+        field.add_region(0, 1_048_576, 0);
 
         // Step many times without access — should cool down
         for _ in 0..100 {
@@ -394,8 +573,8 @@ mod tests {
     fn test_access_keeps_hot() {
         let mut field = LeniaField::new(100.0);
 
-        field.add_region(0, 1_048_576);
-        field.add_region(1, 1_048_576);
+        field.add_region(0, 1_048_576, 0);
+        field.add_region(1, 1_048_576, 0);
 
         // Step and access region 0, ignore region 1
         for _ in 0..50 {
@@ -419,7 +598,7 @@ mod tests {
 
         // Add 5 x 1MB regions — 5MB total, budget is 2MB
         for i in 0..5 {
-            field.add_region(i, 1_048_576);
+            field.add_region(i, 1_048_576, 0);
             field.access(i);
         }
 
@@ -435,9 +614,9 @@ mod tests {
     fn test_neighborhood_spreading() {
         let mut field = LeniaField::new(100.0);
 
-        field.add_region(0, 1_048_576);
-        field.add_region(1, 1_048_576);
-        field.add_region(2, 1_048_576);
+        field.add_region(0, 1_048_576, 0);
+        field.add_region(1, 1_048_576, 0);
+        field.add_region(2, 1_048_576, 0);
 
         // Region 0 neighbors region 1 and 2
         field.set_neighbors(0, vec![(1, 1.0), (2, 1.0)]);
@@ -474,7 +653,7 @@ mod tests {
 
         // 10 regions, access only 3
         for i in 0..10 {
-            field.add_region(i, 5_242_880); // 5MB each = 50MB total = at budget
+            field.add_region(i, 5_242_880, 0); // 5MB each = 50MB total = at budget
         }
 
         // Hot set: regions 0, 1, 2
@@ -497,5 +676,194 @@ mod tests {
         // Mass conservation: with budget = 50MB and 50MB total,
         // energy should be at or below budget
         assert!(summary.total_energy <= 50.1);
+    }
+
+    // ── new tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_lenia_process_tagged() {
+        let mut field = LeniaField::new(100.0);
+
+        field.add_region(10, 1_048_576, 42);
+        field.add_region(11, 1_048_576, 42);
+        field.add_region(12, 1_048_576, 99);
+
+        assert_eq!(field.regions[&10].process_id, 42);
+        assert_eq!(field.regions[&11].process_id, 42);
+        assert_eq!(field.regions[&12].process_id, 99);
+
+        // Default process_id is 0 for regions added with process_id=0
+        field.add_region(13, 1_048_576, 0);
+        assert_eq!(field.regions[&13].process_id, 0);
+    }
+
+    #[test]
+    fn test_lenia_set_budget() {
+        let mut field = LeniaField::new(10.0); // 10MB budget
+
+        // Fill to just above the original budget
+        for i in 0..5 {
+            field.add_region(i, 2_097_152, 0); // 2MB each = 10MB
+            field.access(i);
+        }
+        field.step();
+
+        let energy_at_10mb = field.summary().total_energy;
+        assert!(energy_at_10mb <= 10.1, "Energy should be at most 10MB: {}", energy_at_10mb);
+
+        // Expand budget — next step should allow more energy
+        field.set_budget(20);
+        assert_eq!(field.ram_budget_mb, 20);
+        assert!((field.max_total_energy - 20.0).abs() < 0.001,
+                "max_total_energy should be 20.0 after set_budget(20)");
+
+        // Re-heat everything and step — conservation limit is now 20MB
+        for i in 0..5 {
+            field.access(i);
+        }
+        field.step();
+
+        let energy_at_20mb = field.summary().total_energy;
+        assert!(energy_at_20mb <= 20.1, "Energy should be within new 20MB budget: {}", energy_at_20mb);
+    }
+
+    #[test]
+    fn test_lenia_adaptive_overcooling() {
+        // tune_interval is 100; record many faults then step 100 times
+        // fault_rate = faults / steps_since_tune
+        // We want fault_rate > 0.01 → record > 1 fault per 100 steps
+        let mut field = LeniaField::new(100.0);
+        field.add_region(0, 1_048_576, 0);
+
+        // Capture initial sigma
+        let initial_sigma = match &field.growth {
+            GrowthFunction::Gaussian { sigma, .. } => *sigma,
+            _ => panic!("Expected Gaussian growth function"),
+        };
+
+        // Record 50 page faults before the 100-step tune interval fires
+        for _ in 0..50 {
+            field.record_page_fault();
+        }
+
+        // Step exactly tune_interval times to trigger one tuning cycle
+        for _ in 0..100 {
+            field.step();
+        }
+
+        let new_sigma = match &field.growth {
+            GrowthFunction::Gaussian { sigma, .. } => *sigma,
+            _ => panic!("Expected Gaussian growth function"),
+        };
+
+        assert!(new_sigma > initial_sigma,
+            "Sigma should have widened due to over-cooling (fault_rate=0.5): initial={}, new={}",
+            initial_sigma, new_sigma);
+    }
+
+    #[test]
+    fn test_lenia_priority_exempt() {
+        let mut field = LeniaField::new(100.0);
+
+        // Add two regions: one priority, one not
+        field.add_region(0, 1_048_576, 0);
+        field.add_region(1, 1_048_576, 0);
+        field.set_priority(0, true);
+
+        // Let both cool for many steps without any access
+        for _ in 0..200 {
+            field.step();
+        }
+
+        let priority_temp = field.regions[&0].temperature;
+        let normal_temp   = field.regions[&1].temperature;
+
+        assert!(priority_temp >= 0.5,
+            "Priority region must not drop below 0.5: {}", priority_temp);
+        assert!(normal_temp < 0.5,
+            "Normal region should cool below 0.5: {}", normal_temp);
+    }
+
+    #[test]
+    fn test_lenia_serialize_roundtrip() {
+        let mut field = LeniaField::new(64.0);
+
+        field.add_region(1, 1_048_576, 7);
+        field.add_region(2, 2_097_152, 13);
+        field.add_region(3, 4_194_304, 0);
+
+        field.set_priority(1, true);
+        field.access(2);
+        field.step();
+
+        let bytes = field.serialize();
+
+        // Header: 4 bytes + 3 regions * 25 bytes = 79 bytes
+        assert_eq!(bytes.len(), 4 + 3 * 25);
+
+        let restored = LeniaField::deserialize(&bytes, 64)
+            .expect("deserialize should succeed");
+
+        assert_eq!(restored.regions.len(), field.regions.len());
+
+        for id in [1u32, 2, 3] {
+            let orig = &field.regions[&id];
+            let rest = &restored.regions[&id];
+
+            assert_eq!(rest.id, orig.id, "id mismatch for region {}", id);
+            assert_eq!(rest.process_id, orig.process_id, "process_id mismatch for {}", id);
+            assert_eq!(rest.size_bytes, orig.size_bytes, "size_bytes mismatch for {}", id);
+            assert_eq!(rest.priority, orig.priority, "priority mismatch for {}", id);
+
+            // f32 round-trip loses a tiny bit of precision
+            let temp_diff = (rest.temperature - orig.temperature).abs();
+            assert!(temp_diff < 1e-5,
+                "temperature mismatch for region {}: {} vs {}", id, orig.temperature, rest.temperature);
+
+            let decay_diff = (rest.decay_rate - orig.decay_rate).abs();
+            assert!(decay_diff < 1e-5,
+                "decay_rate mismatch for region {}: {} vs {}", id, orig.decay_rate, rest.decay_rate);
+        }
+    }
+
+    #[test]
+    fn test_lenia_cross_process_energy() {
+        // Two process groups: PIDs 1 and 2, three regions each
+        let mut field = LeniaField::new(6.0); // exactly 6MB budget
+
+        // Process 1: regions 10, 11, 12 (1MB each)
+        field.add_region(10, 1_048_576, 1);
+        field.add_region(11, 1_048_576, 1);
+        field.add_region(12, 1_048_576, 1);
+
+        // Process 2: regions 20, 21, 22 (1MB each)
+        field.add_region(20, 1_048_576, 2);
+        field.add_region(21, 1_048_576, 2);
+        field.add_region(22, 1_048_576, 2);
+
+        // Repeatedly access process 1's regions only
+        for _ in 0..50 {
+            field.access(10);
+            field.access(11);
+            field.access(12);
+            field.step();
+        }
+
+        // Process 1 regions should be hotter than process 2 regions
+        let p1_avg = [10u32, 11, 12].iter()
+            .map(|id| field.regions[id].temperature)
+            .sum::<f64>() / 3.0;
+        let p2_avg = [20u32, 21, 22].iter()
+            .map(|id| field.regions[id].temperature)
+            .sum::<f64>() / 3.0;
+
+        assert!(p1_avg > p2_avg,
+            "Process 1 (accessed) should be hotter than process 2: {:.3} vs {:.3}",
+            p1_avg, p2_avg);
+
+        // Mass conservation still holds across both process groups
+        let summary = field.summary();
+        assert!(summary.total_energy <= 6.1,
+            "Total energy must stay within 6MB budget: {}", summary.total_energy);
     }
 }

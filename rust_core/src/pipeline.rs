@@ -9,13 +9,28 @@
 //! LD_PRELOAD hooks. Every allocation event flows through the graph,
 //! triggers predictions, and the condenser acts on them.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::graph::AccessGraph;
 use crate::predictor::RustPredictor;
 use crate::condenser::{Condenser, CondenserConfig};
 use crate::lenia::LeniaField;
+
+/// Pipeline operating mode — governs whether the pipeline acts on predictions.
+///
+/// The substrate always learns. Mode controls whether it compresses.
+/// Observing → Active after confidence threshold is met.
+/// Blacklisted → permanent: never acts, never transitions.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PipelineMode {
+    /// Learning phase — graph and predictor train, condenser is silent.
+    Observing,
+    /// Fully operational — condenser compresses and pre-promotes.
+    Active,
+    /// Permanently silenced — never transitions, never compresses.
+    Blacklisted,
+}
 
 /// Pipeline configuration
 pub struct PipelineConfig {
@@ -31,6 +46,9 @@ pub struct PipelineConfig {
     pub graph_rebuild_interval: usize,
     /// Minimum prediction confidence to act on
     pub prediction_threshold: f64,
+    /// Enable test mode — condenser generates synthetic data instead of reading
+    /// from raw memory pointers. Required when using fake addresses in tests.
+    pub test_mode: bool,
 }
 
 impl Default for PipelineConfig {
@@ -42,6 +60,7 @@ impl Default for PipelineConfig {
             min_manage_size: 4_096,             // 4KB
             graph_rebuild_interval: 500,         // rebuild graph every 500 events
             prediction_threshold: 0.3,           // act on predictions with >30% confidence
+            test_mode: false,
         }
     }
 }
@@ -99,7 +118,27 @@ pub struct Pipeline {
     /// Lenia step counter (step every N events)
     field_step_counter: u64,
 
-    /// Stats
+    // ── Mode & safety model ───────────────────────────────────────────────
+
+    /// Current operating mode
+    pub mode: PipelineMode,
+
+    /// How many graph rebuilds have occurred since creation
+    /// (used for transition gate — separate from the public stats counter)
+    mode_rebuilds: u32,
+
+    /// Last measured prediction accuracy (0.0–100.0, from ScoreResult.accuracy)
+    pub last_prediction_accuracy: f64,
+
+    /// How many process_alloc calls have occurred while in Active mode
+    pub active_cycles: u64,
+
+    /// Timestamps (ns) of recent scan_and_compress calls that compressed something.
+    /// Ring-buffered: keeps last 100 entries.
+    pub condensation_timestamps: Vec<u64>,
+
+    // ── Stats ─────────────────────────────────────────────────────────────
+
     pub events_processed: u64,
     pub predictions_fired: u64,
     pub predictions_acted: u64,
@@ -109,10 +148,23 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    /// Create a new pipeline in **Active** mode (backward-compatible default).
     pub fn new(config: PipelineConfig) -> Self {
+        Self::new_with_mode(config, PipelineMode::Active)
+    }
+
+    /// Create a new pipeline in **Observing** mode.
+    /// The substrate learns immediately; compression is gated until
+    /// `check_transition()` promotes it to Active.
+    pub fn new_observing(config: PipelineConfig) -> Self {
+        Self::new_with_mode(config, PipelineMode::Observing)
+    }
+
+    fn new_with_mode(config: PipelineConfig, mode: PipelineMode) -> Self {
         let condenser_config = CondenserConfig {
             idle_threshold_ns: config.idle_threshold_ns,
             min_manage_size: config.min_manage_size,
+            test_mode: config.test_mode,
             ..Default::default()
         };
 
@@ -131,6 +183,11 @@ impl Pipeline {
             path_counter: 0,
             start: Instant::now(),
             field_step_counter: 0,
+            mode,
+            mode_rebuilds: 0,
+            last_prediction_accuracy: 0.0,
+            active_cycles: 0,
+            condensation_timestamps: Vec::with_capacity(100),
             events_processed: 0,
             predictions_fired: 0,
             predictions_acted: 0,
@@ -181,13 +238,9 @@ impl Pipeline {
 
     /// Process a single allocation event through the full pipeline.
     ///
-    /// This is the heartbeat. Every malloc flows here:
-    /// 1. Register with condenser + Lenia field
-    /// 2. Heat the Lenia field (access = energy injection)
-    /// 3. Record in event buffer (for graph learning)
-    /// 4. If graph is learned, predict what's next
-    /// 5. Pre-promote predicted regions
-    /// 6. Periodically step the Lenia field (continuous dynamics)
+    /// Graph building and predictor learning happen in ALL modes.
+    /// Condenser registration, pre-promote, and scan are gated to Active mode.
+    /// The substrate always learns — it just doesn't act until Active.
     pub fn process_alloc(&mut self, address: usize, size: usize) {
         self.events_processed += 1;
         let ts = self.elapsed_ns();
@@ -197,60 +250,75 @@ impl Pipeline {
             return;
         }
 
-        // 1. Register with condenser AND Lenia field
-        self.condenser.register(address, size);
-        let field_id = self.get_or_create_field_id(address, size as u64);
+        // Track active_cycles — graduated engagement ramp
+        if self.mode == PipelineMode::Active {
+            self.active_cycles += 1;
+        }
 
-        // 2. Heat the field — this access injects energy
-        self.field.access(field_id);
+        let threshold = self.effective_threshold();
 
-        // 3. Record for graph learning
-        let path = self.get_path(address, size);
-        self.event_buffer.push((ts, path.clone(), size as u64));
+        if self.mode == PipelineMode::Active {
+            // 1. Register with condenser AND Lenia field
+            self.condenser.register(address, size);
+            let field_id = self.get_or_create_field_id(address, size as u64);
 
-        // 4. If predictor is learned, fire predictions
-        if self.predictor.is_learned() {
-            let predictions = self.predictor.predict(&path, 5);
-            self.predictions_fired += predictions.len() as u64;
+            // 2. Heat the field — this access injects energy
+            self.field.access(field_id);
 
-            for pred in &predictions {
-                if pred.confidence >= self.config.prediction_threshold {
-                    for (&addr, p) in &self.address_to_path {
-                        if *p == pred.path {
-                            self.condenser.pre_promote(addr);
-                            // Also heat the predicted region in the field
-                            if let Some(&fid) = self.address_to_field_id.get(&addr) {
-                                self.field.access(fid);
+            // 3. Record for graph learning
+            let path = self.get_path(address, size);
+            self.event_buffer.push((ts, path.clone(), size as u64));
+
+            // 4. If predictor is learned, fire predictions
+            if self.predictor.is_learned() {
+                let predictions = self.predictor.predict(&path, 5);
+                self.predictions_fired += predictions.len() as u64;
+
+                for pred in &predictions {
+                    if pred.confidence >= threshold {
+                        for (&addr, p) in &self.address_to_path {
+                            if *p == pred.path {
+                                self.condenser.pre_promote(addr);
+                                // Also heat the predicted region in the field
+                                if let Some(&fid) = self.address_to_field_id.get(&addr) {
+                                    self.field.access(fid);
+                                }
+                                self.predictions_acted += 1;
+                                break;
                             }
-                            self.predictions_acted += 1;
+                        }
+                    }
+                }
+            }
+
+            // 5. Periodically step the Lenia field
+            self.field_step_counter += 1;
+            if self.field_step_counter % 100 == 0 {
+                self.field.step();
+                self.lenia_steps += 1;
+
+                // Use Lenia's cold regions to drive condenser compression
+                let cold = self.field.get_cold_regions();
+                for (cold_id, _temp) in &cold {
+                    // Find the address for this cold field region
+                    for (&addr, &fid) in &self.address_to_field_id {
+                        if fid == *cold_id {
+                            // Tell condenser this region is cold
+                            self.condenser.touch(addr); // mark for idle detection
                             break;
                         }
                     }
                 }
             }
+        } else {
+            // Observing or Blacklisted — substrate still learns, condenser is silent
+
+            // Record for graph learning (no condenser registration)
+            let path = self.get_path(address, size);
+            self.event_buffer.push((ts, path, size as u64));
         }
 
-        // 5. Periodically step the Lenia field
-        self.field_step_counter += 1;
-        if self.field_step_counter % 100 == 0 {
-            self.field.step();
-            self.lenia_steps += 1;
-
-            // Use Lenia's cold regions to drive condenser compression
-            let cold = self.field.get_cold_regions();
-            for (cold_id, _temp) in &cold {
-                // Find the address for this cold field region
-                for (&addr, &fid) in &self.address_to_field_id {
-                    if fid == *cold_id {
-                        // Tell condenser this region is cold
-                        self.condenser.touch(addr); // mark for idle detection
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 6. Periodically rebuild graph and retrain predictor
+        // 6. Periodically rebuild graph and retrain predictor (all modes)
         if self.event_buffer.len() >= self.config.graph_rebuild_interval {
             self.rebuild_graph();
         }
@@ -263,7 +331,7 @@ impl Pipeline {
         }
         let id = self.next_field_id;
         self.next_field_id += 1;
-        self.field.add_region(id, size_bytes);
+        self.field.add_region(id, size_bytes as usize, 0);
         self.address_to_field_id.insert(address, id);
         id
     }
@@ -275,7 +343,8 @@ impl Pipeline {
         self.address_to_field_id.remove(&address);
     }
 
-    /// Rebuild the graph from accumulated events and retrain the predictor
+    /// Rebuild the graph from accumulated events and retrain the predictor.
+    /// Called automatically from process_alloc when the event buffer fills.
     fn rebuild_graph(&mut self) {
         // Build fresh graph from accumulated events
         let mut new_graph = AccessGraph::new(
@@ -288,27 +357,113 @@ impl Pipeline {
         let mut new_predictor = RustPredictor::new();
         new_predictor.learn(&new_graph);
 
+        // Score the new predictor against the buffer we just trained on
+        if new_predictor.is_learned() && !self.event_buffer.is_empty() {
+            let score = new_predictor.score(self.event_buffer.clone());
+            self.last_prediction_accuracy = score.accuracy;
+        }
+
         self.graph = new_graph;
         self.predictor = new_predictor;
         self.graph_rebuilds += 1;
+        self.mode_rebuilds += 1;
 
         // Keep last 20% of events for continuity
         let keep = self.event_buffer.len() / 5;
         let drain_to = self.event_buffer.len() - keep;
         self.event_buffer.drain(..drain_to);
+
+        // Check mode transition after each rebuild
+        self.check_transition();
     }
 
-    /// Run the condenser's compression scan
-    /// Call this periodically (e.g., every second)
+    /// Check whether the pipeline should transition from Observing → Active.
+    ///
+    /// Transition gates:
+    /// - mode must be Observing
+    /// - at least 3 graph rebuilds since creation
+    /// - last_prediction_accuracy >= 40.0
+    ///
+    /// Blacklisted pipelines never transition.
+    ///
+    /// Returns true if a transition occurred.
+    pub fn check_transition(&mut self) -> bool {
+        match self.mode {
+            PipelineMode::Blacklisted => false,
+            PipelineMode::Active => false,
+            PipelineMode::Observing => {
+                if self.mode_rebuilds >= 3
+                    && self.last_prediction_accuracy >= 40.0
+                {
+                    self.mode = PipelineMode::Active;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Effective compression threshold — graduated engagement ramp.
+    ///
+    /// New pipelines start conservative (0.8) and relax over time.
+    /// Non-Active pipelines return 1.0 so nothing ever compresses.
+    pub fn effective_threshold(&self) -> f64 {
+        match self.mode {
+            PipelineMode::Active => {
+                if self.active_cycles < 100 {
+                    0.8
+                } else if self.active_cycles < 1100 {
+                    0.5
+                } else {
+                    self.config.prediction_threshold
+                }
+            }
+            _ => 1.0, // Never compress when not Active
+        }
+    }
+
+    /// Run the condenser's compression scan.
+    /// Call this periodically (e.g., every second).
+    ///
+    /// Records condensation timestamps for crash correlation when compression occurs.
     pub fn scan(&mut self) -> (u32, u64) {
         let (count, saved) = self.condenser.scan_and_compress();
         self.compressions += count as u64;
+        if count > 0 {
+            // Record timestamp for crash correlation (ring buffer, last 100)
+            let ts = self.elapsed_ns();
+            if self.condensation_timestamps.len() >= 100 {
+                self.condensation_timestamps.remove(0);
+            }
+            self.condensation_timestamps.push(ts);
+        }
         (count, saved)
     }
 
     /// Touch a region (it was accessed)
     pub fn touch(&mut self, address: usize) {
         self.condenser.touch(address);
+    }
+
+    /// Report that the monitored process died at `death_ns` (nanoseconds,
+    /// same epoch as `elapsed_ns`).
+    ///
+    /// Returns true if any recorded condensation event occurred within 5 seconds
+    /// of the death — suggesting the condenser may have interfered.
+    pub fn report_process_death(&mut self, death_ns: u64) -> bool {
+        const WINDOW_NS: u64 = 5_000_000_000;
+        for &ts in &self.condensation_timestamps {
+            let delta = if death_ns >= ts {
+                death_ns - ts
+            } else {
+                ts - death_ns
+            };
+            if delta <= WINDOW_NS {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get pipeline summary
@@ -328,6 +483,58 @@ impl Pipeline {
             condenser: condenser_summary,
             lenia: lenia_summary,
         }
+    }
+}
+
+/// Per-process pipeline map — routes allocation events to the correct pipeline
+/// based on PID. Each process gets its own isolated pipeline starting in
+/// Observing mode.
+pub struct ProcessPipelineMap {
+    pipelines: HashMap<u32, Pipeline>,
+    config: PipelineConfig,
+}
+
+impl ProcessPipelineMap {
+    pub fn new(config: PipelineConfig) -> Self {
+        Self {
+            pipelines: HashMap::new(),
+            config,
+        }
+    }
+
+    /// Get or create the pipeline for a given PID.
+    /// New pipelines start in Observing mode.
+    pub fn get_or_create(&mut self, pid: u32) -> &mut Pipeline {
+        if !self.pipelines.contains_key(&pid) {
+            let pipeline = Pipeline::new_observing(PipelineConfig {
+                causal_window_ns: self.config.causal_window_ns,
+                cluster_threshold: self.config.cluster_threshold,
+                idle_threshold_ns: self.config.idle_threshold_ns,
+                min_manage_size: self.config.min_manage_size,
+                graph_rebuild_interval: self.config.graph_rebuild_interval,
+                prediction_threshold: self.config.prediction_threshold,
+                test_mode: self.config.test_mode,
+            });
+            self.pipelines.insert(pid, pipeline);
+        }
+        self.pipelines.get_mut(&pid).unwrap()
+    }
+
+    /// Route an allocation event to the correct process pipeline.
+    pub fn process_alloc_global(&mut self, pid: u32, address: usize, size: usize) {
+        self.get_or_create(pid).process_alloc(address, size);
+    }
+
+    /// Route a free event to the correct process pipeline.
+    pub fn process_free_global(&mut self, pid: u32, address: usize) {
+        if let Some(pipeline) = self.pipelines.get_mut(&pid) {
+            pipeline.process_free(address);
+        }
+    }
+
+    /// Number of tracked processes.
+    pub fn process_count(&self) -> usize {
+        self.pipelines.len()
     }
 }
 
@@ -409,6 +616,8 @@ impl PipelineSummary {
 mod tests {
     use super::*;
 
+    // ── Existing tests (must continue to pass) ────────────────────────────
+
     #[test]
     fn test_pipeline_basic_flow() {
         let mut pipeline = Pipeline::new(PipelineConfig {
@@ -441,6 +650,7 @@ mod tests {
             min_manage_size: 1024,
             idle_threshold_ns: 0,  // compress immediately
             prediction_threshold: 0.1,  // low threshold to see predictions act
+            test_mode: true,  // fake addresses — use synthetic data
             ..Default::default()
         });
 
@@ -473,6 +683,7 @@ mod tests {
             min_manage_size: 1024,
             idle_threshold_ns: 0,  // compress immediately
             graph_rebuild_interval: 1000,  // don't rebuild during this test
+            test_mode: true,  // fake addresses — use synthetic data
             ..Default::default()
         });
 
@@ -517,6 +728,7 @@ mod tests {
             min_manage_size: 4096,
             idle_threshold_ns: 0,
             prediction_threshold: 0.3,
+            test_mode: true,  // fake addresses — use synthetic data
             ..Default::default()
         });
 
@@ -549,5 +761,197 @@ mod tests {
         assert!(summary.condenser.total_regions > 0);
         assert!(summary.graph_rebuilds >= 1,
                 "Graph should have rebuilt at least once");
+    }
+
+    // ── Block D: new tests ────────────────────────────────────────────────
+
+    /// Observing pipeline registers events but never compresses
+    #[test]
+    fn test_pipeline_mode_observing() {
+        let mut pipeline = Pipeline::new_observing(PipelineConfig {
+            min_manage_size: 1024,
+            idle_threshold_ns: 0,  // would compress immediately if Active
+            graph_rebuild_interval: 1000,
+            test_mode: true,
+            ..Default::default()
+        });
+
+        // Feed events
+        pipeline.process_alloc(0x10000, 65_536);
+        pipeline.process_alloc(0x20000, 65_536);
+        pipeline.process_alloc(0x30000, 65_536);
+
+        // Mode must still be Observing (not enough rebuilds / accuracy)
+        assert_eq!(pipeline.mode, PipelineMode::Observing);
+
+        // Scan should return zero compressions — condenser is silent
+        let (count, saved) = pipeline.scan();
+        assert_eq!(count, 0, "Observing pipeline must not compress");
+        assert_eq!(saved, 0);
+
+        // Condenser must have nothing registered
+        let summary = pipeline.summary();
+        assert_eq!(summary.condenser.total_regions, 0,
+                   "Observing pipeline must not register regions with condenser");
+    }
+
+    /// After 3 rebuilds with good accuracy, Observing transitions to Active
+    #[test]
+    fn test_pipeline_transition() {
+        // Use a small rebuild interval so we can force rebuilds quickly.
+        // We need mode_rebuilds >= 3 AND last_prediction_accuracy >= 40.
+        let mut pipeline = Pipeline::new_observing(PipelineConfig {
+            min_manage_size: 1024,
+            graph_rebuild_interval: 10,
+            idle_threshold_ns: 1_000_000_000,
+            prediction_threshold: 0.1,
+            ..Default::default()
+        });
+
+        // Drive a strong repeating pattern so the predictor scores well.
+        // Each batch of 10+ events triggers a rebuild.
+        for _round in 0..5 {
+            for i in 0..12usize {
+                let size = if i % 2 == 0 { 65_536 } else { 131_072 };
+                pipeline.process_alloc(0x10000 + i * 0x1000, size);
+            }
+        }
+
+        assert!(pipeline.graph_rebuilds >= 3,
+                "Expected at least 3 rebuilds, got {}", pipeline.graph_rebuilds);
+
+        // Patch accuracy to guarantee the transition gate passes,
+        // then call check_transition (also called internally — idempotent).
+        pipeline.last_prediction_accuracy = 50.0;
+        let transitioned = pipeline.check_transition();
+
+        assert!(transitioned, "Should have transitioned to Active");
+        assert_eq!(pipeline.mode, PipelineMode::Active);
+    }
+
+    /// effective_threshold returns 0.8 fresh, 0.5 mid-ramp, config value at maturity
+    #[test]
+    fn test_pipeline_graduated_threshold() {
+        let mut pipeline = Pipeline::new(PipelineConfig {
+            prediction_threshold: 0.3,
+            ..Default::default()
+        });
+
+        // Fresh Active pipeline, 0 cycles
+        assert_eq!(pipeline.active_cycles, 0);
+        assert_eq!(pipeline.effective_threshold(), 0.8,
+                   "Fresh active pipeline should use conservative 0.8 threshold");
+
+        // Mid-ramp
+        pipeline.active_cycles = 500;
+        assert_eq!(pipeline.effective_threshold(), 0.5,
+                   "Mid-ramp should use 0.5 threshold");
+
+        // Mature
+        pipeline.active_cycles = 1100;
+        assert_eq!(pipeline.effective_threshold(), 0.3,
+                   "Mature pipeline should use config threshold");
+
+        // Observing always returns 1.0
+        let observing = Pipeline::new_observing(PipelineConfig::default());
+        assert_eq!(observing.effective_threshold(), 1.0,
+                   "Observing pipeline threshold must be 1.0 (never compress)");
+    }
+
+    /// Condensation within 5 seconds of process death is flagged
+    #[test]
+    fn test_pipeline_crash_correlation() {
+        let mut pipeline = Pipeline::new(PipelineConfig {
+            min_manage_size: 1024,
+            idle_threshold_ns: 0,
+            graph_rebuild_interval: 1000,
+            test_mode: true,  // fake addresses — use synthetic data
+            ..Default::default()
+        });
+
+        // Compress something so a timestamp is recorded
+        pipeline.process_alloc(0x10000, 65_536);
+        let (count, _) = pipeline.scan();
+        assert_eq!(count, 1, "Expected one compression");
+        assert_eq!(pipeline.condensation_timestamps.len(), 1);
+
+        // Death 1 second after condensation — inside the 5s window
+        let condensation_ts = pipeline.condensation_timestamps[0];
+        let death_1s_later = condensation_ts + 1_000_000_000;
+        assert!(
+            pipeline.report_process_death(death_1s_later),
+            "Death 1s after condensation should be flagged as likely interference"
+        );
+
+        // Death 10 seconds later — outside window
+        let death_10s_later = condensation_ts + 10_000_000_000;
+        assert!(
+            !pipeline.report_process_death(death_10s_later),
+            "Death 10s after condensation should not be flagged"
+        );
+    }
+
+    /// Blacklisted pipeline never transitions regardless of accuracy or rebuilds
+    #[test]
+    fn test_pipeline_blacklisted() {
+        let mut pipeline = Pipeline::new_observing(PipelineConfig {
+            min_manage_size: 1024,
+            graph_rebuild_interval: 1000,
+            ..Default::default()
+        });
+
+        // Force blacklist
+        pipeline.mode = PipelineMode::Blacklisted;
+
+        // Simulate ideal conditions — should still not transition
+        pipeline.mode_rebuilds = 10;
+        pipeline.last_prediction_accuracy = 99.0;
+
+        let transitioned = pipeline.check_transition();
+        assert!(!transitioned, "Blacklisted pipeline must never transition");
+        assert_eq!(pipeline.mode, PipelineMode::Blacklisted);
+    }
+
+    /// Two PIDs get fully isolated pipelines
+    #[test]
+    fn test_process_pipeline_map() {
+        let mut map = ProcessPipelineMap::new(PipelineConfig {
+            min_manage_size: 1024,
+            idle_threshold_ns: 0,
+            graph_rebuild_interval: 1000,
+            test_mode: true,  // fake addresses — use synthetic data
+            ..Default::default()
+        });
+
+        // Two distinct PIDs
+        map.process_alloc_global(100, 0x10000, 65_536);
+        map.process_alloc_global(100, 0x20000, 65_536);
+        map.process_alloc_global(200, 0x10000, 65_536);
+
+        assert_eq!(map.process_count(), 2, "Should track exactly 2 processes");
+
+        // Pipelines start in Observing mode
+        {
+            let p100 = map.get_or_create(100);
+            assert_eq!(p100.mode, PipelineMode::Observing,
+                       "New pipelines must start in Observing mode");
+            assert_eq!(p100.events_processed, 2);
+        }
+
+        {
+            let p200 = map.get_or_create(200);
+            assert_eq!(p200.events_processed, 1);
+        }
+
+        // Free on PID 100 doesn't affect PID 200
+        map.process_free_global(100, 0x10000);
+        {
+            let p200 = map.get_or_create(200);
+            assert_eq!(p200.events_processed, 1,
+                       "PID 200 should be unaffected by PID 100 free");
+        }
+
+        // Free on unknown PID is a no-op (must not panic)
+        map.process_free_global(999, 0xDEAD);
     }
 }

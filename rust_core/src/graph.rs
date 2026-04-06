@@ -82,6 +82,19 @@ pub struct NodeInfo {
     pub last_access_ns: u64,
 }
 
+/// Holographic node boundary — lightweight representation for cold nodes.
+/// Fixed size, no heap allocation. Enough for Lenia temperature management,
+/// cluster membership checks, and promotion decisions.
+/// Full NodeInfo is reconstructed from the path_to_id map only when needed.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeBoundary {
+    pub id: u32,
+    pub access_count: u32,
+    pub last_access_ns: u64,
+    pub cluster_id: Option<u32>,
+    pub edge_count: u16,
+}
+
 /// The access graph — learns memory access topology.
 ///
 /// Exposed to Python via PyO3.
@@ -107,10 +120,7 @@ pub struct AccessGraph {
     cluster_map: Vec<Option<u32>>,
 }
 
-#[cfg_attr(feature = "python", pymethods)]
 impl AccessGraph {
-    #[cfg_attr(feature = "python", new)]
-    #[cfg_attr(feature = "python", pyo3(signature = (causal_window_ns=5_000_000, cluster_threshold=0.7)))]
     pub fn new(causal_window_ns: u64, cluster_threshold: f64) -> Self {
         Self {
             path_to_id: HashMap::new(),
@@ -197,11 +207,6 @@ impl AccessGraph {
         self.edges.len()
     }
 
-    /// Get strong edge count (weight >= threshold).
-    fn strong_edge_count(&self, min_weight: f64) -> usize {
-        self.edges.values().filter(|e| e.weight >= min_weight).count()
-    }
-
     /// Get cluster count.
     pub fn cluster_count(&self) -> usize {
         self.clusters.len()
@@ -214,8 +219,51 @@ impl AccessGraph {
             .collect()
     }
 
+    /// Check if graph has been built.
+    pub fn is_built(&self) -> bool {
+        self.built
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl AccessGraph {
+    #[new]
+    #[pyo3(signature = (causal_window_ns=5_000_000, cluster_threshold=0.7))]
+    fn py_new(causal_window_ns: u64, cluster_threshold: f64) -> Self {
+        Self::new(causal_window_ns, cluster_threshold)
+    }
+
+    #[pyo3(name = "build")]
+    fn py_build(&mut self, events: Vec<(u64, String, u64)>) {
+        self.build(events);
+    }
+
+    #[pyo3(name = "node_count")]
+    fn py_node_count(&self) -> usize {
+        self.node_count()
+    }
+
+    #[pyo3(name = "edge_count")]
+    fn py_edge_count(&self) -> usize {
+        self.edge_count()
+    }
+
+    #[pyo3(name = "cluster_count")]
+    fn py_cluster_count(&self) -> usize {
+        self.cluster_count()
+    }
+
+    #[pyo3(name = "get_node_stats")]
+    fn py_get_node_stats(&self) -> Vec<(String, u32)> {
+        self.get_node_stats()
+    }
+}
+
+// Non-PyO3 internal methods
+impl AccessGraph {
     /// Get top edges by weight as (source_path, target_path, count, mean_delta_ms, weight).
-    fn get_top_edges(&self, limit: usize) -> Vec<(String, String, u32, f64, f64)> {
+    pub fn get_top_edges(&self, limit: usize) -> Vec<(String, String, u32, f64, f64)> {
         let mut edges: Vec<_> = self.edges.values().collect();
         edges.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap());
         edges.iter()
@@ -228,14 +276,6 @@ impl AccessGraph {
             .collect()
     }
 
-    /// Check if graph has been built.
-    fn is_built(&self) -> bool {
-        self.built
-    }
-}
-
-// Non-PyO3 internal methods
-impl AccessGraph {
     fn get_or_create_node(&mut self, path: &str) -> u32 {
         if let Some(&id) = self.path_to_id.get(path) {
             return id;
@@ -259,26 +299,19 @@ impl AccessGraph {
             return;
         }
 
-        // Build co-access count matrix (sparse)
-        let mut cocount: HashMap<(u32, u32), u32> = HashMap::new();
-        for ((src, tgt), edge) in &self.edges {
-            *cocount.entry((*src, *tgt)).or_default() += edge.count;
-            *cocount.entry((*tgt, *src)).or_default() += edge.count;
-        }
-
-        // Build adjacency from pairs above threshold
+        // Build adjacency directly from edges — O(E), not O(N²).
+        // Only node pairs that actually have causal edges get compared.
+        // The edges are the evidence; pairs without edges have no
+        // co-access relationship and can't be in the same cluster.
         let mut adjacency: Vec<Vec<u32>> = vec![Vec::new(); n];
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let co = cocount.get(&(i as u32, j as u32)).copied().unwrap_or(0);
-                let min_count = self.nodes[i].access_count
-                    .min(self.nodes[j].access_count)
-                    .max(1);
-                let ratio = co as f64 / min_count as f64;
-                if ratio >= self.cluster_threshold {
-                    adjacency[i].push(j as u32);
-                    adjacency[j].push(i as u32);
-                }
+        for ((src, tgt), edge) in &self.edges {
+            let min_count = self.nodes[*src as usize].access_count
+                .min(self.nodes[*tgt as usize].access_count)
+                .max(1);
+            let ratio = edge.count as f64 / min_count as f64;
+            if ratio >= self.cluster_threshold {
+                adjacency[*src as usize].push(*tgt);
+                adjacency[*tgt as usize].push(*src);
             }
         }
 
@@ -372,6 +405,42 @@ impl AccessGraph {
     /// Get path for a node ID.
     pub fn get_path(&self, id: u32) -> Option<&str> {
         self.nodes.get(id as usize).map(|n| n.path.as_str())
+    }
+
+    /// Get holographic boundary for a node — lightweight, no heap allocation.
+    /// Enough for temperature management and promotion decisions.
+    pub fn get_boundary(&self, id: u32) -> Option<NodeBoundary> {
+        let node = self.nodes.get(id as usize)?;
+        let edge_count = self.edges.iter()
+            .filter(|((s, t), _)| *s == id || *t == id)
+            .count() as u16;
+        Some(NodeBoundary {
+            id: node.id,
+            access_count: node.access_count,
+            last_access_ns: node.last_access_ns,
+            cluster_id: self.cluster_map.get(id as usize).and_then(|c| *c),
+            edge_count,
+        })
+    }
+
+    /// Get boundaries for all nodes — bulk operation for Lenia field seeding.
+    /// O(N + E) — scans edges once to count per-node.
+    pub fn get_all_boundaries(&self) -> Vec<NodeBoundary> {
+        let n = self.nodes.len();
+        let mut edge_counts = vec![0u16; n];
+        for ((s, t), _) in &self.edges {
+            if (*s as usize) < n { edge_counts[*s as usize] = edge_counts[*s as usize].saturating_add(1); }
+            if (*t as usize) < n { edge_counts[*t as usize] = edge_counts[*t as usize].saturating_add(1); }
+        }
+        self.nodes.iter().enumerate().map(|(i, node)| {
+            NodeBoundary {
+                id: node.id,
+                access_count: node.access_count,
+                last_access_ns: node.last_access_ns,
+                cluster_id: self.cluster_map.get(i).and_then(|c| *c),
+                edge_count: edge_counts[i],
+            }
+        }).collect()
     }
 
     /// Get node ID for a path.

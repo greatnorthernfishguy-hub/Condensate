@@ -7,7 +7,7 @@
 //! Three tiers:
 //!   HOT:  Untouched, full speed access
 //!   WARM: LZ4 compressed in-place, fast decompress on access
-//!   COLD: Backed by mmap'd file, zero RSS until touched
+//!   COLD: Backed by disk file, zero RSS until touched
 //!
 //! The condenser runs as a background thread, periodically scanning
 //! the membrane's tracked allocations and demoting idle ones.
@@ -15,10 +15,15 @@
 //! accessed"), the condenser pre-promotes it.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::fs;
+use std::io::{Read as IoRead, Write as IoWrite};
+use std::path::Path;
 use std::time::Instant;
 
 use crate::membrane::{MembraneState, MembraneSummary};
+
+const PAGE_SIZE: usize = 4096;
+const COLD_DIR: &str = "/tmp/condensate_cold";
 
 /// Tier state for a managed memory region
 #[derive(Clone, Debug, PartialEq)]
@@ -30,9 +35,9 @@ pub enum Tier {
         compressed: Vec<u8>,
         original_size: usize,
     },
-    /// Backed to disk via mmap, zero RSS
+    /// Compressed bytes written to disk, in-memory buffer freed
     Cold {
-        file_offset: u64,
+        file_path: String,
         original_size: usize,
     },
 }
@@ -48,6 +53,10 @@ pub struct ManagedRegion {
     pub promotions: u32,
     pub demotions: u32,
     pub prediction_hits: u32,
+    /// Optional data override used in tests to inject specific byte patterns
+    /// without needing a real allocation. Only consulted by read_region_data
+    /// when present; ignored in production.
+    pub test_data: Option<Vec<u8>>,
 }
 
 impl ManagedRegion {
@@ -61,6 +70,7 @@ impl ManagedRegion {
             promotions: 0,
             demotions: 0,
             prediction_hits: 0,
+            test_data: None,
         }
     }
 
@@ -130,6 +140,10 @@ pub struct CondenserConfig {
     pub max_tracked: usize,
     /// How often the scan loop runs (ns)
     pub scan_interval_ns: u64,
+    /// When true, compress/decompress uses data stored in the Warm tier
+    /// directly rather than reading from raw memory addresses. Enables
+    /// testing without real allocations.
+    pub test_mode: bool,
 }
 
 impl Default for CondenserConfig {
@@ -139,6 +153,7 @@ impl Default for CondenserConfig {
             min_manage_size: 65_536,            // 64KB minimum
             max_tracked: 10_000,
             scan_interval_ns: 1_000_000_000,   // 1 second
+            test_mode: false,
         }
     }
 }
@@ -156,10 +171,13 @@ pub struct Condenser {
     total_bytes_saved: u64,
     peak_bytes_saved: u64,
     scan_count: u64,
+    /// When true, use test-safe data paths (no raw pointer reads/writes)
+    test_mode: bool,
 }
 
 impl Condenser {
     pub fn new(config: CondenserConfig) -> Self {
+        let test_mode = config.test_mode;
         Self {
             config,
             regions: HashMap::with_capacity(1000),
@@ -169,6 +187,7 @@ impl Condenser {
             total_bytes_saved: 0,
             peak_bytes_saved: 0,
             scan_count: 0,
+            test_mode,
         }
     }
 
@@ -210,22 +229,126 @@ impl Condenser {
         }
     }
 
-    /// Pre-promote a region (prediction-driven)
+    /// Pre-promote a region (prediction-driven).
+    /// Decompresses the region and, when not in test_mode, writes the
+    /// decompressed bytes back to the original address.
     pub fn pre_promote(&mut self, address: usize) {
         if let Some(region) = self.regions.get_mut(&address) {
             if !region.is_hot() {
-                // In a real implementation, this would decompress
-                // and write back to the original address.
-                // For the PoC, we track that the prediction fired.
                 region.prediction_hits += 1;
-                region.tier = Tier::Hot;
-                region.promotions += 1;
+
+                if let Some(decompressed) = region.decompress() {
+                    // decompress() already set tier → Hot and bumped promotions.
+                    if !self.test_mode {
+                        // SAFETY: The caller guarantees `address` points to a live
+                        // allocation of at least `decompressed.len()` bytes that we
+                        // originally registered and compressed. We are restoring the
+                        // original contents before the application touches it again.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                decompressed.as_ptr(),
+                                address as *mut u8,
+                                decompressed.len(),
+                            );
+                        }
+                    }
+                } else {
+                    // Fallback: force to Hot even if decompress failed
+                    region.tier = Tier::Hot;
+                    region.promotions += 1;
+                }
+
                 self.total_decompressed += 1;
             }
         }
     }
 
-    /// Scan for idle regions and compress them
+    /// Demote a WARM region to COLD by writing its compressed bytes to disk.
+    /// Creates `/tmp/condensate_cold/` if it does not exist.
+    pub fn demote_to_cold(&mut self, address: usize) {
+        if let Some(region) = self.regions.get_mut(&address) {
+            if let Tier::Warm { ref compressed, original_size } = region.tier.clone() {
+                // Ensure the cold directory exists
+                fs::create_dir_all(COLD_DIR)
+                    .expect("condensate: failed to create cold storage directory");
+
+                let file_path = format!("{}/{}.bin", COLD_DIR, address);
+
+                fs::write(&file_path, compressed)
+                    .expect("condensate: failed to write cold file");
+
+                region.tier = Tier::Cold { file_path, original_size };
+                region.demotions += 1;
+            }
+        }
+    }
+
+    /// Promote a COLD region back to HOT.
+    /// Reads compressed bytes from disk, LZ4-decompresses them, deletes the
+    /// file, and sets the tier back to Hot.
+    /// Returns the decompressed data, or None if the region is not Cold.
+    pub fn promote_from_cold(&mut self, address: usize) -> Option<Vec<u8>> {
+        if let Some(region) = self.regions.get_mut(&address) {
+            if let Tier::Cold { ref file_path, .. } = region.tier.clone() {
+                let compressed = fs::read(&file_path)
+                    .expect("condensate: failed to read cold file");
+
+                let decompressed = lz4_flex::decompress_size_prepended(&compressed)
+                    .expect("condensate: failed to decompress cold data");
+
+                // Delete the backing file
+                let _ = fs::remove_file(&file_path);
+
+                region.tier = Tier::Hot;
+                region.promotions += 1;
+                self.total_decompressed += 1;
+
+                return Some(decompressed);
+            }
+        }
+        None
+    }
+
+    /// Build the data buffer used during scan compression.
+    ///
+    /// Priority order:
+    ///   1. If the region has a `test_data` override, use that.
+    ///   2. If in `test_mode`, generate a deterministic repeating pattern from
+    ///      the address bytes — compressible, safe, no real allocation needed.
+    ///   3. In production: read directly from the live allocation.
+    fn read_region_data(&self, address: usize, size: usize) -> Vec<u8> {
+        // Test-data override takes precedence (injected by tests for specific patterns)
+        if let Some(region) = self.regions.get(&address) {
+            if let Some(ref data) = region.test_data {
+                return data.clone();
+            }
+        }
+
+        if self.test_mode {
+            // Deterministic repeating pattern from the address bytes — compressible
+            let addr_bytes = address.to_le_bytes();
+            let mut buf = Vec::with_capacity(size);
+            for i in 0..size {
+                buf.push(addr_bytes[i % addr_bytes.len()]);
+            }
+            buf
+        } else {
+            // SAFETY: The caller (register) has verified that `address` is a live
+            // allocation of exactly `size` bytes tracked by this condenser. We hold
+            // a shared reference to this data only for the duration of this call and
+            // do not alias the slice with any mutable reference.
+            unsafe {
+                std::slice::from_raw_parts(address as *const u8, size).to_vec()
+            }
+        }
+    }
+
+    /// Scan for idle regions and compress them.
+    ///
+    /// Guards applied per region before compression:
+    ///   1. Skip regions smaller than PAGE_SIZE (4096 bytes) — not worth it.
+    ///   2. Skip if compressed_size > original_size * 0.9 — less than 10% savings.
+    ///
     /// Returns (regions_compressed, bytes_saved)
     pub fn scan_and_compress(&mut self) -> (u32, u64) {
         let now = self.elapsed_ns();
@@ -240,18 +363,29 @@ impl Condenser {
             .filter(|(_, r)| {
                 r.is_hot() &&
                 r.size >= self.config.min_manage_size &&
+                r.size >= PAGE_SIZE &&           // minimum page size guard
                 now - r.last_access_ns > threshold
             })
             .map(|(&addr, _)| addr)
             .collect();
 
         for addr in to_compress {
+            let size = match self.regions.get(&addr) {
+                Some(r) => r.size,
+                None => continue,
+            };
+
+            let data = self.read_region_data(addr, size);
+
+            // Compression ratio guard: pre-check before promoting to Warm
+            let candidate = lz4_flex::compress_prepend_size(&data);
+            if candidate.len() > (data.len() as f64 * 0.9) as usize {
+                // Less than 10% savings — skip this region
+                continue;
+            }
+
             if let Some(region) = self.regions.get_mut(&addr) {
-                // In a real LD_PRELOAD implementation, we'd read from
-                // the actual memory address. For now, simulate with
-                // a zero-filled buffer (shows compression mechanics).
-                let fake_data = vec![0u8; region.size];
-                let saved = region.compress(&fake_data);
+                let saved = region.compress(&data);
 
                 if saved > 0 {
                     compressed_count += 1;
@@ -369,9 +503,22 @@ impl CondenserSummary {
 mod tests {
     use super::*;
 
+    /// Helper: Condenser in test_mode with immediate idle threshold
+    fn test_condenser() -> Condenser {
+        Condenser::new(CondenserConfig {
+            idle_threshold_ns: 0,
+            min_manage_size: 1024,
+            test_mode: true,
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn test_register_and_touch() {
-        let mut c = Condenser::new(CondenserConfig::default());
+        let mut c = Condenser::new(CondenserConfig {
+            test_mode: true,
+            ..Default::default()
+        });
 
         c.register(0x10000, 100_000);
         c.register(0x20000, 200_000);
@@ -404,6 +551,7 @@ mod tests {
         let mut c = Condenser::new(CondenserConfig {
             idle_threshold_ns: 0, // compress immediately
             min_manage_size: 1024,
+            test_mode: true,
             ..Default::default()
         });
 
@@ -425,6 +573,7 @@ mod tests {
         let mut c = Condenser::new(CondenserConfig {
             idle_threshold_ns: 0,
             min_manage_size: 1024,
+            test_mode: true,
             ..Default::default()
         });
 
@@ -443,6 +592,7 @@ mod tests {
         let mut c = Condenser::new(CondenserConfig {
             idle_threshold_ns: 0,
             min_manage_size: 1024,
+            test_mode: true,
             ..Default::default()
         });
 
@@ -464,5 +614,155 @@ mod tests {
 
         assert_eq!(summary.total_regions, 3);
         assert!(summary.total_compressions >= 2);
+    }
+
+    // -----------------------------------------------------------------
+    // New tests for Block B
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_minimum_page_size_guard() {
+        // Region of 100 bytes is below PAGE_SIZE (4096); scan must skip it.
+        // We need min_manage_size lower than PAGE_SIZE to let it register,
+        // but the scan-time guard should still block compression.
+        let mut c = Condenser::new(CondenserConfig {
+            idle_threshold_ns: 0,
+            min_manage_size: 64,   // low enough to register the 100-byte region
+            test_mode: true,
+            ..Default::default()
+        });
+
+        c.register(0xABCD0, 100);
+        assert_eq!(c.regions.len(), 1, "Region should be registered");
+
+        let (count, _saved) = c.scan_and_compress();
+        assert_eq!(count, 0, "Scan should skip the sub-page-size region");
+        assert!(c.regions[&0xABCD0].is_hot(), "Region should remain Hot");
+    }
+
+    #[test]
+    fn test_compression_ratio_guard() {
+        // The ratio guard in scan_and_compress skips a region if
+        // compressed_size > original_size * 0.9 (less than 10% savings).
+        //
+        // We test both sides:
+        //   1. Compressible data passes the guard → region becomes Warm.
+        //   2. Incompressible data is skipped → region stays Hot.
+        //
+        // We use ManagedRegion::test_data injection to control exactly what
+        // bytes each region presents to the scan, without needing real addresses.
+
+        // --- Happy path: zero-filled buffer compresses extremely well ---
+        let mut c = test_condenser();
+        let compressible = vec![0u8; 65_536];
+        c.register(0xC0000usize, 65_536);
+        c.regions.get_mut(&0xC0000usize).unwrap().test_data = Some(compressible);
+        let (count, _) = c.scan_and_compress();
+        assert_eq!(count, 1, "Compressible region should pass the ratio guard");
+        assert!(matches!(c.regions[&0xC0000usize].tier, Tier::Warm { .. }));
+
+        // --- Blocked path: incompressible data (unique bytes, no patterns) ---
+        // A sequential 0..=255 cycle gives LZ4 very little to grab onto when
+        // the window never repeats at scan scale.  We build a buffer that is
+        // already-maximally-dense for LZ4 by using raw bytes from a known
+        // LZ4 frame: we compress a small seed with maximum output, then
+        // expand it into a large buffer that changes every byte position.
+        // The most reliable incompressible source is XOR-folding the position
+        // counter with a prime multiplier across the full u8 space.
+        let buf_size = 65_536usize;
+        // Each byte is derived from position with a prime multiplier — the
+        // pattern never repeats within the buffer since 65536 is the full u8
+        // cycle times 256, so LZ4's match-finder finds no long-range copies.
+        let incompressible: Vec<u8> = (0..buf_size)
+            .map(|i| {
+                let a = (i.wrapping_mul(6364136223846793005) >> 33) as u8;
+                let b = (i.wrapping_mul(1442695040888963407) >> 25) as u8;
+                a ^ b ^ (i as u8)
+            })
+            .collect();
+
+        // Verify our data actually fails the 90% ratio guard before running scan
+        let candidate = lz4_flex::compress_prepend_size(&incompressible);
+        let threshold = (buf_size as f64 * 0.9) as usize;
+        assert!(
+            candidate.len() > threshold,
+            "Test data must be incompressible enough to trigger the guard \
+             (candidate_len={} threshold={}). Regenerate with a harder pattern.",
+            candidate.len(), threshold
+        );
+
+        // Register and inject incompressible data — scan should skip it
+        let mut c2 = test_condenser();
+        c2.register(0xD0000usize, buf_size);
+        c2.regions.get_mut(&0xD0000usize).unwrap().test_data = Some(incompressible);
+        let (count2, _) = c2.scan_and_compress();
+        assert_eq!(count2, 0, "Incompressible region should be skipped by the ratio guard");
+        assert!(c2.regions[&0xD0000usize].is_hot(), "Region should remain Hot");
+    }
+
+    #[test]
+    fn test_cold_tier_disk_roundtrip() {
+        let mut c = test_condenser();
+
+        // Use a large address that doesn't collide with anything real
+        let addr = 0xDEAD_0000usize;
+        c.register(addr, 65_536);
+
+        // Compress HOT → WARM
+        let (count, _) = c.scan_and_compress();
+        assert_eq!(count, 1, "Region should compress to WARM");
+        assert!(matches!(c.regions[&addr].tier, Tier::Warm { .. }));
+
+        // Capture the original decompressed bytes from the WARM tier so we
+        // can compare them after the roundtrip.
+        let original_data = match &c.regions[&addr].tier {
+            Tier::Warm { compressed, .. } => {
+                lz4_flex::decompress_size_prepended(compressed).unwrap()
+            }
+            _ => panic!("Expected Warm tier"),
+        };
+
+        // Demote WARM → COLD (writes file to disk)
+        c.demote_to_cold(addr);
+        assert!(matches!(c.regions[&addr].tier, Tier::Cold { .. }));
+
+        // Verify file exists on disk
+        let file_path = match &c.regions[&addr].tier {
+            Tier::Cold { file_path, .. } => file_path.clone(),
+            _ => panic!("Expected Cold tier"),
+        };
+        assert!(Path::new(&file_path).exists(), "Cold file should exist on disk");
+
+        // Promote COLD → HOT (reads file, decompresses, deletes file)
+        let restored = c.promote_from_cold(addr).expect("promote_from_cold should return data");
+
+        assert_eq!(restored, original_data, "Restored data should match original");
+        assert!(matches!(c.regions[&addr].tier, Tier::Hot), "Tier should be Hot after promotion");
+    }
+
+    #[test]
+    fn test_cold_tier_file_cleanup() {
+        let mut c = test_condenser();
+
+        let addr = 0xBEEF_0000usize;
+        c.register(addr, 65_536);
+        c.scan_and_compress();
+
+        // Demote to cold
+        c.demote_to_cold(addr);
+        let file_path = match &c.regions[&addr].tier {
+            Tier::Cold { file_path, .. } => file_path.clone(),
+            _ => panic!("Expected Cold tier"),
+        };
+        assert!(Path::new(&file_path).exists(), "File should exist before promote");
+
+        // Promote from cold
+        c.promote_from_cold(addr);
+
+        // File must be gone
+        assert!(
+            !Path::new(&file_path).exists(),
+            "Cold file should be deleted after promote_from_cold"
+        );
     }
 }

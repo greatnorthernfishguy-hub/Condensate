@@ -1,7 +1,7 @@
 [package]
 name = "condensate_core"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 description = "Living memory manager — Rust core with PyO3 bindings + LD_PRELOAD membrane"
 license = "AGPL-3.0"
 
@@ -21,6 +21,7 @@ libc = "0.2"
 [features]
 default = ["python"]
 python = ["pyo3"]
+preload = []
 
 [profile.release]
 opt-level = 3
