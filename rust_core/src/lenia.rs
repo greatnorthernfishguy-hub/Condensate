@@ -185,8 +185,11 @@ impl LeniaField {
     }
 
     /// Remove a region from the field — called when an allocation is freed.
-    /// Reclaims the energy and removes from all tracking structures.
-    /// Dead allocations must not haunt the field.
+    /// Reclaims the energy and removes from primary tracking.
+    /// Stale neighbor references are left in place — step() already handles
+    /// missing regions gracefully (skips them). Eager neighbor cleanup was
+    /// O(N × avg_neighbors) on every free, which killed throughput.
+    /// Sleep consolidation prunes stale references in batch.
     pub fn remove_region(&mut self, id: u32) {
         if let Some(region) = self.regions.remove(&id) {
             let energy = region.temperature * (region.size_bytes as f64 / (1024.0 * 1024.0));
@@ -196,9 +199,16 @@ impl LeniaField {
             }
         }
         self.neighbors.remove(&id);
-        // Also remove this id from other regions' neighbor lists
+        // Stale references in OTHER regions' neighbor lists are harmless —
+        // step() checks regions.contains_key() before using a neighbor.
+        // Batch cleanup happens during sleep consolidation.
+    }
+
+    /// Prune stale neighbor references — call during sleep consolidation.
+    /// Removes references to regions that no longer exist.
+    pub fn prune_stale_neighbors(&mut self) {
         for (_rid, nbrs) in self.neighbors.iter_mut() {
-            nbrs.retain(|(nid, _)| *nid != id);
+            nbrs.retain(|(nid, _)| self.regions.contains_key(nid));
         }
     }
 
