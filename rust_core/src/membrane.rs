@@ -455,34 +455,42 @@ static PIPELINE: std::sync::LazyLock<Mutex<Pipeline>> =
 static DRAIN_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Process skip flag — if true, hooks are no-ops.
-/// Set at init if the process is in the skip list.
-static SKIP_PROCESS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Membrane engagement state — three phases:
+/// 0 = DORMANT: pure passthrough, don't even record. Process just started.
+/// 1 = OBSERVING: push events to ring buffer, drain thread processes them.
+/// 2 = ACTIVE: full condensation (future — currently same as OBSERVING).
+const PHASE_DORMANT: u8 = 0;
+const PHASE_OBSERVING: u8 = 1;
+#[allow(dead_code)]
+const PHASE_ACTIVE: u8 = 2;
 
-/// Processes that should not be hooked.
-const SKIP_NAMES: &[&str] = &["node", "npm", "npx"];
+static ENGAGEMENT_PHASE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(PHASE_DORMANT);
 
-/// Check if this process should be skipped
-fn should_skip_process() -> bool {
-    // Read /proc/self/exe to get the binary path
-    if let Ok(exe) = std::fs::read_link("/proc/self/exe") {
-        if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
-            return SKIP_NAMES.iter().any(|skip| name == *skip);
-        }
-    }
-    false
-}
+/// Grace period before engaging — let the process finish initializing.
+/// Default 10 seconds. Solves V8/Node.js and xrdp SEGV during init.
+const GRACE_PERIOD_NS: u64 = 10_000_000_000;
+
+/// Timestamp when the membrane loaded (set in init)
+static LOAD_TIME_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Cached real malloc/free function pointers — resolved ONCE at init,
+/// not via dlsym on every call. Avoids dlsym during early process init.
+static REAL_MALLOC: AtomicU64 = AtomicU64::new(0);
+static REAL_FREE: AtomicU64 = AtomicU64::new(0);
 
 /// Scan counter — run condenser scan every N allocs
 static SCAN_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SCAN_INTERVAL: u64 = 1_000;
 
-/// Start the background drain thread (called once from init)
+/// Start the background drain thread (called once when transitioning to OBSERVING)
 fn start_drain_thread() {
     if DRAIN_STARTED.swap(true, Ordering::SeqCst) {
         return; // already started
     }
+    // Now that we're actually observing, register the exit summary
+    unsafe { libc::atexit(condensate_summary) };
+
     std::thread::Builder::new()
         .name("condensate-drain".to_string())
         .spawn(|| {
@@ -556,36 +564,87 @@ fn push_event(tag: u8, address: usize, size: usize) {
     slot.store(pack_event(tag, address, size), Ordering::Release);
 }
 
-/// Get the original malloc function
+/// Resolve and cache the real malloc/free function pointers.
+/// Called once during init — after this, no more dlsym calls.
+unsafe fn cache_real_functions() {
+    unsafe {
+        let m = libc::dlsym(libc::RTLD_NEXT, c"malloc".as_ptr());
+        let f = libc::dlsym(libc::RTLD_NEXT, c"free".as_ptr());
+        REAL_MALLOC.store(m as u64, Ordering::Release);
+        REAL_FREE.store(f as u64, Ordering::Release);
+    }
+}
+
+/// Call the real malloc — uses cached pointer, no dlsym
+#[inline(always)]
 unsafe fn real_malloc(size: size_t) -> *mut c_void {
     type MallocFn = unsafe extern "C" fn(size_t) -> *mut c_void;
+    let ptr = REAL_MALLOC.load(Ordering::Relaxed);
+    if ptr == 0 {
+        // Fallback during very early init before cache_real_functions runs.
+        // Use dlsym directly — this only happens for the first few mallocs.
+        unsafe {
+            let sym = libc::dlsym(libc::RTLD_NEXT, c"malloc".as_ptr());
+            let func: MallocFn = std::mem::transmute(sym);
+            return func(size);
+        }
+    }
     unsafe {
-        let sym = libc::dlsym(libc::RTLD_NEXT, c"malloc".as_ptr());
-        let func: MallocFn = std::mem::transmute(sym);
+        let func: MallocFn = std::mem::transmute(ptr);
         func(size)
     }
 }
 
-/// Get the original free function
+/// Call the real free — uses cached pointer, no dlsym
+#[inline(always)]
 unsafe fn real_free(ptr: *mut c_void) {
     type FreeFn = unsafe extern "C" fn(*mut c_void);
+    let fptr = REAL_FREE.load(Ordering::Relaxed);
+    if fptr == 0 {
+        unsafe {
+            let sym = libc::dlsym(libc::RTLD_NEXT, c"free".as_ptr());
+            let func: FreeFn = std::mem::transmute(sym);
+            func(ptr);
+            return;
+        }
+    }
     unsafe {
-        let sym = libc::dlsym(libc::RTLD_NEXT, c"free".as_ptr());
-        let func: FreeFn = std::mem::transmute(sym);
+        let func: FreeFn = std::mem::transmute(fptr);
         func(ptr)
     }
 }
 
-/// Hooked malloc — pushes event to ring buffer, no locks, no pipeline on hot path.
-/// Skipped processes get pure passthrough — zero overhead.
+/// Get monotonic time in nanoseconds (no allocation, no syscall overhead)
+#[inline(always)]
+fn now_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Hooked malloc — born dormant, wakes after grace period.
+///
+/// DORMANT: pure passthrough. Single atomic load overhead (~1ns).
+/// OBSERVING: push to ring buffer. Atomic increment (~10ns).
+/// The process doesn't know the difference.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     let ptr = unsafe { real_malloc(size) };
 
-    if SKIP_PROCESS.load(Ordering::Relaxed) {
+    // Fast path: dormant = pure passthrough, ~1ns overhead
+    let phase = ENGAGEMENT_PHASE.load(Ordering::Relaxed);
+    if phase == PHASE_DORMANT {
+        // Check if grace period has elapsed — transition to observing
+        let load_time = LOAD_TIME_NS.load(Ordering::Relaxed);
+        if load_time > 0 && now_ns() - load_time > GRACE_PERIOD_NS {
+            ENGAGEMENT_PHASE.store(PHASE_OBSERVING, Ordering::Release);
+            // Start drain thread on first transition
+            start_drain_thread();
+        }
         return ptr;
     }
 
+    // Observing/active: record the event
     REENTRANT.with(|r| {
         if r.get() {
             return;
@@ -598,27 +657,24 @@ pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     ptr
 }
 
-/// Hooked free — pushes event to ring buffer, no locks.
-/// Skipped processes get pure passthrough.
+/// Hooked free — same dormant/observing phases as malloc.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
 
-    if SKIP_PROCESS.load(Ordering::Relaxed) {
-        unsafe { real_free(ptr) }
-        return;
+    let phase = ENGAGEMENT_PHASE.load(Ordering::Relaxed);
+    if phase >= PHASE_OBSERVING {
+        REENTRANT.with(|r| {
+            if r.get() {
+                return;
+            }
+            r.set(true);
+            push_event(EVENT_FREE, ptr as usize, 0);
+            r.set(false);
+        });
     }
-
-    REENTRANT.with(|r| {
-        if r.get() {
-            return;
-        }
-        r.set(true);
-        push_event(EVENT_FREE, ptr as usize, 0);
-        r.set(false);
-    });
 
     unsafe { real_free(ptr) }
 }
@@ -658,19 +714,18 @@ static INIT: extern "C" fn() = {
     extern "C" fn init() {
         INITIALIZED.store(true, Ordering::SeqCst);
 
-        // Check if this process should be skipped (Node.js, npm, etc.)
-        // Must happen before anything else — skipped processes get
-        // pure passthrough with zero overhead.
-        if should_skip_process() {
-            SKIP_PROCESS.store(true, Ordering::SeqCst);
-            return; // No drain thread, no atexit, nothing. Pure passthrough.
-        }
+        // Cache real malloc/free pointers — one dlsym each, never again.
+        unsafe { cache_real_functions() };
 
-        // Ring buffer is static .bss — no initialization needed.
-        // Start the background drain thread.
-        start_drain_thread();
+        // Record load time — grace period starts now.
+        // The membrane stays DORMANT (pure passthrough) for GRACE_PERIOD_NS.
+        // After that, the first malloc transitions to OBSERVING.
+        // This lets processes like Node.js/V8 and xrdp finish their
+        // initialization before we touch anything.
+        LOAD_TIME_NS.store(now_ns(), Ordering::Release);
 
-        unsafe { libc::atexit(condensate_summary) };
+        // Don't start drain thread yet — it starts when DORMANT → OBSERVING.
+        // Don't register atexit yet — only register when we actually observe.
     }
     init
 };
