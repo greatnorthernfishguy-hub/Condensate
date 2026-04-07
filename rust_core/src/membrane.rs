@@ -455,6 +455,25 @@ static PIPELINE: std::sync::LazyLock<Mutex<Pipeline>> =
 static DRAIN_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Process skip flag — if true, hooks are no-ops.
+/// Set at init if the process is in the skip list.
+static SKIP_PROCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Processes that should not be hooked.
+const SKIP_NAMES: &[&str] = &["node", "npm", "npx"];
+
+/// Check if this process should be skipped
+fn should_skip_process() -> bool {
+    // Read /proc/self/exe to get the binary path
+    if let Ok(exe) = std::fs::read_link("/proc/self/exe") {
+        if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
+            return SKIP_NAMES.iter().any(|skip| name == *skip);
+        }
+    }
+    false
+}
+
 /// Scan counter — run condenser scan every N allocs
 static SCAN_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SCAN_INTERVAL: u64 = 1_000;
@@ -557,10 +576,15 @@ unsafe fn real_free(ptr: *mut c_void) {
     }
 }
 
-/// Hooked malloc — pushes event to ring buffer, no locks, no pipeline on hot path
+/// Hooked malloc — pushes event to ring buffer, no locks, no pipeline on hot path.
+/// Skipped processes get pure passthrough — zero overhead.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     let ptr = unsafe { real_malloc(size) };
+
+    if SKIP_PROCESS.load(Ordering::Relaxed) {
+        return ptr;
+    }
 
     REENTRANT.with(|r| {
         if r.get() {
@@ -574,10 +598,16 @@ pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     ptr
 }
 
-/// Hooked free — pushes event to ring buffer, no locks
+/// Hooked free — pushes event to ring buffer, no locks.
+/// Skipped processes get pure passthrough.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     if ptr.is_null() {
+        return;
+    }
+
+    if SKIP_PROCESS.load(Ordering::Relaxed) {
+        unsafe { real_free(ptr) }
         return;
     }
 
@@ -627,6 +657,14 @@ pub extern "C" fn condensate_summary() {
 static INIT: extern "C" fn() = {
     extern "C" fn init() {
         INITIALIZED.store(true, Ordering::SeqCst);
+
+        // Check if this process should be skipped (Node.js, npm, etc.)
+        // Must happen before anything else — skipped processes get
+        // pure passthrough with zero overhead.
+        if should_skip_process() {
+            SKIP_PROCESS.store(true, Ordering::SeqCst);
+            return; // No drain thread, no atexit, nothing. Pure passthrough.
+        }
 
         // Ring buffer is static .bss — no initialization needed.
         // Start the background drain thread.
