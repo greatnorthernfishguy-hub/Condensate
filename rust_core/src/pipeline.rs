@@ -340,7 +340,10 @@ impl Pipeline {
     pub fn process_free(&mut self, address: usize) {
         self.condenser.unregister(address);
         self.address_to_path.remove(&address);
-        self.address_to_field_id.remove(&address);
+        // Remove from Lenia field — dead allocations don't get thermal cycles
+        if let Some(field_id) = self.address_to_field_id.remove(&address) {
+            self.field.remove_region(field_id);
+        }
     }
 
     /// Rebuild the graph from accumulated events and retrain the predictor.

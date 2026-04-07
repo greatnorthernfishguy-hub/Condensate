@@ -184,6 +184,24 @@ impl LeniaField {
         self.regions.insert(id, region);
     }
 
+    /// Remove a region from the field — called when an allocation is freed.
+    /// Reclaims the energy and removes from all tracking structures.
+    /// Dead allocations must not haunt the field.
+    pub fn remove_region(&mut self, id: u32) {
+        if let Some(region) = self.regions.remove(&id) {
+            let energy = region.temperature * (region.size_bytes as f64 / (1024.0 * 1024.0));
+            self.total_energy -= energy;
+            if self.total_energy < 0.0 {
+                self.total_energy = 0.0;
+            }
+        }
+        self.neighbors.remove(&id);
+        // Also remove this id from other regions' neighbor lists
+        for (_rid, nbrs) in self.neighbors.iter_mut() {
+            nbrs.retain(|(nid, _)| *nid != id);
+        }
+    }
+
     /// Set neighborhood connections from graph edges
     pub fn set_neighbors(&mut self, id: u32, neighbors: Vec<(u32, f64)>) {
         self.neighbors.insert(id, neighbors);
