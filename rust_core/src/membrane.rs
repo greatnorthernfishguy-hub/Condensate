@@ -410,37 +410,35 @@ const EVENT_ALLOC: u8 = 1;
 const EVENT_FREE: u8 = 2;
 const EVENT_EMPTY: u8 = 0;
 
-/// Single event in the lock-free ring buffer.
-/// Sized for cache-line alignment (32 bytes).
-#[repr(C)]
-struct RingEvent {
-    tag: std::sync::atomic::AtomicU8,  // EVENT_EMPTY, EVENT_ALLOC, EVENT_FREE
-    _pad: u8,
-    size_kb: u16,                       // size in KB (enough for up to 64MB)
-    address: u32,                       // lower 32 bits of address (unique enough for tracking)
-    timestamp_ns: u64,                  // monotonic time
-    _reserved: [u8; 16],               // pad to 32 bytes
+/// Lock-free ring buffer capacity — must be power of 2.
+/// 8K slots × 8 bytes = 64KB. Lives in .bss, zero heap allocation.
+const RING_SIZE: usize = 8192;
+
+/// Compact ring event — 8 bytes, packed into a single AtomicU64.
+/// Layout: [tag:8][size_kb:16][address_low:32][_pad:8]
+/// No heap allocation, no struct, no AtomicU8 issues.
+/// The entire ring is a static array of AtomicU64 — lives in .bss.
+static RING: [AtomicU64; RING_SIZE] = {
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; RING_SIZE]
+};
+
+/// Pack an event into a u64: tag in low byte, size_kb in bytes 1-2, address_low in bytes 3-6
+#[inline(always)]
+fn pack_event(tag: u8, address: usize, size: usize) -> u64 {
+    let size_kb = (size / 1024).min(0xFFFF) as u64;
+    let addr_low = (address as u32) as u64;
+    (tag as u64) | (size_kb << 8) | (addr_low << 24)
 }
 
-/// Lock-free ring buffer capacity — must be power of 2
-const RING_SIZE: usize = 65536; // 64K slots × 32 bytes = 2MB ring
-
-/// The ring buffer — malloc/free push events here with no locks.
-/// The background drain thread reads them.
-static RING: std::sync::LazyLock<Box<[RingEvent]>> = std::sync::LazyLock::new(|| {
-    let mut v = Vec::with_capacity(RING_SIZE);
-    for _ in 0..RING_SIZE {
-        v.push(RingEvent {
-            tag: std::sync::atomic::AtomicU8::new(EVENT_EMPTY),
-            _pad: 0,
-            size_kb: 0,
-            address: 0,
-            timestamp_ns: 0,
-            _reserved: [0; 16],
-        });
-    }
-    v.into_boxed_slice()
-});
+/// Unpack: returns (tag, address_low, size_kb)
+#[inline(always)]
+fn unpack_event(packed: u64) -> (u8, usize, usize) {
+    let tag = (packed & 0xFF) as u8;
+    let size_kb = ((packed >> 8) & 0xFFFF) as usize;
+    let addr_low = ((packed >> 24) & 0xFFFFFFFF) as usize;
+    (tag, addr_low, size_kb * 1024)
+}
 
 /// Write cursor — atomically incremented by malloc/free hooks
 static WRITE_POS: AtomicUsize = AtomicUsize::new(0);
@@ -475,13 +473,12 @@ fn start_drain_thread() {
                 // Drain up to 1024 events per batch
                 for _ in 0..1024 {
                     let slot = &RING[read_pos & (RING_SIZE - 1)];
-                    let tag = slot.tag.load(Ordering::Acquire);
-                    if tag == EVENT_EMPTY {
-                        break;
+                    let packed = slot.load(Ordering::Acquire);
+                    if packed == 0 {
+                        break; // empty slot
                     }
 
-                    let address = slot.address as usize;
-                    let size = slot.size_kb as usize * 1024;
+                    let (tag, address, size) = unpack_event(packed);
 
                     match tag {
                         EVENT_ALLOC => {
@@ -509,8 +506,8 @@ fn start_drain_thread() {
                         _ => {}
                     }
 
-                    // Mark slot as consumed
-                    slot.tag.store(EVENT_EMPTY, Ordering::Release);
+                    // Mark slot as consumed (zero = empty)
+                    slot.store(0, Ordering::Release);
                     read_pos += 1;
                     drained += 1;
                 }
@@ -524,27 +521,20 @@ fn start_drain_thread() {
         .expect("Failed to spawn condensate drain thread");
 }
 
-/// Push an event to the ring buffer — lock-free, ~10ns
+/// Push an event to the ring buffer — lock-free, ~10ns, zero heap allocation
 #[inline(always)]
 fn push_event(tag: u8, address: usize, size: usize) {
     let pos = WRITE_POS.fetch_add(1, Ordering::Relaxed);
     let slot = &RING[pos & (RING_SIZE - 1)];
 
-    // If slot isn't empty, drain thread is behind — drop this event.
+    // If slot isn't empty (non-zero), drain thread is behind — drop this event.
     // Better to lose an event than to stall malloc.
-    if slot.tag.load(Ordering::Relaxed) != EVENT_EMPTY {
+    if slot.load(Ordering::Relaxed) != 0 {
         return;
     }
 
-    // Write payload before tag (tag is the release fence)
-    // SAFETY: We're the only writer to this slot (unique pos from atomic increment).
-    // The drain thread won't read until tag is set.
-    let slot_ptr = slot as *const RingEvent as *mut RingEvent;
-    unsafe {
-        (*slot_ptr).address = address as u32;
-        (*slot_ptr).size_kb = (size / 1024).min(u16::MAX as usize) as u16;
-    }
-    slot.tag.store(tag, Ordering::Release);
+    // Single atomic store — the packed value IS the fence
+    slot.store(pack_event(tag, address, size), Ordering::Release);
 }
 
 /// Get the original malloc function
@@ -638,10 +628,8 @@ static INIT: extern "C" fn() = {
     extern "C" fn init() {
         INITIALIZED.store(true, Ordering::SeqCst);
 
-        // Force ring buffer allocation before any malloc hooks fire
-        let _ = &*RING;
-
-        // Start the background drain thread
+        // Ring buffer is static .bss — no initialization needed.
+        // Start the background drain thread.
         start_drain_thread();
 
         unsafe { libc::atexit(condensate_summary) };
