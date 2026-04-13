@@ -4,3 +4,4 @@ __pycache__/
 !package.json
 rust_core/target/
 .venv/
+*.so
