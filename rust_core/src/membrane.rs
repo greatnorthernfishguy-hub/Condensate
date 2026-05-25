@@ -15,6 +15,20 @@
 //! This data feeds the AccessGraph for pattern discovery.
 //!
 //! ---- Changelog ----
+//! [2026-05-25] CC — Refinements from 40 days of observer data (#260)
+//!   What: Four hardening changes based on condensate_observer.py data analysis:
+//!         1. RING_SIZE 8192→65536: burst events hit 672MB/s = 171k events/s,
+//!            old ring filled in 47ms → EVENT_FREEs dropped → stale condenser addrs.
+//!         2. Defer scan() to after batch: was firing inline inside 1024-event loop
+//!            while pending EVENT_FREEs for those same addrs sat 3 slots ahead.
+//!         3. Burst gate: suppress scan() for 60s when growth >50MB/s (observer
+//!            p95=21.5MB/s, bursts hit 672MB/s during coldload; gate is 2.3× p95).
+//!         4. Ring overflow counter: now surfaced in MembraneState summary.
+//!   Why:  Observer ran 40 days, 1M+ entries. neurograph_rpc: 8238 burst events
+//!         >100MB/10s, median restart interval 2min, startup coldload 31s median.
+//!         These patterns were exactly what the membrane wasn't built to handle.
+//!   How:  See BURST_WINDOW_*, BURST_SUPPRESSED_UNTIL_NS, RING_OVERFLOW_COUNT.
+//!         test_mode: true safety hold remains — remove only after this lands.
 //! [2026-05-25] CC — Fix: PIPELINE now uses test_mode=true in LD_PRELOAD context
 //!   What: condenser.scan_and_compress() was reading from and writing to live
 //!         Python/uvicorn heap addresses, causing use-after-free heap corruption
@@ -423,8 +437,10 @@ const EVENT_FREE: u8 = 2;
 const EVENT_EMPTY: u8 = 0;
 
 /// Lock-free ring buffer capacity — must be power of 2.
-/// 8K slots × 8 bytes = 64KB. Lives in .bss, zero heap allocation.
-const RING_SIZE: usize = 8192;
+/// 64K slots × 8 bytes = 512KB. Lives in .bss, zero heap allocation.
+/// Sized for burst events: observer recorded 672MB/s peaks (171k alloc events/s).
+/// At that rate the old 8K ring filled in 47ms; 64K buys ~380ms drain headroom.
+const RING_SIZE: usize = 65536;
 
 /// Compact ring event — 8 bytes, packed into a single AtomicU64.
 /// Layout: [tag:8][size_kb:16][address_low:32][_pad:8]
@@ -532,6 +548,25 @@ fn is_early_ptr(ptr: *mut c_void) -> bool {
 static SCAN_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SCAN_INTERVAL: u64 = 1_000;
 
+/// Burst gate — suppress scan() when allocation rate exceeds threshold.
+/// Observer data: p95 growth = 21.5 MB/s, max burst = 672 MB/s (coldload storms).
+/// Threshold of 50 MB/s is 2.3× p95: definitively burst, not busy-normal.
+/// When tripped, scan() is suppressed for BURST_SUPPRESSION_NS (60 seconds).
+const BURST_THRESHOLD_MB_PER_S: f64 = 50.0;
+const BURST_SUPPRESSION_NS: u64 = 60_000_000_000;  // 60 seconds
+const BURST_WINDOW_NS: u64 = 10_000_000_000;        // 10-second rolling window
+
+/// Start of current burst-measurement window (nanoseconds, monotonic)
+static BURST_WINDOW_START_NS: AtomicU64 = AtomicU64::new(0);
+/// Bytes allocated within the current burst window
+static BURST_WINDOW_BYTES: AtomicU64 = AtomicU64::new(0);
+/// scan() is suppressed until this timestamp (0 = not suppressed)
+static BURST_SUPPRESSED_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Ring buffer overflow counter — incremented when push_event drops an event.
+/// Non-zero means the drain thread fell behind during a burst.
+static RING_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Start the background drain thread (called once when transitioning to OBSERVING)
 fn start_drain_thread() {
     if DRAIN_STARTED.swap(true, Ordering::SeqCst) {
@@ -546,6 +581,13 @@ fn start_drain_thread() {
             let mut read_pos: usize = 0;
             loop {
                 let mut drained = 0;
+                // Refinement #2: scan() is deferred to AFTER the full batch.
+                // Previously it fired inline inside EVENT_ALLOC processing, while
+                // pending EVENT_FREEs for those same addresses sat 3 slots ahead.
+                // Deferring to post-batch means all frees in this batch are processed
+                // before the condenser scans for idle regions to compress.
+                let mut do_scan = false;
+
                 // Drain up to 1024 events per batch
                 for _ in 0..1024 {
                     let slot = &RING[read_pos & (RING_SIZE - 1)];
@@ -564,11 +606,35 @@ fn start_drain_thread() {
                             if let Ok(mut pipeline) = PIPELINE.try_lock() {
                                 pipeline.process_alloc(address, size);
                             }
+
+                            // Refinement #3: burst gate.
+                            // Track bytes in a rolling 10s window. If rate exceeds
+                            // BURST_THRESHOLD_MB_PER_S, suppress scan() for 60s.
+                            // Observer data: p95=21.5MB/s, max burst=672MB/s.
+                            // Threshold 50MB/s = 2.3× p95: unambiguously a storm.
+                            let now = now_ns();
+                            let window_start = BURST_WINDOW_START_NS.load(Ordering::Relaxed);
+                            if now.saturating_sub(window_start) > BURST_WINDOW_NS {
+                                // Roll the window
+                                BURST_WINDOW_START_NS.store(now, Ordering::Relaxed);
+                                BURST_WINDOW_BYTES.store(size as u64, Ordering::Relaxed);
+                            } else {
+                                let total = BURST_WINDOW_BYTES.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+                                let elapsed_s = now.saturating_sub(window_start).max(1) as f64 / 1e9;
+                                let rate_mb_s = total as f64 / (1024.0 * 1024.0) / elapsed_s;
+                                if rate_mb_s > BURST_THRESHOLD_MB_PER_S {
+                                    let suppress_until = now + BURST_SUPPRESSION_NS;
+                                    // Only extend the suppression window, never shorten it
+                                    let _ = BURST_SUPPRESSED_UNTIL_NS.fetch_update(
+                                        Ordering::Relaxed, Ordering::Relaxed,
+                                        |cur| if suppress_until > cur { Some(suppress_until) } else { None }
+                                    );
+                                }
+                            }
+
                             let count = SCAN_COUNTER.fetch_add(1, Ordering::Relaxed);
                             if count > 0 && count % SCAN_INTERVAL == 0 {
-                                if let Ok(mut pipeline) = PIPELINE.try_lock() {
-                                    pipeline.scan();
-                                }
+                                do_scan = true; // defer — don't scan mid-batch
                             }
                         }
                         EVENT_FREE => {
@@ -588,6 +654,18 @@ fn start_drain_thread() {
                     drained += 1;
                 }
 
+                // Post-batch scan — all frees in this batch are already processed.
+                // Also gated on burst suppression: no scan during coldload storms.
+                if do_scan {
+                    let now = now_ns();
+                    let suppressed_until = BURST_SUPPRESSED_UNTIL_NS.load(Ordering::Relaxed);
+                    if now >= suppressed_until {
+                        if let Ok(mut pipeline) = PIPELINE.try_lock() {
+                            pipeline.scan();
+                        }
+                    }
+                }
+
                 if drained == 0 {
                     // Nothing to drain — sleep briefly to avoid busy-spin
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -605,7 +683,9 @@ fn push_event(tag: u8, address: usize, size: usize) {
 
     // If slot isn't empty (non-zero), drain thread is behind — drop this event.
     // Better to lose an event than to stall malloc.
+    // Refinement #4: count overflows so summary can surface ring pressure.
     if slot.load(Ordering::Relaxed) != 0 {
+        RING_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -740,6 +820,11 @@ pub extern "C" fn condensate_summary() {
     // Membrane stats
     if let Ok(state) = MEMBRANE.lock() {
         state.summary().print();
+    }
+    // Ring buffer overflow count — non-zero means drain fell behind during burst
+    let overflow = RING_OVERFLOW_COUNT.load(Ordering::Relaxed);
+    if overflow > 0 {
+        eprintln!("  Ring overflow events:  {} (events dropped during burst)", overflow);
     }
     // Pipeline stats (the living loop)
     if let Ok(pipeline) = PIPELINE.lock() {

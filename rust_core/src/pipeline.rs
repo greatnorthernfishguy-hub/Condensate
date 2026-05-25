@@ -8,6 +8,20 @@
 //! The pipeline runs as a background thread alongside the membrane's
 //! LD_PRELOAD hooks. Every allocation event flows through the graph,
 //! triggers predictions, and the condenser acts on them.
+//!
+//! ---- Changelog ----
+//! [2026-05-25] CC — Large-alloc passthrough (#260)
+//!   What: Allocations above large_alloc_passthrough_bytes (default 10MB) are
+//!         tracked in the graph and predictor for pattern learning but never
+//!         registered with the condenser for compression.
+//!   Why:  Observer data: ONNX embedding model = 86MB single allocation; NG
+//!         burst events hit 7GB in 10s. Large allocs are (a) high-entropy —
+//!         LZ4 won't help, (b) hot during inference — compressing them mid-
+//!         flight causes use-after-read, (c) the source of the "massive" class
+//!         patterns the graph already learns from. Graph still sees them.
+//!   How:  process_alloc() checks size vs config.large_alloc_passthrough_bytes
+//!         before condenser.register() and field.access() calls.
+//! -------------------
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -49,6 +63,12 @@ pub struct PipelineConfig {
     /// Enable test mode — condenser generates synthetic data instead of reading
     /// from raw memory pointers. Required when using fake addresses in tests.
     pub test_mode: bool,
+    /// Allocations above this size are tracked in the graph/predictor for
+    /// pattern learning but never registered with the condenser.
+    /// Observer data: ONNX model = 86MB; NG burst allocs hit 7GB.
+    /// Large allocs are high-entropy (LZ4 ineffective) and inference-hot.
+    /// Default: 10MB — conservative floor well below the 86MB ONNX baseline.
+    pub large_alloc_passthrough_bytes: usize,
 }
 
 impl Default for PipelineConfig {
@@ -61,6 +81,7 @@ impl Default for PipelineConfig {
             graph_rebuild_interval: 500,         // rebuild graph every 500 events
             prediction_threshold: 0.3,           // act on predictions with >30% confidence
             test_mode: false,
+            large_alloc_passthrough_bytes: 10 * 1024 * 1024,  // 10MB
         }
     }
 }
@@ -258,12 +279,20 @@ impl Pipeline {
         let threshold = self.effective_threshold();
 
         if self.mode == PipelineMode::Active {
-            // 1. Register with condenser AND Lenia field
-            self.condenser.register(address, size);
-            let field_id = self.get_or_create_field_id(address, size as u64);
+            // Large-alloc passthrough: graph still learns the pattern but the
+            // condenser never touches these addresses. They are high-entropy
+            // (ONNX weights, embedding caches, large tensors — LZ4 won't help)
+            // and inference-hot (compressing mid-flight causes use-after-read).
+            // Observer data: ONNX model = 86MB; NG bursts hit 7GB in 10s.
+            let passthrough = size > self.config.large_alloc_passthrough_bytes;
 
-            // 2. Heat the field — this access injects energy
-            self.field.access(field_id);
+            // 1. Register with condenser AND Lenia field (skipped for large allocs)
+            if !passthrough {
+                self.condenser.register(address, size);
+                let field_id = self.get_or_create_field_id(address, size as u64);
+                // 2. Heat the field — this access injects energy
+                self.field.access(field_id);
+            }
 
             // 3. Record for graph learning
             let path = self.get_path(address, size);
@@ -517,6 +546,7 @@ impl ProcessPipelineMap {
                 graph_rebuild_interval: self.config.graph_rebuild_interval,
                 prediction_threshold: self.config.prediction_threshold,
                 test_mode: self.config.test_mode,
+                large_alloc_passthrough_bytes: self.config.large_alloc_passthrough_bytes,
             });
             self.pipelines.insert(pid, pipeline);
         }
