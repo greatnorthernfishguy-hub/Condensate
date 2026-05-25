@@ -13,6 +13,18 @@
 //!   - Size distribution: what sizes dominate
 //!
 //! This data feeds the AccessGraph for pattern discovery.
+//!
+//! ---- Changelog ----
+//! [2026-05-25] CC — Fix: PIPELINE now uses test_mode=true in LD_PRELOAD context
+//!   What: condenser.scan_and_compress() was reading from and writing to live
+//!         Python/uvicorn heap addresses, causing use-after-free heap corruption
+//!         and SIGSEGV in glibc's freelist traversal (~35-50s after TID start).
+//!   Why:  The condenser tracks addresses it does not own. Freed allocations can
+//!         be re-used by Python; condenser's copy_nonoverlapping overwrote glibc
+//!         chunk metadata, crashing in libc+0x17934d (svcfd_create region).
+//!   How:  PipelineConfig { test_mode: true } on global PIPELINE — condenser
+//!         learns allocation patterns but never dereferences observed addresses.
+//! -------------------
 
 use libc::{c_void, size_t};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -448,8 +460,15 @@ static MEMBRANE: std::sync::LazyLock<Mutex<MembraneState>> =
     std::sync::LazyLock::new(|| Mutex::new(MembraneState::new()));
 
 /// Global pipeline — only accessed by drain thread
+/// test_mode: true — never read from or write to live process memory.
+/// The condenser tracks alloc patterns (graph, predictor) but never
+/// dereferences the observed addresses. This is mandatory in LD_PRELOAD
+/// context where we do not own the memory we observe.
 static PIPELINE: std::sync::LazyLock<Mutex<Pipeline>> =
-    std::sync::LazyLock::new(|| Mutex::new(Pipeline::new(PipelineConfig::default())));
+    std::sync::LazyLock::new(|| Mutex::new(Pipeline::new(PipelineConfig {
+        test_mode: true,
+        ..PipelineConfig::default()
+    })));
 
 /// Drain thread handle
 static DRAIN_STARTED: std::sync::atomic::AtomicBool =
