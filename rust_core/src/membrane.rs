@@ -479,6 +479,36 @@ static LOAD_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static REAL_MALLOC: AtomicU64 = AtomicU64::new(0);
 static REAL_FREE: AtomicU64 = AtomicU64::new(0);
 
+// Early-alloc buffer — serves malloc calls during the bootstrap window before
+// dlsym has resolved REAL_MALLOC. dlsym calls malloc internally; without this,
+// real_malloc(ptr==0) calls dlsym, which calls malloc, which calls real_malloc(0),
+// which calls dlsym... → infinite recursion → stack overflow → SIGSEGV.
+// 1MB in .bss: zero-initialized, writable, no heap. Far more than dlsym needs.
+static mut EARLY_BUF: [u8; 1024 * 1024] = [0u8; 1024 * 1024];
+static EARLY_POS: AtomicUsize = AtomicUsize::new(0);
+const EARLY_BUF_LEN: usize = 1024 * 1024;
+
+unsafe fn early_alloc(size: usize) -> *mut c_void {
+    if size == 0 { return 1usize as *mut c_void; }
+    let aligned = (size + 15) & !15;
+    let pos = EARLY_POS.fetch_add(aligned, Ordering::Relaxed);
+    if pos + aligned <= EARLY_BUF_LEN {
+        unsafe { EARLY_BUF.as_mut_ptr().add(pos) as *mut c_void }
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+fn is_early_ptr(ptr: *mut c_void) -> bool {
+    if ptr.is_null() || ptr as usize == 1 { return false; }
+    unsafe {
+        let start = EARLY_BUF.as_ptr() as usize;
+        let p = ptr as usize;
+        p >= start && p < start + EARLY_BUF_LEN
+    }
+}
+
+
 /// Scan counter — run condenser scan every N allocs
 static SCAN_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SCAN_INTERVAL: u64 = 1_000;
@@ -581,13 +611,9 @@ unsafe fn real_malloc(size: size_t) -> *mut c_void {
     type MallocFn = unsafe extern "C" fn(size_t) -> *mut c_void;
     let ptr = REAL_MALLOC.load(Ordering::Relaxed);
     if ptr == 0 {
-        // Fallback during very early init before cache_real_functions runs.
-        // Use dlsym directly — this only happens for the first few mallocs.
-        unsafe {
-            let sym = libc::dlsym(libc::RTLD_NEXT, c"malloc".as_ptr());
-            let func: MallocFn = std::mem::transmute(sym);
-            return func(size);
-        }
+        // Bootstrap: dlsym hasn't returned REAL_MALLOC yet.
+        // Calling dlsym here would recurse infinitely — use static buffer instead.
+        return unsafe { early_alloc(size) };
     }
     unsafe {
         let func: MallocFn = std::mem::transmute(ptr);
@@ -600,14 +626,9 @@ unsafe fn real_malloc(size: size_t) -> *mut c_void {
 unsafe fn real_free(ptr: *mut c_void) {
     type FreeFn = unsafe extern "C" fn(*mut c_void);
     let fptr = REAL_FREE.load(Ordering::Relaxed);
-    if fptr == 0 {
-        unsafe {
-            let sym = libc::dlsym(libc::RTLD_NEXT, c"free".as_ptr());
-            let func: FreeFn = std::mem::transmute(sym);
-            func(ptr);
-            return;
-        }
-    }
+    // Early-buffer pointers live in .bss — never pass them to the real allocator.
+    if is_early_ptr(ptr) { return; }
+    if fptr == 0 { return; }
     unsafe {
         let func: FreeFn = std::mem::transmute(fptr);
         func(ptr)
