@@ -19,7 +19,14 @@ lz4_flex = "0.11"
 libc = "0.2"
 
 [features]
-default = ["python"]
+# Default: preload-only (no PyO3). This is the LD_PRELOAD membrane build.
+# `cargo build --release` produces a .so safe to preload into any process (bash, etc.)
+# because it carries no Python symbol dependencies.
+#
+# To build Python bindings: cargo build --release --features python
+# PyO3's `extension-module` feature means Python symbols come from the embedding process,
+# so that .so cannot be LD_PRELOADed into non-Python processes (exit 127 / undefined symbol).
+default = []
 python = ["pyo3"]
 preload = []
 
