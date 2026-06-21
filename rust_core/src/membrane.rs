@@ -492,7 +492,7 @@ static MEMBRANE: std::sync::LazyLock<Mutex<MembraneState>> =
 ///   3. recently_freed tombstone (5s): blocks reused addresses after free processing
 static PIPELINE: std::sync::LazyLock<Mutex<Pipeline>> =
     std::sync::LazyLock::new(|| Mutex::new(Pipeline::new(PipelineConfig {
-        test_mode: false,
+        test_mode: true,  // REVERTED 2026-06-21: SIGSEGV in production mode
         ..PipelineConfig::default()
     })));
 
