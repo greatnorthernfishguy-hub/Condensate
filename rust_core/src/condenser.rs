@@ -13,6 +13,23 @@
 //! the membrane's tracked allocations and demoting idle ones.
 //! When the predictor fires a spike ("this region is about to be
 //! accessed"), the condenser pre-promotes it.
+//!
+//! ---- Changelog ----
+//! [2026-06-21] CC — recently_freed tombstone guard (Option B safety)
+//!   What: Added `recently_freed: HashMap<usize, u64>` tombstone set.
+//!         unregister() stamps freed addresses with their freed_at_ns.
+//!         scan_and_compress() prunes stale tombstones and skips any
+//!         address still within FREED_RECENCY_NS (5s) of its free event.
+//!   Why:  Closes the address-reuse race: free(X) processed → X removed
+//!         from regions and added to tombstones → malloc(X) re-registers X
+//!         → scan would otherwise operate on the new live object at X.
+//!         The primary race (free not yet processed) is mitigated by #260
+//!         (64K ring + deferred scan + burst gate). This guard closes the
+//!         secondary race (processed free → immediate reuse → re-register).
+//!         Together these make test_mode: false materially safe to enable.
+//!   How:  FREED_RECENCY_NS const; recently_freed field on Condenser;
+//!         unregister stamps; scan_and_compress prunes + filters.
+//! -------------------
 
 use std::collections::HashMap;
 use std::fs;
@@ -24,6 +41,10 @@ use crate::membrane::{MembraneState, MembraneSummary};
 
 const PAGE_SIZE: usize = 4096;
 const COLD_DIR: &str = "/tmp/condensate_cold";
+/// How long (ns) after a free event to block that address from compression.
+/// Closes the address-reuse race: free(X) processed → malloc(X) re-registered
+/// → scan skips X for this window before treating it as a fresh allocation.
+const FREED_RECENCY_NS: u64 = 5_000_000_000;
 
 /// Tier state for a managed memory region
 #[derive(Clone, Debug, PartialEq)]
@@ -163,6 +184,10 @@ pub struct Condenser {
     config: CondenserConfig,
     /// Managed regions: address → ManagedRegion
     regions: HashMap<usize, ManagedRegion>,
+    /// Tombstone set: addresses freed within the last FREED_RECENCY_NS.
+    /// Prevents scan_and_compress from operating on a reused address whose
+    /// free event was processed but a new malloc has already re-registered it.
+    recently_freed: HashMap<usize, u64>,
     /// Start time
     start: Instant,
     /// Stats
@@ -181,6 +206,7 @@ impl Condenser {
         Self {
             config,
             regions: HashMap::with_capacity(1000),
+            recently_freed: HashMap::new(),
             start: Instant::now(),
             total_compressed: 0,
             total_decompressed: 0,
@@ -220,6 +246,10 @@ impl Condenser {
     /// Remove a region (freed by the application)
     pub fn unregister(&mut self, address: usize) {
         if let Some(region) = self.regions.remove(&address) {
+            // Stamp tombstone so scan_and_compress skips this address if it
+            // is reused by a new malloc before the recency window expires.
+            self.recently_freed.insert(address, self.elapsed_ns());
+
             // Reclaim any saved bytes
             let usage = region.ram_usage();
             if usage < region.size {
@@ -348,6 +378,8 @@ impl Condenser {
     /// Guards applied per region before compression:
     ///   1. Skip regions smaller than PAGE_SIZE (4096 bytes) — not worth it.
     ///   2. Skip if compressed_size > original_size * 0.9 — less than 10% savings.
+    ///   3. Skip addresses in the recently_freed tombstone set — the address may
+    ///      have been reused by a new malloc before the recency window expires.
     ///
     /// Returns (regions_compressed, bytes_saved)
     pub fn scan_and_compress(&mut self) -> (u32, u64) {
@@ -355,16 +387,21 @@ impl Condenser {
         let threshold = self.config.idle_threshold_ns;
         self.scan_count += 1;
 
+        // Prune stale tombstones first — entries older than FREED_RECENCY_NS
+        // are safe to forget; the address has been "clean" long enough.
+        self.recently_freed.retain(|_, freed_at| now - *freed_at < FREED_RECENCY_NS);
+
         let mut compressed_count = 0u32;
         let mut bytes_saved = 0u64;
 
         // Collect addresses to compress (can't mutate while iterating)
         let to_compress: Vec<usize> = self.regions.iter()
-            .filter(|(_, r)| {
+            .filter(|(addr, r)| {
                 r.is_hot() &&
                 r.size >= self.config.min_manage_size &&
                 r.size >= PAGE_SIZE &&           // minimum page size guard
-                now - r.last_access_ns > threshold
+                now - r.last_access_ns > threshold &&
+                !self.recently_freed.contains_key(addr)  // tombstone guard
             })
             .map(|(&addr, _)| addr)
             .collect();

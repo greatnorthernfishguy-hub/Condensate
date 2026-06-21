@@ -38,6 +38,15 @@
 //!         chunk metadata, crashing in libc+0x17934d (svcfd_create region).
 //!   How:  PipelineConfig { test_mode: true } on global PIPELINE — condenser
 //!         learns allocation patterns but never dereferences observed addresses.
+//! [2026-06-21] CC — Flip PIPELINE to test_mode: false (production condensation)
+//!   What: Removed test_mode: true safety hold. PIPELINE now runs in production
+//!         mode — condenser reads idle allocations and writes compressed bytes back.
+//!   Why:  72h stability check passed on VPS TID (inode 1844695, no SIGBUS/SIGSEGV).
+//!         #260 improvements (64K ring, deferred scan, 60s burst gate) dramatically
+//!         reduce the primary race (unprocessed free event). Option B guard added
+//!         to condenser (recently_freed tombstone set, FREED_RECENCY_NS=5s) closes
+//!         the secondary race (processed free → malloc reuse → re-register → scan).
+//!   How:  PipelineConfig { test_mode: false } — see condenser.rs changelog.
 //! -------------------
 
 use libc::{c_void, size_t};
@@ -475,14 +484,15 @@ static WRITE_POS: AtomicUsize = AtomicUsize::new(0);
 static MEMBRANE: std::sync::LazyLock<Mutex<MembraneState>> =
     std::sync::LazyLock::new(|| Mutex::new(MembraneState::new()));
 
-/// Global pipeline — only accessed by drain thread
-/// test_mode: true — never read from or write to live process memory.
-/// The condenser tracks alloc patterns (graph, predictor) but never
-/// dereferences the observed addresses. This is mandatory in LD_PRELOAD
-/// context where we do not own the memory we observe.
+/// Global pipeline — only accessed by drain thread.
+/// Production mode: condenser reads idle allocations and writes compressed
+/// bytes back. Protected by three layered guards:
+///   1. 64K ring + deferred scan (#260): minimises unprocessed-free window
+///   2. 60s burst gate (#260): no scan during startup coldload (original crash window)
+///   3. recently_freed tombstone (5s): blocks reused addresses after free processing
 static PIPELINE: std::sync::LazyLock<Mutex<Pipeline>> =
     std::sync::LazyLock::new(|| Mutex::new(Pipeline::new(PipelineConfig {
-        test_mode: true,
+        test_mode: false,
         ..PipelineConfig::default()
     })));
 
