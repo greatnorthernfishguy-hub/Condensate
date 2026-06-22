@@ -78,9 +78,23 @@ struct KissSession {
 // ── Shared app state ────────────────────────────────────────────────────────
 
 struct AppState {
-    upstream: String,
-    client:   Client,
-    sessions: Mutex<HashMap<String, KissSession>>,
+    // Fallback upstream when the config file is absent/unreadable.
+    upstream_fallback: String,
+    client:            Client,
+    sessions:          Mutex<HashMap<String, KissSession>>,
+}
+
+// Read the live upstream URL from ~/.config/minitid/upstream, falling back to
+// `fallback` when the file is absent.  Called per-request so `use-claude` /
+// `use-openrouter` can switch destinations without restarting the service.
+fn read_upstream(fallback: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let path = format!("{}/.config/minitid/upstream", home);
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -189,11 +203,13 @@ async fn proxy(
         body_bytes
     };
 
-    // Build upstream URL.
+    // Build upstream URL — read config file live so switching providers
+    // takes effect immediately without restarting the service.
+    let upstream = read_upstream(&state.upstream_fallback);
     let path_and_query = uri.path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(uri.path());
-    let upstream_url = format!("{}{}", state.upstream, path_and_query);
+    let upstream_url = format!("{}{}", upstream, path_and_query);
 
     // Build reqwest request, forwarding safe headers.
     let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
@@ -234,9 +250,9 @@ async fn main() {
         .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
 
     let state = Arc::new(AppState {
-        client:   Client::builder().build().expect("reqwest client"),
-        sessions: Mutex::new(HashMap::new()),
-        upstream: upstream.clone(),
+        client:            Client::builder().build().expect("reqwest client"),
+        sessions:          Mutex::new(HashMap::new()),
+        upstream_fallback: upstream.clone(),
     });
 
     let app = Router::new()
