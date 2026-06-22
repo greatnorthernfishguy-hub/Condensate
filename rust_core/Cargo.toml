@@ -13,10 +13,22 @@ crate-type = ["cdylib", "rlib"]
 name = "condensate_cli"
 path = "src/cli.rs"
 
+[[bin]]
+name = "minitid"
+path = "src/minitid.rs"
+required-features = ["minitid"]
+
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
 lz4_flex = "0.11"
 libc = "0.2"
+# minitid — CC-native KISS proxy. Only compiled with --features minitid.
+# Does NOT affect the LD_PRELOAD .so build.
+tokio       = { version = "1",    features = ["full"],                optional = true }
+axum        = { version = "0.8",                                      optional = true }
+reqwest     = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false, optional = true }
+serde_json  = { version = "1",                                        optional = true }
+sha2        = { version = "0.10",                                     optional = true }
 
 [features]
 # Default: preload-only (no PyO3). This is the LD_PRELOAD membrane build.
@@ -26,9 +38,12 @@ libc = "0.2"
 # To build Python bindings: cargo build --release --features python
 # PyO3's `extension-module` feature means Python symbols come from the embedding process,
 # so that .so cannot be LD_PRELOADed into non-Python processes (exit 127 / undefined symbol).
+#
+# To build miniTID proxy: cargo build --release --features minitid
 default = []
 python = ["pyo3"]
 preload = []
+minitid = ["dep:tokio", "dep:axum", "dep:reqwest", "dep:serde_json", "dep:sha2"]
 
 [profile.release]
 opt-level = 3
