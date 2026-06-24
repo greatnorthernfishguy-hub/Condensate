@@ -19,7 +19,7 @@ path = "src/minitid.rs"
 required-features = ["minitid"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"], optional = true }
 lz4_flex = "0.11"
 libc = "0.2"
 # minitid — CC-native KISS proxy. Only compiled with --features minitid.

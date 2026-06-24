@@ -42,6 +42,7 @@ pub mod sleep;
 pub mod splat;
 pub mod erasure;
 mod bench;
+mod pybind;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -57,5 +58,7 @@ fn condensate_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<graph::AccessGraph>()?;
     m.add_class::<predictor::RustPredictor>()?;
     m.add_class::<predictor::Prediction>()?;
+    // Demo measurement + tiering
+    pybind::py::register(m)?;
     Ok(())
 }
