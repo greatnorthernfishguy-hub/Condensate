@@ -139,10 +139,10 @@ Space cache/wheel gotchas]].
 **Cold-start storage:** a 7B is ~15 GB. ZeroGPU's *own* disk is ephemeral, but a
 **persistent bucket is mounted** on the staging Space, so the model is **downloaded once
 and reused** — *provided* we point the HF cache at the bucket. Config item for the plan:
-set `HF_HOME` (and/or `HUGGINGFACE_HUB_CACHE` / `TRANSFORMERS_CACHE`) to the bucket mount
-path (confirm the actual mount on the Space — do not assume; HF persistent storage is
-commonly `/data`). After the first download, cold starts **load weights from the bucket
-disk (seconds), not re-download (minutes)**.
+set `HF_HOME` (and/or `HUGGINGFACE_HUB_CACHE` / `TRANSFORMERS_CACHE`) to the mounted
+bucket. **Confirmed:** bucket `Executor-Tyrant-Framework/Condensate-storage` (Read & Write)
+mounts at **`/data`** → use e.g. `HF_HOME=/data/hf-cache`. After the first download, cold
+starts **load weights from the bucket disk (seconds), not re-download (minutes)**.
 
 ## 7. Deployment
 
