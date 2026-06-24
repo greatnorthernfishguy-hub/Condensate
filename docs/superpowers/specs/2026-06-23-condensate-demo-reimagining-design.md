@@ -136,9 +136,13 @@ Space cache/wheel gotchas]].
 - **ZeroGPU constraints:** `import spaces`; `@spaces.GPU(duration=…)`; load weights to
   CPU at import, move to CUDA *inside* the decorated fn; no `torch.compile`; CUDA-wheel torch.
 
-**Operational risk:** a 7B → ~15 GB model download per cold start (ephemeral ZeroGPU
-storage — mitigated now that a **persistent bucket is mounted** on the staging Space).
-First post-idle run is still slower; the bucket caches the weights across restarts.
+**Cold-start storage:** a 7B is ~15 GB. ZeroGPU's *own* disk is ephemeral, but a
+**persistent bucket is mounted** on the staging Space, so the model is **downloaded once
+and reused** — *provided* we point the HF cache at the bucket. Config item for the plan:
+set `HF_HOME` (and/or `HUGGINGFACE_HUB_CACHE` / `TRANSFORMERS_CACHE`) to the bucket mount
+path (confirm the actual mount on the Space — do not assume; HF persistent storage is
+commonly `/data`). After the first download, cold starts **load weights from the bucket
+disk (seconds), not re-download (minutes)**.
 
 ## 7. Deployment
 
