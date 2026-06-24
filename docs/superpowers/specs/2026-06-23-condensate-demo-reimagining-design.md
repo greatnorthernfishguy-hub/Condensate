@@ -5,6 +5,7 @@
 **Status:** Design approved; pending spec review → implementation plan
 **Repo:** `~/Condensate` (the public demo Space)
 **Live Space:** `huggingface.co/spaces/Executor-Tyrant-Framework/Condensate` (Gradio SDK, ZeroGPU)
+**See also:** [[Condensate]] · [[Condensate_PRD_v0.1]] · [[Condensate_Rust_Conversion_Workorder]] · [[laptop_home_project_condensate_lab|Condensate-Lab (sister Space)]]
 
 ---
 
@@ -12,12 +13,12 @@
 
 The current demo is parked-and-stale: it runs the original Python proof-of-concept,
 renders the inherently-visual HOT/COLD story as ASCII tables, gates value behind a
-3-click flow, and the deployed Space is 27 commits behind. None of the Rust engine
+3-click flow, and the deployed Space is 27 commits behind. None of the [[Condensate_Rust_Conversion_Workorder|Rust engine]]
 that received all the real development is represented.
 
 This is a ground-up reimagining: **visual + real engine + one flow**. It makes the
-product promise — *"do the same, or more, with less"* — visceral in one screen, and
-it does so on the actual `condensate_core` Rust engine for the first time.
+[[Condensate|product promise]] — *"do the same, or more, with less"* — visceral in one
+screen, and it does so on the actual `condensate_core` Rust engine for the first time.
 
 ## 2. Goals / Non-goals
 
@@ -45,8 +46,9 @@ it does so on the actual `condensate_core` Rust engine for the first time.
 Load/Train happen **lazily on first Run** with a progress indicator — no manual steps.
 
 **Model:** `Qwen2.5-7B-Instruct` (Apache-2.0; clean for a public AGPL demo; fits a
-ZeroGPU A100 slice). Headline becomes "condensed ~9 GB off a live 7B, same answer."
-Fallback to a 3B if ZeroGPU per-call time is too slow.
+ZeroGPU A100 slice; see [[vps_home_project_qwen25_attention_quirks|Qwen2.5 attention quirks]]
+— relevant to the head-level view's GQA layout). Headline becomes "condensed ~9 GB off
+a live 7B, same answer." Fallback to a 3B if ZeroGPU per-call time is too slow.
 
 ## 4. Visualization
 
@@ -55,7 +57,8 @@ Composition (single screen, top→bottom):
 2. **Temperature heatmap** (centerpiece): rows = layers, cols = the 7 linear modules
    per layer (q/k/v/o + gate/up/down) → clean 28×7 grid for Qwen2.5-7B. COLD =
    deep blue/near-black, WARM = amber, HOT = bright orange-red. Hover = module name,
-   access count, MB. Toggle → finer head-level view (layers × attention heads).
+   access count, MB. Toggle → finer head-level view (layers × attention heads; mind the
+   [[vps_home_project_qwen25_attention_quirks|GQA head layout]]).
 3. **Before/after RAM bars** (full vs condensed, delta annotated).
 4. **Stats strip**: HOT/WARM/COLD counts + prediction accuracy (from `RustPredictor`).
 5. **Generated text** (same-output proof).
@@ -83,8 +86,9 @@ Split: **PyTorch is the sensor, Rust `condensate_core` is the brain.**
 
 ### Integrity backbone (must stay honest)
 Condensation is **lossless lz4 of idle regions with decompress-on-access**, NOT
-weight dropping/quantization. COLD bytes remain; they're just stored compactly while
-untouched. Therefore:
+weight dropping/quantization (lossless-boundary basis: [[provisional-condensate-spec|Condensate
+provisional spec]]). COLD bytes remain; they're just stored compactly while untouched.
+Therefore:
 - **RAM saved** = Σ(cold_region_size − lz4_compressed_size) — *measured*.
 - **"Same output"** = guaranteed by the lossless round-trip; **assert in code**
   (decompress == original) and surface a green "✓ lossless verified" check.
@@ -111,6 +115,9 @@ from a script or by a coding agent without touching the widget.
 ## 6. Packaging (wheel + Space)
 
 Stays **Gradio SDK** (for ZeroGPU). Rust reaches a cargo-less runtime as a prebuilt wheel.
+The wheel-into-ZeroGPU pattern has precedent on the splat Space
+([[splat_lenia_living_compression]]); honor the known [[vps_home_feedback_hf_space_cache_mismatch|HF
+Space cache/wheel gotchas]].
 
 - **Wheel:** add PyO3 **`abi3-py310`** (one wheel works across Python ≥3.10) and build
   with **`maturin build --release --features python --zig --compatibility
@@ -130,8 +137,8 @@ Stays **Gradio SDK** (for ZeroGPU). Rust reaches a cargo-less runtime as a prebu
   CPU at import, move to CUDA *inside* the decorated fn; no `torch.compile`; CUDA-wheel torch.
 
 **Operational risk:** a 7B → ~15 GB model download per cold start (ephemeral ZeroGPU
-storage). First post-idle run is slow. Options: accept (session cache warms), attach
-persistent storage, or choose a smaller-footprint model. Not a blocker.
+storage — mitigated now that a **persistent bucket is mounted** on the staging Space).
+First post-idle run is still slower; the bucket caches the weights across restarts.
 
 ## 7. Deployment
 
@@ -162,3 +169,21 @@ The 8 GB laptop can't run Gradio, so test the parts that matter headlessly:
 - Engine: real `condensate_core`; expose `Condenser` via PyO3; lossless integrity.
 - Measurement: sampled default + full toggle (mode is a plain arg).
 - Deploy: staging-first, then promote + fix auto-sync.
+
+## 11. Related notes
+- [[Condensate]] — the core concept (living memory manager).
+- [[Condensate_PRD_v0.1]] · [[Condensate_Rust_Conversion_Workorder]] — product spec + the
+  Rust v2 engine this demo finally surfaces.
+- [[provisional-condensate-spec]] · [[SB16-condensate-data]] — lossless/holographic IP
+  behind the "same output" guarantee.
+- [[laptop_home_project_condensate_lab|Condensate-Lab]] — sister Space; the other consumer
+  of `condensate_core` (membrane safety harness).
+- [[laptop_home_project_minitid|miniTID]] — CC-native KISS proxy; shares the compression lineage.
+- [[splat_lenia_living_compression]] · [[Lenia FlowGraph]] — Lenia field dynamics in the
+  engine; the splat Space is the wheel-into-ZeroGPU precedent.
+- [[vps_home_feedback_hf_space_cache_mismatch]] — HF Space deploy gotchas to honor when
+  packaging the wheel.
+- [[vps_home_project_qwen25_attention_quirks]] — Qwen2.5 attention/GQA quirks for the
+  head-level heatmap.
+- [[feedback_condensate_nuwave_shared_principles]] — shared principles across Condensate /
+  NuWave / [[KISS]] / [[Pith]].
