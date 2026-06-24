@@ -1,5 +1,7 @@
+gradio==6.10.0
+spaces
 torch
 transformers
-numpy
-lz4
-spaces
+accelerate
+plotly
+./wheels/condensate_core-0.1.0-cp310-abi3-manylinux_2_28_x86_64.whl
