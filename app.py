@@ -9,9 +9,18 @@
 # Why: SDD task-4-brief.md — replace multi-step PoC with production-quality demo.
 # How: Lazy CPU load, CUDA inside @spaces.GPU, model back to CPU before
 #      region building, condensate_core.classify_tier inline to gate full_bytes.
+# [2026-06-24] CC — Task 4 review fixes (Finding 1 + Finding 2)
+# What: F1: _access_count_for() helper — unobserved modules treated HOT (conservative),
+#       with diagnostic stderr line. F2: pad_token guard after tokenizer load.
+# Why: F1: savings % was overstated when model module names didn't join sensor names
+#      (unobserved → default 0 → COLD → counted as condensable — wrong).
+#      F2: generate() can fail with pad_token_id=None on some tokenizer configs.
+# How: F1: Pure helper with max_access fallback; count+MB of unobserved emitted to
+#      stderr before _regions_from returns. F2: Standard pad_token = eos_token guard.
 # -------------------
 
 import os
+import sys
 os.environ.setdefault("HF_HOME", "/data/hf-cache")
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/data/hf-cache/hub")
 
@@ -25,6 +34,7 @@ import viz
 import condensate_core
 from examples import EXAMPLES
 from torch_membrane import TorchMembrane
+from app_helpers import _access_count_for
 
 MODEL_NAME = os.environ.get("CONDENSATE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 _M = {"model": None, "tok": None, "sensor": None}
@@ -37,6 +47,8 @@ def _ensure_loaded():
     """Lazy CPU load (no CUDA at import — ZeroGPU rule). Cached on the bucket."""
     if _M["model"] is None:
         _M["tok"] = AutoTokenizer.from_pretrained(MODEL_NAME)
+        if _M["tok"].pad_token is None:
+            _M["tok"].pad_token = _M["tok"].eos_token
         _M["model"] = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME, torch_dtype=torch.float16)
         _M["model"].eval()
@@ -57,12 +69,21 @@ def _regions_from(model, sensor, measurement):
     max_access = max(access.values(), default=0)
 
     regions = []
+    unobserved_count = 0
+    unobserved_bytes = 0
+
     for name, p in model.named_parameters():
         if not name.endswith(".weight"):
             continue
         mod = name[: -len(".weight")]
         nbytes = p.numel() * p.element_size()
-        acc = int(access.get(mod, 0))
+
+        # Conservative: unobserved modules are treated as fully-hot so savings
+        # are never overstated.  Observed modules use their real access count.
+        acc = _access_count_for(mod, access, max_access)
+        if mod not in access:
+            unobserved_count += 1
+            unobserved_bytes += nbytes
 
         # Bounded sample: slice first, then convert — never the whole tensor.
         flat = p.detach().flatten()
@@ -82,6 +103,15 @@ def _regions_from(model, sensor, measurement):
             "sample_bytes": sample,
             "full_bytes": full,
         })
+
+    total_weight_params = len(regions)
+    if unobserved_count:
+        unobserved_mb = unobserved_bytes / (1024 * 1024)
+        print(
+            f"[regions] {unobserved_count}/{total_weight_params} weight modules "
+            f"unobserved by sensor ({unobserved_mb:.1f} MB) -> treated HOT",
+            file=sys.stderr,
+        )
     return regions
 
 
