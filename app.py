@@ -21,8 +21,21 @@
 
 import os
 import sys
+import subprocess
 os.environ.setdefault("HF_HOME", "/data/hf-cache")
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/data/hf-cache/hub")
+
+# HF Spaces (gradio SDK) install requirements.txt in an early build layer, BEFORE
+# the repo (and wheels/) is copied in — so a local-path wheel can't resolve at
+# build time. Install our prebuilt engine wheel at runtime instead; the file is
+# present in the repo checkout (/app/wheels) once the Space is running.
+try:
+    import condensate_core  # noqa: F401
+except ModuleNotFoundError:
+    _whl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wheels",
+                        "condensate_core-0.1.0-cp310-abi3-manylinux_2_28_x86_64.whl")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps", _whl])
+    import condensate_core  # noqa: F401
 
 import spaces
 import gradio as gr
