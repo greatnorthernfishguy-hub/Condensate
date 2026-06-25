@@ -17,6 +17,11 @@
 #      F2: generate() can fail with pad_token_id=None on some tokenizer configs.
 # How: F1: Pure helper with max_access fallback; count+MB of unobserved emitted to
 #      stderr before _regions_from returns. F2: Standard pad_token = eos_token guard.
+# [2026-06-24] CC — Signal fix: avg_activation replaces forward_count (punchlist #265)
+# What: _regions_from reads avg_activation (output L2 norm) instead of forward_count.
+# Why: forward_count is identical for all layers in dense inference → 100% HOT.
+#      avg_activation discriminates by actual layer contribution to the residual stream.
+# How: One-line dict comprehension change; _access_count_for already handles float→int.
 # -------------------
 
 import os
@@ -77,7 +82,7 @@ def _regions_from(model, sensor, measurement):
     Full mode on a large model is memory-intensive — acceptable v1 trade-off;
     streaming full_bytes is a future optimisation.
     """
-    access = {a["name"]: a.get("forward_count", a.get("access_count", 0))
+    access = {a["name"]: a.get("avg_activation", a.get("forward_count", 0.0))
               for a in sensor.get_activation_map()}
     max_access = max(access.values(), default=0)
 
