@@ -31,6 +31,26 @@
 // Wire up CC:
 //   export ANTHROPIC_BASE_URL=http://127.0.0.1:9090
 //   # Add to ~/.bashrc alongside LD_PRELOAD for membrane.
+//
+// ---- Changelog ----
+// [2026-07-04/05] Claude Code (Sonnet 5 / Haiku 4.5) — CC Gateway Turn-Deposit (Tasks 5-7)
+// What: Tee the response stream (relay live to the client + accumulate for parsing),
+//       reconstruct the assistant's full text from SSE content_block_delta/text_delta
+//       events, extract the genuine last user message before KISS mutates the body,
+//       and deposit both sides of the turn as raw ExperienceEntry frames via the
+//       ng_tract crate (write_experience/deposit_to_file) to CC_GATEWAY_TRACT_PATH.
+// Why:  Claude Code's hook system never exposes CC's own generated response text to
+//       any hook script -- only prompts and tool I/O. CC's own NeuroGraph instance
+//       (a separate substrate from Syl's) never saw its own words. This closes that
+//       gap the same way Anima closes it for Syl: sit in the transport path and
+//       deposit raw, unclassified turn text (LAW 7), never a direct call into the
+//       Python daemon that drains it (LAW 1) -- deposit/drain via tract file only.
+// How:  Client-facing relay and accumulation/deposit run in two independently
+//       spawned tokio tasks so neither blocking nor a panic in the deposit path can
+//       reach the proxied response. CC_GATEWAY_TRACT_PATH (LAW 5) is read
+//       independently here and by the Python drain side (cc_ng_organism.py), same
+//       default on both. See docs/superpowers/specs/2026-07-04-cc-gateway-turn-deposit-design.md.
+// -------------------
 
 use axum::{Router, extract::State, response::Response};
 use axum::body::Body;
