@@ -30,6 +30,8 @@ reqwest     = { version = "0.12", features = ["stream", "json", "rustls-tls"], d
 serde_json  = { version = "1",                                        optional = true }
 sha2        = { version = "0.10",                                     optional = true }
 ng_tract    = { path = "/home/josh/UniAI/rust_core", default-features = false, optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio-stream = { version = "0.1", optional = true }
 
 [features]
 # Default: preload-only (no PyO3). This is the LD_PRELOAD membrane build.
@@ -44,7 +46,7 @@ ng_tract    = { path = "/home/josh/UniAI/rust_core", default-features = false, o
 default = []
 python = ["pyo3"]
 preload = []
-minitid = ["dep:tokio", "dep:axum", "dep:reqwest", "dep:serde_json", "dep:sha2", "dep:ng_tract"]
+minitid = ["dep:tokio", "dep:axum", "dep:reqwest", "dep:serde_json", "dep:sha2", "dep:ng_tract", "dep:futures-util", "dep:tokio-stream"]
 
 [profile.release]
 opt-level = 3

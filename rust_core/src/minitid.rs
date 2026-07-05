@@ -226,6 +226,40 @@ fn apply_kiss(messages: &[Value], sessions: &Mutex<HashMap<String, KissSession>>
     }).collect()
 }
 
+// TEMPORARY STUBS (Task 5 scope only): Task 6 replaces extract_last_user_message
+// with the real implementation — extract the last user message's text from the
+// (possibly KISS-compressed) request body. Task 7 replaces deposit_turn with the
+// real implementation — deposit the (last_user_message, assistant_text) turn
+// pair into CC's own NeuroGraph substrate via ng_tract (Law 7: raw experience,
+// no classification here). Both are forward references needed to wire the tee
+// below; they are not this task's responsibility.
+fn extract_last_user_message(_: &[u8]) -> Option<String> { None }
+fn deposit_turn(_: Option<String>, _: String) {}
+
+/// Reconstruct the assistant's full generated text from accumulated SSE
+/// bytes by concatenating every `content_block_delta` event whose
+/// `delta.type` is `text_delta`. Malformed/non-text events are skipped,
+/// never panicked on -- this runs on every response and must never crash
+/// the proxy. Returns "" if nothing could be reconstructed.
+fn reconstruct_assistant_text(sse_bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(sse_bytes);
+    let mut out = String::new();
+    for line in text.lines() {
+        let Some(json_str) = line.strip_prefix("data: ") else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(json_str) else { continue };
+        if value["type"].as_str() != Some("content_block_delta") {
+            continue;
+        }
+        if value["delta"]["type"].as_str() != Some("text_delta") {
+            continue;
+        }
+        if let Some(t) = value["delta"]["text"].as_str() {
+            out.push_str(t);
+        }
+    }
+    out
+}
+
 // ── Proxy handler ────────────────────────────────────────────────────────────
 
 async fn proxy(
@@ -290,7 +324,46 @@ async fn proxy(
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let resp_headers = upstream_resp.headers().clone();
 
-    let mut response = Response::new(Body::from_stream(upstream_resp.bytes_stream()));
+    let last_user_message = if is_messages {
+        extract_last_user_message(&body_bytes)
+    } else {
+        None
+    };
+
+    use futures_util::StreamExt;
+    use tokio::sync::mpsc;
+    let (tx, rx) = mpsc::unbounded_channel::<Result<axum::body::Bytes, std::io::Error>>();
+    let mut upstream_stream = upstream_resp.bytes_stream();
+    let accumulator_task = tokio::spawn(async move {
+        let mut accumulated: Vec<u8> = Vec::new();
+        while let Some(chunk) = upstream_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    accumulated.extend_from_slice(&bytes);
+                    if tx.send(Ok(bytes)).is_err() {
+                        break; // client disconnected -- stop relaying, still finish accumulating for deposit
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+                    break;
+                }
+            }
+        }
+        accumulated
+    });
+
+    tokio::spawn(async move {
+        let accumulated = match accumulator_task.await {
+            Ok(bytes) => bytes,
+            Err(_) => return, // task panicked -- nothing to deposit, never crash the proxy
+        };
+        let assistant_text = reconstruct_assistant_text(&accumulated);
+        deposit_turn(last_user_message, assistant_text);
+    });
+
+    let out_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+    let mut response = Response::new(Body::from_stream(out_stream));
     *response.status_mut() = status;
     for (k, v) in &resp_headers {
         response.headers_mut().insert(k, v.clone());
@@ -464,5 +537,28 @@ mod tests {
         // First warmup turn must be a full pass — no compression.
         let out = apply_kiss(&original, &sessions);
         assert_eq!(out[0], original[0], "warmup turn must pass through verbatim");
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_assistant_text_from_sse() {
+        let sse = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n\
+                    event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\", world\"}}\n\n\
+                    event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let text = reconstruct_assistant_text(sse);
+        assert_eq!(text, "Hello, world");
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_assistant_text_ignores_non_text_delta() {
+        let sse = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n";
+        let text = reconstruct_assistant_text(sse);
+        assert_eq!(text, "");
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_assistant_text_handles_malformed_lines_gracefully() {
+        let sse = b"garbage\nnot json at all\ndata: {not even valid json\n\n";
+        let text = reconstruct_assistant_text(sse);
+        assert_eq!(text, "");
     }
 }
