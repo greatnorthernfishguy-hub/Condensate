@@ -76,6 +76,16 @@ thread_local! {
     static REENTRANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// Guards the free() guaranteed-delivery fallback (see push_event/free below).
+// process_free() can itself drop owned data (e.g. a PathBuf) whose deallocation
+// re-enters this same hooked free() on the same thread. Without this guard, a
+// nested overflow during the fallback would try to re-lock a mutex this thread
+// already holds — a self-deadlock. Nested/reentrant overflows just fall back to
+// the old lossy behavior instead.
+thread_local! {
+    static IN_FREE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A tracked memory allocation
 #[derive(Clone, Debug)]
 pub struct Allocation {
@@ -577,6 +587,10 @@ static BURST_SUPPRESSED_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
 /// Non-zero means the drain thread fell behind during a burst.
 static RING_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Guaranteed-delivery fallback counter — incremented each time free()'s
+/// blocking fallback actually runs (i.e. the ring was full for a free event).
+static FREE_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Start the background drain thread (called once when transitioning to OBSERVING)
 fn start_drain_thread() {
     if DRAIN_STARTED.swap(true, Ordering::SeqCst) {
@@ -685,9 +699,10 @@ fn start_drain_thread() {
         .expect("Failed to spawn condensate drain thread");
 }
 
-/// Push an event to the ring buffer — lock-free, ~10ns, zero heap allocation
+/// Push an event to the ring buffer — lock-free, ~10ns, zero heap allocation.
+/// Returns false if the slot was full (drain thread behind) and the event was dropped.
 #[inline(always)]
-fn push_event(tag: u8, address: usize, size: usize) {
+fn push_event(tag: u8, address: usize, size: usize) -> bool {
     let pos = WRITE_POS.fetch_add(1, Ordering::Relaxed);
     let slot = &RING[pos & (RING_SIZE - 1)];
 
@@ -696,11 +711,12 @@ fn push_event(tag: u8, address: usize, size: usize) {
     // Refinement #4: count overflows so summary can surface ring pressure.
     if slot.load(Ordering::Relaxed) != 0 {
         RING_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
 
     // Single atomic store — the packed value IS the fence
     slot.store(pack_event(tag, address, size), Ordering::Release);
+    true
 }
 
 /// Resolve and cache the real malloc/free function pointers.
@@ -787,7 +803,37 @@ pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     ptr
 }
 
+/// Record a free, guaranteeing delivery: pushes to the ring buffer, falling
+/// back to a direct blocking record if the ring was full. Split out from the
+/// `free()` hook so it can be exercised directly in tests without touching
+/// the real allocator.
+fn handle_free_event(address: usize) {
+    if !push_event(EVENT_FREE, address, 0) {
+        // Ring was full — fall back to a direct, blocking record so
+        // this free is guaranteed to land somewhere. Skip the fallback
+        // if we're already inside it on this thread (see IN_FREE_FALLBACK).
+        let already_in_fallback = IN_FREE_FALLBACK.with(|f| f.get());
+        if !already_in_fallback {
+            IN_FREE_FALLBACK.with(|f| f.set(true));
+            FREE_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut state) = MEMBRANE.lock() {
+                state.record_free(address);
+            }
+            if let Ok(mut pipeline) = PIPELINE.lock() {
+                pipeline.process_free(address);
+            }
+            IN_FREE_FALLBACK.with(|f| f.set(false));
+        }
+    }
+}
+
 /// Hooked free — same dormant/observing phases as malloc.
+///
+/// Free events must never be silently lost: an undelivered free means
+/// unregister() never tombstones the address, so a later scan() could
+/// read/compress memory that's already been freed (and possibly reused).
+/// Alloc events stay best-effort (a dropped alloc just means the address
+/// is never tracked — no compression, no safety issue).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     if ptr.is_null() {
@@ -801,7 +847,7 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
                 return;
             }
             r.set(true);
-            push_event(EVENT_FREE, ptr as usize, 0);
+            handle_free_event(ptr as usize);
             r.set(false);
         });
     }
@@ -836,6 +882,12 @@ pub extern "C" fn condensate_summary() {
     if overflow > 0 {
         eprintln!("  Ring overflow events:  {} (events dropped during burst)", overflow);
     }
+    // Free fallback count — non-zero means the guaranteed-delivery slow path
+    // fired at least once (ring was full for a free event).
+    let free_fallback = FREE_FALLBACK_COUNT.load(Ordering::Relaxed);
+    if free_fallback > 0 {
+        eprintln!("  Free fallback events:  {} (guaranteed-delivery slow path taken)", free_fallback);
+    }
     // Pipeline stats (the living loop)
     if let Ok(pipeline) = PIPELINE.lock() {
         pipeline.summary().print();
@@ -864,6 +916,64 @@ static INIT: extern "C" fn() = {
     }
     init
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the free() guaranteed-delivery fallback (see
+    /// handle_free_event above). Simulates a drain thread that has fallen
+    /// behind by pre-filling every ring slot so push_event() reports "full"
+    /// no matter where WRITE_POS lands, then checks the fallback still lands
+    /// the free in both MEMBRANE and the condenser instead of dropping it.
+    #[test]
+    fn test_free_delivered_when_ring_full() {
+        let address = 0x7f00_dead_beef_usize;
+        let size = 4096;
+
+        // Seed both tracking structures directly — bypasses record_alloc's
+        // 1-in-100 sampling so the test doesn't depend on hitting the
+        // sampled call.
+        MEMBRANE.lock().unwrap().active.insert(address, Allocation {
+            address,
+            size,
+            alloc_time_ns: 0,
+            last_access_ns: 0,
+            access_count: 1,
+        });
+        PIPELINE.lock().unwrap().process_alloc(address, size);
+        assert_eq!(PIPELINE.lock().unwrap().summary().condenser.total_regions, 1);
+
+        // Fill every ring slot so push_event() reports "full".
+        for slot in RING.iter() {
+            slot.store(1, Ordering::Relaxed);
+        }
+
+        let fallback_before = FREE_FALLBACK_COUNT.load(Ordering::Relaxed);
+
+        handle_free_event(address);
+
+        assert_eq!(
+            FREE_FALLBACK_COUNT.load(Ordering::Relaxed),
+            fallback_before + 1,
+            "ring-full free must take the guaranteed-delivery fallback"
+        );
+        assert!(
+            !MEMBRANE.lock().unwrap().active.contains_key(&address),
+            "fallback must remove the freed address from MEMBRANE"
+        );
+        assert_eq!(
+            PIPELINE.lock().unwrap().summary().condenser.total_regions,
+            0,
+            "fallback must unregister the freed address from the condenser"
+        );
+
+        // Restore the ring so it doesn't bleed into any other preload-feature test.
+        for slot in RING.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+}
 
 } // mod preload_hooks
 
