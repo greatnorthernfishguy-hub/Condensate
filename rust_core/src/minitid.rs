@@ -226,14 +226,36 @@ fn apply_kiss(messages: &[Value], sessions: &Mutex<HashMap<String, KissSession>>
     }).collect()
 }
 
-// TEMPORARY STUBS (Task 5 scope only): Task 6 replaces extract_last_user_message
-// with the real implementation — extract the last user message's text from the
-// (possibly KISS-compressed) request body. Task 7 replaces deposit_turn with the
-// real implementation — deposit the (last_user_message, assistant_text) turn
-// pair into CC's own NeuroGraph substrate via ng_tract (Law 7: raw experience,
-// no classification here). Both are forward references needed to wire the tee
-// below; they are not this task's responsibility.
-fn extract_last_user_message(_: &[u8]) -> Option<String> { None }
+/// The genuine last user message, extracted from the request body BEFORE
+/// KISS's compression mutates it. KISS only compresses OLDER history, so
+/// the last message is always the real one -- this must be captured
+/// independent of and before apply_kiss() runs on the messages array.
+fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
+    let body: Value = serde_json::from_slice(body_bytes).ok()?;
+    let messages = body["messages"].as_array()?;
+    for msg in messages.iter().rev() {
+        if msg["role"].as_str() != Some("user") {
+            continue;
+        }
+        if let Some(s) = msg["content"].as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(blocks) = msg["content"].as_array() {
+            for b in blocks {
+                if b["type"].as_str() == Some("text") {
+                    if let Some(t) = b["text"].as_str() {
+                        return Some(t.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// Task 7 will replace this with the real implementation — deposit the
+// (last_user_message, assistant_text) turn pair into CC's own NeuroGraph
+// substrate via ng_tract (Law 7: raw experience, no classification here).
 fn deposit_turn(_: Option<String>, _: String) {}
 
 /// Reconstruct the assistant's full generated text from accumulated SSE
@@ -280,6 +302,14 @@ async fn proxy(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
+    // Extract the last user message BEFORE KISS mutation — the last message is
+    // always genuine (uncompressed) since KISS only compresses older history.
+    let last_user_message = if is_messages {
+        extract_last_user_message(&body_bytes)
+    } else {
+        None
+    };
+
     // Rewrite messages array when applicable.
     let body_bytes = if is_messages {
         match serde_json::from_slice::<Value>(&body_bytes) {
@@ -323,12 +353,6 @@ async fn proxy(
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let resp_headers = upstream_resp.headers().clone();
-
-    let last_user_message = if is_messages {
-        extract_last_user_message(&body_bytes)
-    } else {
-        None
-    };
 
     use futures_util::StreamExt;
     use tokio::sync::mpsc;
@@ -561,5 +585,31 @@ mod tests {
         let sse = b"garbage\nnot json at all\ndata: {not even valid json\n\n";
         let text = reconstruct_assistant_text(sse);
         assert_eq!(text, "");
+    }
+
+    #[test]
+    fn test_extract_last_user_message_returns_most_recent_user_text() {
+        let body = br#"{"messages":[
+            {"role":"user","content":"first"},
+            {"role":"assistant","content":"reply"},
+            {"role":"user","content":"second, the real last message"}
+        ]}"#;
+        let result = extract_last_user_message(body);
+        assert_eq!(result, Some("second, the real last message".to_string()));
+    }
+
+    #[test]
+    fn test_extract_last_user_message_handles_array_content_blocks() {
+        let body = br#"{"messages":[
+            {"role":"user","content":[{"type":"text","text":"array-form message"}]}
+        ]}"#;
+        let result = extract_last_user_message(body);
+        assert_eq!(result, Some("array-form message".to_string()));
+    }
+
+    #[test]
+    fn test_extract_last_user_message_returns_none_on_malformed_body() {
+        let body = b"not json";
+        assert_eq!(extract_last_user_message(body), None);
     }
 }
