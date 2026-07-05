@@ -253,10 +253,50 @@ fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
     None
 }
 
-// Task 7 will replace this with the real implementation — deposit the
-// (last_user_message, assistant_text) turn pair into CC's own NeuroGraph
-// substrate via ng_tract (Law 7: raw experience, no classification here).
-fn deposit_turn(_: Option<String>, _: String) {}
+/// CC_GATEWAY_TRACT_PATH (LAW 5) -- read independently here and by the
+/// Python daemon's drain_ingest_tract(); same default on both sides so
+/// they resolve to the same file even if the env var is never set.
+fn cc_gateway_tract_path() -> String {
+    std::env::var("CC_GATEWAY_TRACT_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        format!("{home}/.claude/plugins/neurograph/tracts/cc_gateway/turns.tract")
+    })
+}
+
+fn deposit_experience_entry(path: &str, source: &str, content: String) {
+    if content.trim().is_empty() {
+        return;
+    }
+    let entry = ng_tract::ExperienceEntry {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+        source: source.to_string(),
+        content_type: "text".to_string(),
+        content: content.into_bytes(),
+    };
+    let bytes = ng_tract::write::write_experience(&entry);
+    let _ = ng_tract::write::deposit_to_file(path, &bytes);
+}
+
+/// Deposit both sides of one turn as raw experience (LAW 7) -- no
+/// classification, no embedding computed here (deferred to the daemon's
+/// ng_embed boundary), no success/failure label (write_experience, never
+/// write_outcome). Two independent entries, not one combined/paired
+/// record -- the daemon's own dual-pass chains consecutive conversational
+/// deposits via a delayed synapse regardless of physical turn boundaries.
+/// Fails soft: this must never affect the proxied response to the client.
+fn deposit_turn(user_message: Option<String>, assistant_text: String) {
+    let path = cc_gateway_tract_path();
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Some(user_text) = user_message {
+        deposit_experience_entry(&path, "cc_gateway", user_text);
+    }
+    deposit_experience_entry(&path, "cc_gateway", assistant_text);
+}
 
 /// Reconstruct the assistant's full generated text from accumulated SSE
 /// bytes by concatenating every `content_block_delta` event whose
@@ -611,5 +651,32 @@ mod tests {
     fn test_extract_last_user_message_returns_none_on_malformed_body() {
         let body = b"not json";
         assert_eq!(extract_last_user_message(body), None);
+    }
+
+    #[test]
+    fn test_deposit_turn_writes_two_experience_entries() {
+        use ng_tract::read::{TractReader, ReadResult};
+        use ng_tract::TractEntry;
+
+        let tmp = std::env::temp_dir().join(format!("minitid_test_tract_{}.tract", std::process::id()));
+        std::env::set_var("CC_GATEWAY_TRACT_PATH", tmp.to_str().unwrap());
+        let _ = std::fs::remove_file(&tmp);
+
+        deposit_turn(Some("what is the numpy issue".to_string()), "it's a stray .pth file".to_string());
+
+        let data = std::fs::read(&tmp).expect("tract file should exist");
+        let mut reader = TractReader::new(&data);
+        let mut count = 0;
+        let mut contents = Vec::new();
+        while let Some(result) = reader.next_entry() {
+            if let Ok(ReadResult::Entry(TractEntry::Experience(exp))) = result {
+                count += 1;
+                contents.push(String::from_utf8_lossy(&exp.content).to_string());
+            }
+        }
+        assert_eq!(count, 2);
+        assert!(contents.iter().any(|c| c.contains("numpy issue")));
+        assert!(contents.iter().any(|c| c.contains("stray .pth file")));
+        std::fs::remove_file(&tmp).ok();
     }
 }
