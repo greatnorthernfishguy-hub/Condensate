@@ -336,12 +336,13 @@ async fn proxy(
     let mut upstream_stream = upstream_resp.bytes_stream();
     let accumulator_task = tokio::spawn(async move {
         let mut accumulated: Vec<u8> = Vec::new();
+        let mut client_connected = true;
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     accumulated.extend_from_slice(&bytes);
-                    if tx.send(Ok(bytes)).is_err() {
-                        break; // client disconnected -- stop relaying, still finish accumulating for deposit
+                    if client_connected && tx.send(Ok(bytes)).is_err() {
+                        client_connected = false; // client disconnected -- stop relaying, still finish accumulating for deposit
                     }
                 }
                 Err(e) => {
