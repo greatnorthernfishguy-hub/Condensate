@@ -47,6 +47,21 @@
 //!         to condenser (recently_freed tombstone set, FREED_RECENCY_NS=5s) closes
 //!         the secondary race (processed free → malloc reuse → re-register → scan).
 //!   How:  PipelineConfig { test_mode: false } — see condenser.rs changelog.
+//! [2026-07-05] CC — Guarantee free() delivery when the membrane ring is full
+//!   What: EVENT_FREE arm in the drain thread used try_lock() on MEMBRANE and
+//!         PIPELINE, same as the ALLOC arm. Under contention a free was silently
+//!         dropped instead of applied, reopening the tombstone gap #260/06-21
+//!         closed: condenser could still believe a freed address was live.
+//!   Why:  Frees must be guaranteed-delivery, not best-effort like allocs —
+//!         dropping one breaks the guaranteed-delivery contract documented on
+//!         handle_free_event's ring-full fallback. Switched to lock() (blocking).
+//!         That reintroduces a self-deadlock risk: this thread's own internal
+//!         malloc/free traffic (HashMap/Vec growth inside record_free/
+//!         process_free) could re-enter the hooked free() while already
+//!         holding MEMBRANE's or PIPELINE's guard.
+//!   How:  Set REENTRANT true for this thread's entire lifetime at spawn, so
+//!         its own alloc/free traffic skips instrumentation entirely and never
+//!         reaches the lock() calls it would otherwise deadlock against.
 //! -------------------
 
 use libc::{c_void, size_t};
@@ -602,6 +617,17 @@ fn start_drain_thread() {
     std::thread::Builder::new()
         .name("condensate-drain".to_string())
         .spawn(|| {
+            // This thread's own malloc/free traffic (HashMap/Vec growth inside
+            // record_alloc/record_free/process_alloc/process_free/scan) is
+            // never real application activity — it's our own bookkeeping,
+            // running while we may already hold MEMBRANE's or PIPELINE's
+            // guard. Without this, a nested free() from an internal
+            // reallocation reaches handle_free_event's ring-full fallback
+            // and calls .lock() on a mutex this same thread already holds:
+            // std::sync::Mutex isn't reentrant, so that's a permanent
+            // self-deadlock. Set once for the thread's whole life so every
+            // internal alloc/free on it skips instrumentation.
+            REENTRANT.with(|r| r.set(true));
             let mut read_pos: usize = 0;
             loop {
                 let mut drained = 0;
@@ -662,10 +688,18 @@ fn start_drain_thread() {
                             }
                         }
                         EVENT_FREE => {
-                            if let Ok(mut state) = MEMBRANE.try_lock() {
+                            // Unlike the ALLOC arm, this must not skip on contention:
+                            // a free that reaches the ring already counts as "delivered"
+                            // for the guaranteed-delivery contract in handle_free_event,
+                            // so dropping it here on a failed try_lock would silently
+                            // reopen the tombstone gap that fix closed. Block instead —
+                            // safe because lock order (MEMBRANE then PIPELINE, never both
+                            // held at once) matches every other call site, and this
+                            // thread's own traffic is excluded via REENTRANT.
+                            if let Ok(mut state) = MEMBRANE.lock() {
                                 state.record_free(address);
                             }
-                            if let Ok(mut pipeline) = PIPELINE.try_lock() {
+                            if let Ok(mut pipeline) = PIPELINE.lock() {
                                 pipeline.process_free(address);
                             }
                         }
