@@ -1,0 +1,36 @@
+[package]
+name = "ng_tract"
+version = "0.1.0"
+edition = "2024"
+description = "Binary Tract Format — Rust core for the NeuroGraph substrate data path"
+license = "AGPL-3.0"
+
+[lib]
+name = "ng_tract"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py312"], optional = true }
+numpy = { version = "0.24", optional = true }
+uuid = { version = "1", features = ["v4"] }
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+crc32fast = "1"
+libc = "0.2"
+rayon = { version = "1", optional = true }
+cblas-sys = { version = "0.1", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[features]
+default = ["python"]
+# "engine" = the heavy substrate compute (Lenia, NG-Lite core, feature extraction)
+# and its native deps. Gated so consumers that only need the BTF data path
+# (format/read/write) can depend on this crate with default-features=false and
+# pull ZERO Python and ZERO BLAS/rayon — e.g. Anima's pure-Rust River writer (#294).
+engine = ["rayon", "cblas-sys", "sha2"]
+# Python bindings require the engine (python.rs wraps Lenia/NGLiteCore).
+python = ["pyo3", "numpy", "engine"]
+
+[profile.release]
+opt-level = 3
+lto = true
