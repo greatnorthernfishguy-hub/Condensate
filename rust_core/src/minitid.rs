@@ -250,6 +250,24 @@ fn apply_kiss(messages: &[Value], sessions: &Mutex<HashMap<String, KissSession>>
 /// KISS's compression mutates it. KISS only compresses OLDER history, so
 /// the last message is always the real one -- this must be captured
 /// independent of and before apply_kiss() runs on the messages array.
+/// Harness-injected content delivered as a plain `type: "text"` block inside a
+/// synthetic user-role turn -- background Task-tool completions, system
+/// reminders, and local-command output all arrive this way, not as a
+/// `tool_result` block, so the type check alone can't tell them apart from a
+/// genuine human message. Confirmed via `laptop_export.jsonl`: ~29% of one
+/// exported substrate were raw `<task-notification>...</task-notification>`
+/// deliveries deposited verbatim as "user" experience.
+fn is_synthetic_harness_text(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<task-notification>",
+        "<system-reminder>",
+        "<local-command-stdout>",
+        "<local-command-caveat>",
+    ];
+    let trimmed = text.trim_start();
+    MARKERS.iter().any(|m| trimmed.starts_with(m))
+}
+
 fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
     let body: Value = serde_json::from_slice(body_bytes).ok()?;
     let messages = body["messages"].as_array()?;
@@ -258,13 +276,18 @@ fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
             continue;
         }
         if let Some(s) = msg["content"].as_str() {
-            return Some(s.to_string());
+            if !is_synthetic_harness_text(s) {
+                return Some(s.to_string());
+            }
+            continue;
         }
         if let Some(blocks) = msg["content"].as_array() {
             for b in blocks {
                 if b["type"].as_str() == Some("text") {
                     if let Some(t) = b["text"].as_str() {
-                        return Some(t.to_string());
+                        if !is_synthetic_harness_text(t) {
+                            return Some(t.to_string());
+                        }
                     }
                 }
             }
@@ -670,6 +693,36 @@ mod tests {
     #[test]
     fn test_extract_last_user_message_returns_none_on_malformed_body() {
         let body = b"not json";
+        assert_eq!(extract_last_user_message(body), None);
+    }
+
+    #[test]
+    fn test_extract_last_user_message_skips_task_notification_array_block() {
+        let body = br#"{"messages":[
+            {"role":"user","content":"the real question"},
+            {"role":"assistant","content":"working on it"},
+            {"role":"user","content":[{"type":"text","text":"<task-notification>\n<task-id>a123</task-id>\n<result>some subagent report</result>\n</task-notification>"}]}
+        ]}"#;
+        let result = extract_last_user_message(body);
+        assert_eq!(result, Some("the real question".to_string()));
+    }
+
+    #[test]
+    fn test_extract_last_user_message_skips_system_reminder_string_content() {
+        let body = br#"{"messages":[
+            {"role":"user","content":"the real question"},
+            {"role":"assistant","content":"working on it"},
+            {"role":"user","content":"<system-reminder>some injected reminder text</system-reminder>"}
+        ]}"#;
+        let result = extract_last_user_message(body);
+        assert_eq!(result, Some("the real question".to_string()));
+    }
+
+    #[test]
+    fn test_extract_last_user_message_returns_none_when_only_synthetic_present() {
+        let body = br#"{"messages":[
+            {"role":"user","content":[{"type":"text","text":"<local-command-stdout>ls output</local-command-stdout>"}]}
+        ]}"#;
         assert_eq!(extract_last_user_message(body), None);
     }
 
