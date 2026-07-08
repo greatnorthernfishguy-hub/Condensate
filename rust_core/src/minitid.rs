@@ -275,6 +275,24 @@ fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
         if msg["role"].as_str() != Some("user") {
             continue;
         }
+        // Mirror Claude Code's own genuine-last-user-message filter: CC marks
+        // synthetic / already-summarized turns with message-level boolean
+        // fields, not just string markers in the text. A message is skipped
+        // entirely when isMeta or isCompactSummary is explicitly `true`, or
+        // when its content contains a tool_result block -- absent, false, or
+        // non-bool values must NOT trigger a skip (field presence alone is
+        // not truthiness).
+        if msg["isMeta"].as_bool() == Some(true) {
+            continue;
+        }
+        if msg["isCompactSummary"].as_bool() == Some(true) {
+            continue;
+        }
+        if let Some(blocks) = msg["content"].as_array() {
+            if blocks.iter().any(|b| b["type"].as_str() == Some("tool_result")) {
+                continue;
+            }
+        }
         if let Some(s) = msg["content"].as_str() {
             if !is_synthetic_harness_text(s) {
                 return Some(s.to_string());
@@ -724,6 +742,48 @@ mod tests {
             {"role":"user","content":[{"type":"text","text":"<local-command-stdout>ls output</local-command-stdout>"}]}
         ]}"#;
         assert_eq!(extract_last_user_message(body), None);
+    }
+
+    #[test]
+    fn test_extract_skips_ismeta_true_message() {
+        let body = br#"{"messages":[
+            {"role":"user","content":"the real question"},
+            {"role":"assistant","content":"..."},
+            {"role":"user","isMeta":true,"content":"injected meta text"}
+        ]}"#;
+        let result = extract_last_user_message(body);
+        assert_eq!(result, Some("the real question".to_string()));
+    }
+
+    #[test]
+    fn test_extract_skips_iscompactsummary_true_message() {
+        let body = br#"{"messages":[
+            {"role":"user","content":"the real question"},
+            {"role":"assistant","content":"..."},
+            {"role":"user","isCompactSummary":true,"content":[{"type":"text","text":"prior conversation summary..."}]}
+        ]}"#;
+        let result = extract_last_user_message(body);
+        assert_eq!(result, Some("the real question".to_string()));
+    }
+
+    #[test]
+    fn test_extract_skips_tool_result_array_block() {
+        let body = br#"{"messages":[
+            {"role":"user","content":"the real question"},
+            {"role":"assistant","content":"..."},
+            {"role":"user","content":[{"type":"tool_result","content":"..."}]}
+        ]}"#;
+        let result = extract_last_user_message(body);
+        assert_eq!(result, Some("the real question".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ismeta_false_not_skipped() {
+        let body = br#"{"messages":[
+            {"role":"user","isMeta":false,"content":"still a real question"}
+        ]}"#;
+        let result = extract_last_user_message(body);
+        assert_eq!(result, Some("still a real question".to_string()));
     }
 
     #[test]
