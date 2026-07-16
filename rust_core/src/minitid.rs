@@ -8,6 +8,18 @@
 // How:  axum 0.8 HTTP server → KISS message compressor (Rust-native, no
 //       Python round-trip) → reqwest upstream → SSE stream passthrough.
 //       CC sets ANTHROPIC_BASE_URL=http://127.0.0.1:$MINITID_PORT.
+// [2026-07-16 DudeMan CC] — miniTID substrate peninsula (P1/P2), gated OFF
+// What: apply_pith_peninsula() + daemon_compress_history()/message_text()/
+//       set_compressed_text(). When MINITID_PITH_PENINSULA=1, older-than-window
+//       turns are compressed by the CC daemon's substrate-informed Pith (via
+//       daemon.sock compress_history) instead of the 60-char faux-KISS cut.
+// Why:  CC Body Architecture Primitive B — move compression from the blind
+//       proxy into the substrate-connected peninsula; the real replacement for
+//       faux KISS (retires task #49). Law-enforcer PASS (intra-module IPC).
+// How:  blocking UnixStream on spawn_blocking + tokio timeout (async runtime
+//       never stalls); JSON newline frames; splice preserves tool_use/
+//       tool_result; fail-soft → inline faux compression on any daemon failure.
+//       Default OFF (unchanged apply_kiss); socket via MINITID_PENINSULA_SOCK.
 // -------------------
 //
 // KISS behaviour (mirrors kiss_filter.py):
@@ -58,6 +70,11 @@ use reqwest::Client;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+// [2026-07-16 DudeMan CC] substrate-peninsula (P1): blocking Unix-socket client to
+// the CC daemon's compress_history handler, run on the blocking pool so the async
+// runtime is never stalled. Gated off by default (MINITID_PITH_PENINSULA).
+use std::os::unix::net::UnixStream;
+use std::io::{Read as _PenRead, Write as _PenWrite};
 use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -246,6 +263,134 @@ fn apply_kiss(messages: &[Value], sessions: &Mutex<HashMap<String, KissSession>>
     }).collect()
 }
 
+// ============================================================================
+// Substrate peninsula (P1) — substrate-informed history compression via the CC
+// daemon's Pith, the real replacement for the crude apply_kiss() above.
+// Gated off by default (MINITID_PITH_PENINSULA unset). On ANY failure the
+// caller falls back to faux KISS, so the request path never depends on the
+// daemon being up. [2026-07-16 DudeMan CC]
+// ============================================================================
+
+/// Call the CC daemon's `compress_history` handler over its Unix socket.
+/// Blocking socket I/O on the blocking pool (never stalls the async runtime),
+/// bounded by an overall timeout. Text in, text out. None on any error.
+async fn daemon_compress_history(turns: Vec<String>) -> Option<Vec<String>> {
+    let sock = std::env::var("MINITID_PENINSULA_SOCK").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/josh".into());
+        format!("{}/.claude/plugins/neurograph/daemon.sock", home)
+    });
+    let fut = tokio::task::spawn_blocking(move || -> Option<Vec<String>> {
+        let mut stream = UnixStream::connect(&sock).ok()?;
+        let t = std::time::Duration::from_millis(1500);
+        stream.set_read_timeout(Some(t)).ok()?;
+        stream.set_write_timeout(Some(t)).ok()?;
+        let req = serde_json::json!({"event": "compress_history", "data": {"turns": turns}});
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        stream.write_all(&line).ok()?;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let nread = stream.read(&mut chunk).ok()?;
+            if nread == 0 { break; }
+            buf.extend_from_slice(&chunk[..nread]);
+            if buf.last() == Some(&b'\n') { break; }
+        }
+        let resp: Value = serde_json::from_slice(&buf).ok()?;
+        let arr = resp.get("compressed")?.as_array()?;
+        Some(arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+    });
+    match tokio::time::timeout(std::time::Duration::from_millis(2000), fut).await {
+        Ok(Ok(v)) => v,
+        _ => None,
+    }
+}
+
+/// Joined text of a message's text blocks (or its string content) — what the
+/// substrate hashed the turn on, and what gets compressed.
+fn message_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks.iter()
+            .filter_map(|b| if b["type"].as_str() == Some("text") { b["text"].as_str() } else { None })
+            .collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Replace a message's text content with the compressed text, preserving
+/// tool_use/tool_result blocks verbatim (never blank — mirrors the array-content
+/// fix). Multiple text blocks collapse into one compressed block.
+fn set_compressed_text(content: &Value, compressed: &str) -> Value {
+    if compressed.is_empty() { return content.clone(); }
+    match content {
+        Value::String(_) => Value::String(compressed.to_string()),
+        Value::Array(blocks) => {
+            let mut out: Vec<Value> = Vec::new();
+            let mut text_done = false;
+            for b in blocks {
+                if b["type"].as_str() == Some("text") {
+                    if !text_done {
+                        let mut x = b.clone();
+                        x["text"] = Value::String(compressed.to_string());
+                        out.push(x);
+                        text_done = true;
+                    } // subsequent text blocks collapse away
+                } else {
+                    out.push(b.clone());
+                }
+            }
+            Value::Array(out)
+        }
+        _ => content.clone(),
+    }
+}
+
+/// Peninsula KISS: compress older-than-window turns via the daemon's substrate
+/// Pith instead of the 60-char cut. Same warmup/window gate as apply_kiss (the
+/// session is incremented exactly ONCE here). On any daemon failure or a
+/// length mismatch, falls back to the faux compression INLINE (no re-gating,
+/// no double-increment). Async because it awaits the daemon.
+async fn apply_pith_peninsula(messages: &[Value], sessions: &Mutex<HashMap<String, KissSession>>) -> Vec<Value> {
+    let n = messages.len();
+    let sid = session_id(messages);
+    let full_pass = {
+        let mut map = sessions.lock().unwrap();
+        let s = map.entry(sid).or_insert(KissSession { turn_count: 0, since_full: 0 });
+        s.turn_count += 1;
+        s.since_full += 1;
+        let full = s.turn_count <= KISS_WARMUP_TURNS || s.since_full >= KISS_FORCE_FULL_EVERY;
+        if full { s.since_full = 0; }
+        full
+    };
+    if full_pass || n <= KISS_RECENT_WINDOW {
+        return messages.to_vec();
+    }
+    let compress_before = n - KISS_RECENT_WINDOW;
+    let older: Vec<String> = messages[..compress_before].iter()
+        .map(|m| message_text(&m["content"])).collect();
+    let compressed = daemon_compress_history(older).await;
+    match compressed {
+        Some(c) if c.len() == compress_before => {
+            messages.iter().enumerate().map(|(i, msg)| {
+                if i < compress_before {
+                    let mut m = msg.clone();
+                    m["content"] = set_compressed_text(&msg["content"], &c[i]);
+                    m
+                } else { msg.clone() }
+            }).collect()
+        }
+        // Fallback: faux compression inline (do NOT call apply_kiss -> no double gate).
+        _ => messages.iter().enumerate().map(|(i, msg)| {
+            if i < compress_before {
+                let mut m = msg.clone();
+                m["content"] = compress_message_content(&msg["content"]);
+                m
+            } else { msg.clone() }
+        }).collect(),
+    }
+}
+
 /// The genuine last user message, extracted from the request body BEFORE
 /// KISS's compression mutates it. KISS only compresses OLDER history, so
 /// the last message is always the real one -- this must be captured
@@ -416,7 +561,15 @@ async fn proxy(
         match serde_json::from_slice::<Value>(&body_bytes) {
             Ok(mut body) => {
                 if let Some(arr) = body["messages"].as_array().cloned() {
-                    body["messages"] = Value::Array(apply_kiss(&arr, &state.sessions));
+                    body["messages"] = Value::Array(
+                        if std::env::var("MINITID_PITH_PENINSULA").map(|v| v == "1").unwrap_or(false) {
+                            // substrate-informed Pith via the CC daemon (P1); falls back
+                            // to faux KISS internally on any daemon failure.
+                            apply_pith_peninsula(&arr, &state.sessions).await
+                        } else {
+                            apply_kiss(&arr, &state.sessions)
+                        }
+                    );
                 }
                 serde_json::to_vec(&body)
                     .unwrap_or_else(|_| body_bytes.to_vec())
