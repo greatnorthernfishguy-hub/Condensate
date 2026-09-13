@@ -31,6 +31,14 @@
 //       Pith, splice results through that mask, and reuse it for fail-soft faux
 //       compression. The previous human turn becomes eligible when a newer
 //       genuine human instruction arrives.
+// [2026-09-13] Codex (GPT-5.6 Sol) — Bind cadence to genuine human turns
+// What: Key KISS/Pith state from Claude's request metadata, partition agent
+//       sidechains, and reuse one gate decision throughout each human turn.
+// Why:  Tool-loop requests were consuming warmup/GOP cadence and the first-
+//       prompt hash could merge sessions or change after native compaction.
+// How:  Parse metadata.user_id without logging it, track the latest genuine
+//       human marker/count, bypass native compaction requests, and fail open
+//       whenever stable request identity is unavailable.
 // -------------------
 //
 // KISS behaviour (mirrors kiss_filter.py):
@@ -40,9 +48,9 @@
 //     truncated to the first sentence (max 60 chars + "…"). Role
 //     structure is preserved, so Anthropic's alternation rule holds.
 //
-// Session identity: SHA-256 of the first 100 bytes of the first user
-// message's content string, truncated to 16 hex chars. Stable across
-// turns because the first message never changes.
+// Session identity: SHA-256 of metadata.user_id.session_id, optionally
+// partitioned by a bounded x-claude-code-agent-id. Missing or malformed
+// identity fails open without touching shared cadence state.
 //
 // env vars:
 //   MINITID_PORT      — listen port (default: 9090)
@@ -75,8 +83,8 @@
 //       default on both. See docs/superpowers/specs/2026-07-04-cc-gateway-turn-deposit-design.md.
 // -------------------
 
-use axum::{Router, extract::State, response::Response};
 use axum::body::Body;
+use axum::{extract::State, http::HeaderMap, response::Response, Router};
 use reqwest::Client;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -84,17 +92,17 @@ use std::collections::HashMap;
 // [2026-07-16 DudeMan CC] substrate-peninsula (P1): blocking Unix-socket client to
 // the CC daemon's compress_history handler, run on the blocking pool so the async
 // runtime is never stalled. Gated off by default (MINITID_PITH_PENINSULA).
-use std::os::unix::net::UnixStream;
-use std::io::{Read as _PenRead, Write as _PenWrite};
 use std::env;
+use std::io::{Read as _PenRead, Write as _PenWrite};
 use std::net::SocketAddr;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 // ── KISS constants (env-overridable in a future pass) ──────────────────────
 const DEFAULT_PORT: u16 = 9090;
 const KISS_RECENT_WINDOW: usize = 10;
-const KISS_WARMUP_TURNS: u32  = 3;
+const KISS_WARMUP_TURNS: u32 = 3;
 const KISS_FORCE_FULL_EVERY: u32 = 20;
 
 // Maximum request body buffered before forwarding (20 MB covers any realistic
@@ -118,9 +126,18 @@ const DROP_REQ_HEADERS: &[&str] = &[
 
 // ── Per-session KISS state ──────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GateDecision {
+    FullPass,
+    Compress,
+}
+
 struct KissSession {
     turn_count: u32,
     since_full: u32,
+    human_marker: [u8; 32],
+    visible_human_count: usize,
+    decision: GateDecision,
 }
 
 // ── Shared app state ────────────────────────────────────────────────────────
@@ -128,8 +145,8 @@ struct KissSession {
 struct AppState {
     // Fallback upstream when the config file is absent/unreadable.
     upstream_fallback: String,
-    client:            Client,
-    sessions:          Mutex<HashMap<String, KissSession>>,
+    client: Client,
+    sessions: Mutex<HashMap<String, KissSession>>,
 }
 
 // Read the live upstream URL from ~/.config/minitid/upstream, falling back to
@@ -147,40 +164,137 @@ fn read_upstream(fallback: &str) -> String {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Extract plain text from a message content Value, whether it is a bare
-/// string or an Anthropic block array. For arrays, returns the first text
-/// block's text. Used for session identity — NOT for forwarding.
-fn content_text(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks.iter()
-            .find_map(|b| {
-                if b["type"].as_str() == Some("text") {
-                    b["text"].as_str()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
+const MAX_SESSION_ID_BYTES: usize = 512;
+const MAX_AGENT_ID_BYTES: usize = 128;
+const CLAUDE_COMPACTION_PROMPT_PREFIX: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n- You already have all the context you need in the conversation above.\n- Tool calls will be REJECTED and will waste your only turn";
+const CLAUDE_COMPACTED_PREAMBLE: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
+
+fn digest_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Stable, opaque cadence key from Claude Code request identity. The full
+/// user_id envelope is neither retained nor logged.
+fn session_key(body: &Value, headers: &HeaderMap) -> Option<String> {
+    let encoded = body.get("metadata")?.get("user_id")?.as_str()?;
+    let metadata: Value = serde_json::from_str(encoded).ok()?;
+    let session_id = metadata.get("session_id")?.as_str()?;
+    if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_BYTES {
+        return None;
+    }
+
+    let mut key = digest_hex(session_id.as_bytes());
+    if let Some(value) = headers.get("x-claude-code-agent-id") {
+        let agent_id = value.to_str().ok()?;
+        if agent_id.is_empty() || agent_id.len() > MAX_AGENT_ID_BYTES {
+            return None;
+        }
+        key.push(':');
+        key.push_str(&digest_hex(agent_id.as_bytes()));
+    }
+    Some(key)
+}
+
+fn has_exact_prefix(text: &str, prefix: &str) -> bool {
+    text.as_bytes().get(..prefix.len()) == Some(prefix.as_bytes())
+}
+
+fn is_current_claude_compaction_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    has_exact_prefix(trimmed, CLAUDE_COMPACTION_PROMPT_PREFIX)
+        || has_exact_prefix(trimmed, CLAUDE_COMPACTED_PREAMBLE)
+}
+
+fn message_has_text_matching(msg: &Value, predicate: impl Fn(&str) -> bool) -> bool {
+    match &msg["content"] {
+        Value::String(text) => predicate(text),
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            block["type"].as_str() == Some("text")
+                && block["text"].as_str().map(&predicate).unwrap_or(false)
+        }),
+        _ => false,
     }
 }
 
-/// Stable session key: SHA-256 of the first 100 bytes of the first user
-/// message's text, rendered as 16 hex chars. Claude Code sends content as a
-/// block array, so we extract the first text block rather than assuming a
-/// string (else every session hashes to "" and shares KISS state).
-fn session_id(messages: &[Value]) -> String {
-    let first = messages.iter()
-        .find(|m| m["role"].as_str() == Some("user"))
-        .map(|m| content_text(&m["content"]))
-        .unwrap_or_default();
-    let bytes = first.as_bytes();
-    let mut h = Sha256::new();
-    h.update(&bytes[..bytes.len().min(100)]);
-    let hex = format!("{:x}", h.finalize());
-    hex[..16].to_string()
+fn is_compact_summary_message(msg: &Value) -> bool {
+    msg["isCompactSummary"].as_bool() == Some(true)
+        || message_has_text_matching(msg, is_current_claude_compaction_text)
+}
+
+fn human_turn_marker(messages: &[Value]) -> Option<([u8; 32], usize)> {
+    let mut count = 0;
+    let mut latest = None;
+    for msg in messages {
+        if is_genuine_user_message(msg) {
+            count += 1;
+            latest = Some(message_text(&msg["content"]));
+        }
+    }
+    let latest = latest?;
+    let mut digest = Sha256::new();
+    digest.update(latest.as_bytes());
+    Some((digest.finalize().into(), count))
+}
+
+fn decision_for_request(
+    session_key: String,
+    messages: &[Value],
+    sessions: &Mutex<HashMap<String, KissSession>>,
+) -> Option<GateDecision> {
+    let (human_marker, visible_human_count) = human_turn_marker(messages)?;
+    let mut map = sessions.lock().unwrap();
+    let Some(session) = map.get_mut(&session_key) else {
+        let decision = GateDecision::FullPass;
+        map.insert(
+            session_key,
+            KissSession {
+                turn_count: 1,
+                since_full: 0,
+                human_marker,
+                visible_human_count,
+                decision,
+            },
+        );
+        return Some(decision);
+    };
+
+    let advances = human_marker != session.human_marker
+        || (visible_human_count > session.visible_human_count
+            && human_marker == session.human_marker);
+    session.visible_human_count = visible_human_count;
+    if !advances {
+        return Some(session.decision);
+    }
+
+    session.human_marker = human_marker;
+    session.turn_count += 1;
+    session.since_full += 1;
+    let full =
+        session.turn_count <= KISS_WARMUP_TURNS || session.since_full >= KISS_FORCE_FULL_EVERY;
+    if full {
+        session.since_full = 0;
+    }
+    session.decision = if full {
+        GateDecision::FullPass
+    } else {
+        GateDecision::Compress
+    };
+    Some(session.decision)
+}
+
+fn gate_decision_for_body(
+    body: &Value,
+    headers: &HeaderMap,
+    sessions: &Mutex<HashMap<String, KissSession>>,
+) -> Option<GateDecision> {
+    if headers.contains_key("x-cc-compaction-request") {
+        return None;
+    }
+    let key = session_key(body, headers)?;
+    let messages = body.get("messages")?.as_array()?;
+    decision_for_request(key, messages, sessions)
 }
 
 /// Compress a single message's content to first sentence, max 60 chars + "…".
@@ -192,7 +306,8 @@ fn compress_content(s: &str) -> String {
     if trimmed.len() <= 60 {
         trimmed.to_string()
     } else {
-        let cut = sentence.char_indices()
+        let cut = sentence
+            .char_indices()
             .take(60)
             .last()
             .map(|(i, c)| i + c.len_utf8())
@@ -217,22 +332,29 @@ fn compress_message_content(content: &Value) -> Value {
     match content {
         Value::String(s) => {
             let c = compress_content(s);
-            if c.is_empty() { content.clone() } else { Value::String(c) }
+            if c.is_empty() {
+                content.clone()
+            } else {
+                Value::String(c)
+            }
         }
         Value::Array(blocks) => {
-            let nb: Vec<Value> = blocks.iter().map(|b| {
-                if b["type"].as_str() == Some("text") {
-                    if let Some(t) = b["text"].as_str() {
-                        let c = compress_content(t);
-                        if !c.is_empty() {
-                            let mut x = b.clone();
-                            x["text"] = Value::String(c);
-                            return x;
+            let nb: Vec<Value> = blocks
+                .iter()
+                .map(|b| {
+                    if b["type"].as_str() == Some("text") {
+                        if let Some(t) = b["text"].as_str() {
+                            let c = compress_content(t);
+                            if !c.is_empty() {
+                                let mut x = b.clone();
+                                x["text"] = Value::String(c);
+                                return x;
+                            }
                         }
                     }
-                }
-                b.clone()
-            }).collect();
+                    b.clone()
+                })
+                .collect();
             Value::Array(nb)
         }
         // null / number / bool: leave untouched (never produced by the API).
@@ -247,7 +369,7 @@ fn compress_message_content(content: &Value) -> Value {
 fn compression_indices(messages: &[Value], compress_before: usize) -> Vec<usize> {
     let protected = last_genuine_user_message_index(messages);
     (0..compress_before)
-        .filter(|i| Some(*i) != protected)
+        .filter(|i| Some(*i) != protected && !is_compact_summary_message(&messages[*i]))
         .collect()
 }
 
@@ -283,22 +405,9 @@ fn apply_pith_at_indices(
 /// Apply KISS to a messages array.  Returns the original slice if this turn
 /// qualifies as a full pass (warmup / GOP boundary), otherwise returns a new
 /// Vec with old-message content compressed.
-fn apply_kiss(messages: &[Value], sessions: &Mutex<HashMap<String, KissSession>>) -> Vec<Value> {
+fn apply_kiss(messages: &[Value], decision: GateDecision) -> Vec<Value> {
     let n = messages.len();
-    let sid = session_id(messages);
-
-    let full_pass = {
-        let mut map = sessions.lock().unwrap();
-        let s = map.entry(sid).or_insert(KissSession { turn_count: 0, since_full: 0 });
-        s.turn_count  += 1;
-        s.since_full  += 1;
-        let full = s.turn_count <= KISS_WARMUP_TURNS
-                || s.since_full  >= KISS_FORCE_FULL_EVERY;
-        if full { s.since_full = 0; }
-        full
-    };
-
-    if full_pass || n <= KISS_RECENT_WINDOW {
+    if decision == GateDecision::FullPass || n <= KISS_RECENT_WINDOW {
         return messages.to_vec();
     }
 
@@ -336,13 +445,21 @@ async fn daemon_compress_history(turns: Vec<String>) -> Option<Vec<String>> {
         let mut chunk = [0u8; 8192];
         loop {
             let nread = stream.read(&mut chunk).ok()?;
-            if nread == 0 { break; }
+            if nread == 0 {
+                break;
+            }
             buf.extend_from_slice(&chunk[..nread]);
-            if buf.last() == Some(&b'\n') { break; }
+            if buf.last() == Some(&b'\n') {
+                break;
+            }
         }
         let resp: Value = serde_json::from_slice(&buf).ok()?;
         let arr = resp.get("compressed")?.as_array()?;
-        Some(arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+        Some(
+            arr.iter()
+                .map(|v| v.as_str().unwrap_or("").to_string())
+                .collect(),
+        )
     });
     match tokio::time::timeout(std::time::Duration::from_millis(2000), fut).await {
         Ok(Ok(v)) => v,
@@ -355,9 +472,17 @@ async fn daemon_compress_history(turns: Vec<String>) -> Option<Vec<String>> {
 fn message_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks.iter()
-            .filter_map(|b| if b["type"].as_str() == Some("text") { b["text"].as_str() } else { None })
-            .collect::<Vec<_>>().join("\n"),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| {
+                if b["type"].as_str() == Some("text") {
+                    b["text"].as_str()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => String::new(),
     }
 }
@@ -366,7 +491,9 @@ fn message_text(content: &Value) -> String {
 /// tool_use/tool_result blocks verbatim (never blank — mirrors the array-content
 /// fix). Multiple text blocks collapse into one compressed block.
 fn set_compressed_text(content: &Value, compressed: &str) -> Value {
-    if compressed.is_empty() { return content.clone(); }
+    if compressed.is_empty() {
+        return content.clone();
+    }
     match content {
         Value::String(_) => Value::String(compressed.to_string()),
         Value::Array(blocks) => {
@@ -391,23 +518,12 @@ fn set_compressed_text(content: &Value, compressed: &str) -> Value {
 }
 
 /// Peninsula KISS: compress older-than-window turns via the daemon's substrate
-/// Pith instead of the 60-char cut. Same warmup/window gate as apply_kiss (the
-/// session is incremented exactly ONCE here). On any daemon failure or a
-/// length mismatch, falls back to the faux compression INLINE (no re-gating,
-/// no double-increment). Async because it awaits the daemon.
-async fn apply_pith_peninsula(messages: &[Value], sessions: &Mutex<HashMap<String, KissSession>>) -> Vec<Value> {
+/// Pith instead of the 60-char cut. The caller supplies the same human-turn
+/// decision used by faux KISS. On any daemon failure or a length mismatch,
+/// this falls back to faux compression inline without re-gating.
+async fn apply_pith_peninsula(messages: &[Value], decision: GateDecision) -> Vec<Value> {
     let n = messages.len();
-    let sid = session_id(messages);
-    let full_pass = {
-        let mut map = sessions.lock().unwrap();
-        let s = map.entry(sid).or_insert(KissSession { turn_count: 0, since_full: 0 });
-        s.turn_count += 1;
-        s.since_full += 1;
-        let full = s.turn_count <= KISS_WARMUP_TURNS || s.since_full >= KISS_FORCE_FULL_EVERY;
-        if full { s.since_full = 0; }
-        full
-    };
-    if full_pass || n <= KISS_RECENT_WINDOW {
+    if decision == GateDecision::FullPass || n <= KISS_RECENT_WINDOW {
         return messages.to_vec();
     }
     let compress_before = n - KISS_RECENT_WINDOW;
@@ -415,8 +531,10 @@ async fn apply_pith_peninsula(messages: &[Value], sessions: &Mutex<HashMap<Strin
     if indices.is_empty() {
         return messages.to_vec();
     }
-    let older: Vec<String> = indices.iter()
-        .map(|&i| message_text(&messages[i]["content"])).collect();
+    let older: Vec<String> = indices
+        .iter()
+        .map(|&i| message_text(&messages[i]["content"]))
+        .collect();
     let compressed = daemon_compress_history(older).await;
     match compressed {
         Some(c) => apply_pith_at_indices(messages, &indices, &c)
@@ -454,20 +572,27 @@ fn is_synthetic_harness_text(text: &str) -> bool {
 fn is_genuine_user_message(msg: &Value) -> bool {
     if msg["role"].as_str() != Some("user")
         || msg["isMeta"].as_bool() == Some(true)
-        || msg["isCompactSummary"].as_bool() == Some(true)
+        || is_compact_summary_message(msg)
     {
         return false;
     }
     match &msg["content"] {
         Value::String(s) => !is_synthetic_harness_text(s),
         Value::Array(blocks) => {
-            if blocks.iter().any(|b| b["type"].as_str() == Some("tool_result")) {
+            if blocks
+                .iter()
+                .any(|b| b["type"].as_str() == Some("tool_result"))
+            {
                 return false;
             }
             blocks.iter().any(|b| {
                 b["type"].as_str() == Some("text")
-                    && b["text"].as_str()
-                        .map(|text| !is_synthetic_harness_text(text))
+                    && b["text"]
+                        .as_str()
+                        .map(|text| {
+                            !is_synthetic_harness_text(text)
+                                && !is_current_claude_compaction_text(text)
+                        })
                         .unwrap_or(false)
             })
         }
@@ -483,7 +608,9 @@ fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
     let body: Value = serde_json::from_slice(body_bytes).ok()?;
     let messages = body["messages"].as_array()?;
     for msg in messages.iter().rev() {
-        if !is_genuine_user_message(msg) { continue; }
+        if !is_genuine_user_message(msg) {
+            continue;
+        }
         if let Some(s) = msg["content"].as_str() {
             return Some(s.to_string());
         }
@@ -556,8 +683,12 @@ fn reconstruct_assistant_text(sse_bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(sse_bytes);
     let mut out = String::new();
     for line in text.lines() {
-        let Some(json_str) = line.strip_prefix("data: ") else { continue };
-        let Ok(value) = serde_json::from_str::<Value>(json_str) else { continue };
+        let Some(json_str) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(json_str) else {
+            continue;
+        };
         if value["type"].as_str() != Some("content_block_delta") {
             continue;
         }
@@ -579,12 +710,11 @@ async fn proxy(
 ) -> Result<Response<Body>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
 
-    let method  = req.method().clone();
-    let uri     = req.uri().clone();
+    let method = req.method().clone();
+    let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    let is_messages = method == axum::http::Method::POST
-        && uri.path() == "/v1/messages";
+    let is_messages = method == axum::http::Method::POST && uri.path() == "/v1/messages";
 
     // Buffer the request body (needed for KISS rewrite; also needed to forward).
     let body_bytes = axum::body::to_bytes(req.into_body(), MAX_BODY)
@@ -599,27 +729,34 @@ async fn proxy(
         None
     };
 
-    // Rewrite messages array when applicable.
+    // Claude's native summary request must reach the provider byte-for-byte and
+    // cannot consume a human-turn gate decision.
+    // Rewrite messages only when Claude supplied stable request identity and a
+    // genuine human marker. Every other case fails open without shared state.
     let body_bytes = if is_messages {
-        match serde_json::from_slice::<Value>(&body_bytes) {
-            Ok(mut body) => {
-                if let Some(arr) = body["messages"].as_array().cloned() {
-                    body["messages"] = Value::Array(
-                        if std::env::var("MINITID_PITH_PENINSULA").map(|v| v == "1").unwrap_or(false) {
-                            // substrate-informed Pith via the CC daemon (P1); falls back
-                            // to faux KISS internally on any daemon failure.
-                            apply_pith_peninsula(&arr, &state.sessions).await
-                        } else {
-                            apply_kiss(&arr, &state.sessions)
-                        }
-                    );
-                }
-                serde_json::to_vec(&body)
-                    .unwrap_or_else(|_| body_bytes.to_vec())
-                    .into()
-            }
-            Err(_) => body_bytes,
-        }
+        let rewritten = 'rewrite: {
+            let Ok(mut body) = serde_json::from_slice::<Value>(&body_bytes) else {
+                break 'rewrite None;
+            };
+            let Some(arr) = body["messages"].as_array().cloned() else {
+                break 'rewrite None;
+            };
+            let Some(decision) = gate_decision_for_body(&body, &headers, &state.sessions) else {
+                break 'rewrite None;
+            };
+            body["messages"] = Value::Array(
+                if std::env::var("MINITID_PITH_PENINSULA")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    apply_pith_peninsula(&arr, decision).await
+                } else {
+                    apply_kiss(&arr, decision)
+                },
+            );
+            break 'rewrite serde_json::to_vec(&body).ok();
+        };
+        rewritten.map(Into::into).unwrap_or(body_bytes)
     } else {
         body_bytes
     };
@@ -627,7 +764,8 @@ async fn proxy(
     // Build upstream URL — read config file live so switching providers
     // takes effect immediately without restarting the service.
     let upstream = read_upstream(&state.upstream_fallback);
-    let path_and_query = uri.path_and_query()
+    let path_and_query = uri
+        .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(uri.path());
     let upstream_url = format!("{}{}", upstream, path_and_query);
@@ -643,7 +781,9 @@ async fn proxy(
     }
     rb = rb.body(body_bytes.to_vec());
 
-    let upstream_resp = rb.send().await
+    let upstream_resp = rb
+        .send()
+        .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
     // Map status and headers, stream body back.
@@ -667,7 +807,10 @@ async fn proxy(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+                    let _ = tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    )));
                     break;
                 }
             }
@@ -698,21 +841,20 @@ async fn proxy(
 #[tokio::main]
 async fn main() {
     let port: u16 = env::var("MINITID_PORT")
-        .ok().and_then(|v| v.parse().ok())
+        .ok()
+        .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let upstream = env::var("MINITID_UPSTREAM")
-        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let upstream =
+        env::var("MINITID_UPSTREAM").unwrap_or_else(|_| "https://api.anthropic.com".to_string());
 
     let state = Arc::new(AppState {
-        client:            Client::builder().build().expect("reqwest client"),
-        sessions:          Mutex::new(HashMap::new()),
+        client: Client::builder().build().expect("reqwest client"),
+        sessions: Mutex::new(HashMap::new()),
         upstream_fallback: upstream.clone(),
     });
 
-    let app = Router::new()
-        .fallback(proxy)
-        .with_state(state);
+    let app = Router::new().fallback(proxy).with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     eprintln!("miniTID  {}  →  {}", addr, upstream);
@@ -736,15 +878,43 @@ mod tests {
 
     const LONG: &str = "This is a deliberately long earlier message that exceeds the sixty character KISS threshold and should be compressed.";
 
-    // Call apply_kiss enough times to clear warmup (3 turns) so the 4th turn
-    // actually compresses. Same messages → same session id → same counter.
-    fn warm_and_apply(messages: &[Value]) -> Vec<Value> {
-        let sessions = Mutex::new(HashMap::new());
-        let mut out = messages.to_vec();
-        for _ in 0..(KISS_WARMUP_TURNS + 1) {
-            out = apply_kiss(messages, &sessions);
+    fn compress_with_faux(messages: &[Value]) -> Vec<Value> {
+        apply_kiss(messages, GateDecision::Compress)
+    }
+
+    fn headers(agent_id: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(agent_id) = agent_id {
+            headers.insert(
+                "x-claude-code-agent-id",
+                agent_id.parse().expect("valid agent header"),
+            );
         }
-        out
+        headers
+    }
+
+    fn body(session_id: &str, messages: Vec<Value>) -> Value {
+        json!({
+            "metadata": {
+                "user_id": serde_json::to_string(&json!({
+                    "device_id": "device",
+                    "account_uuid": "account",
+                    "session_id": session_id
+                })).unwrap()
+            },
+            "messages": messages
+        })
+    }
+
+    fn conversation(human_texts: &[&str]) -> Vec<Value> {
+        let mut messages = Vec::new();
+        for (index, text) in human_texts.iter().enumerate() {
+            if index > 0 {
+                messages.push(json!({"role": "assistant", "content": "reply"}));
+            }
+            messages.push(json!({"role": "user", "content": text}));
+        }
+        messages
     }
 
     // 12 messages: indices 0,1 fall in the compress range (12 - 10), the rest
@@ -818,7 +988,7 @@ mod tests {
         // index 0 fell below n-10 and was compressed during the same user turn.
         let original = current_turn_with_tool_pairs(5, false);
         assert_eq!(original.len(), 11);
-        let out = warm_and_apply(&original);
+        let out = compress_with_faux(&original);
         assert_eq!(out[0], original[0]);
         assert!(out[0]["content"].as_str().unwrap().contains("PLAN.md"));
     }
@@ -849,7 +1019,10 @@ mod tests {
         let compress_before = original.len() - KISS_RECENT_WINDOW;
         let indices = compression_indices(&original, compress_before);
         assert_eq!(indices, vec![1, 2]);
-        let replacements = vec!["assistant keyframe".to_string(), "tool-result text".to_string()];
+        let replacements = vec![
+            "assistant keyframe".to_string(),
+            "tool-result text".to_string(),
+        ];
         let out = apply_pith_at_indices(&original, &indices, &replacements).unwrap();
         assert_eq!(out[0], original[0]);
         assert_eq!(message_text(&out[1]["content"]), "assistant keyframe");
@@ -918,7 +1091,7 @@ mod tests {
     #[test]
     fn text_blocks_compressed_tool_blocks_preserved() {
         let original = sample_messages();
-        let out = warm_and_apply(&original);
+        let out = compress_with_faux(&original);
 
         // Index 0: text block compressed, tool_result untouched.
         let blocks0 = out[0]["content"].as_array().expect("array content");
@@ -926,35 +1099,48 @@ mod tests {
         let t0 = blocks0[0]["text"].as_str().unwrap();
         assert!(!t0.is_empty(), "text block must never be blanked");
         assert!(t0.len() < LONG.len(), "text block should be compressed");
-        assert_eq!(blocks0[1], original[0]["content"][1], "tool_result block must survive verbatim");
+        assert_eq!(
+            blocks0[1], original[0]["content"][1],
+            "tool_result block must survive verbatim"
+        );
 
         // Index 1: text block compressed, tool_use untouched (input intact).
         let blocks1 = out[1]["content"].as_array().unwrap();
-        assert_eq!(blocks1[1], original[1]["content"][1], "tool_use block must survive verbatim");
+        assert_eq!(
+            blocks1[1], original[1]["content"][1],
+            "tool_use block must survive verbatim"
+        );
         assert_eq!(blocks1[1]["input"]["command"], "ls -la");
     }
 
     #[test]
     fn recent_window_untouched() {
         let original = sample_messages();
-        let out = warm_and_apply(&original);
+        let out = compress_with_faux(&original);
         // Indices 2..12 are the recent window — byte-identical.
         for i in 2..original.len() {
-            assert_eq!(out[i], original[i], "recent message {} must be untouched", i);
+            assert_eq!(
+                out[i], original[i],
+                "recent message {} must be untouched",
+                i
+            );
         }
     }
 
     #[test]
     fn no_message_is_blanked() {
-        let out = warm_and_apply(&sample_messages());
+        let out = compress_with_faux(&sample_messages());
         for (i, m) in out.iter().enumerate() {
             match &m["content"] {
                 Value::String(s) => assert!(!s.is_empty(), "msg {} string blanked", i),
                 Value::Array(blocks) => {
                     for b in blocks {
                         if b["type"].as_str() == Some("text") {
-                            assert!(!b["text"].as_str().unwrap_or("").is_empty(),
-                                "msg {} text block blanked", i);
+                            assert!(
+                                !b["text"].as_str().unwrap_or("").is_empty(),
+                                "msg {} text block blanked",
+                                i
+                            );
                         }
                     }
                 }
@@ -968,7 +1154,10 @@ mod tests {
         // A text block that would compress to "" must be left as-is, not blanked.
         let content = json!([{"type": "text", "text": "   "}]);
         let out = compress_message_content(&content);
-        assert_eq!(out, content, "whitespace block must be preserved, not blanked");
+        assert_eq!(
+            out, content,
+            "whitespace block must be preserved, not blanked"
+        );
     }
 
     #[test]
@@ -982,23 +1171,272 @@ mod tests {
     }
 
     #[test]
-    fn session_id_handles_array_content() {
-        let a = vec![json!({"role": "user", "content": [{"type": "text", "text": "hello world alpha"}]})];
-        let b = vec![json!({"role": "user", "content": [{"type": "text", "text": "different beta text"}]})];
-        let id_a = session_id(&a);
-        let id_b = session_id(&b);
-        assert_eq!(id_a.len(), 16);
-        assert_ne!(id_a, id_b, "distinct first messages must yield distinct session ids");
-        assert_eq!(id_a, session_id(&a), "session id must be stable");
+    fn metadata_identity_survives_first_message_replacement() {
+        let a = body("session-alpha", conversation(&["original first prompt"]));
+        let b = body(
+            "session-alpha",
+            conversation(&["replacement after compaction"]),
+        );
+        assert_eq!(
+            session_key(&a, &headers(None)),
+            session_key(&b, &headers(None))
+        );
+    }
+
+    #[test]
+    fn sessions_with_the_same_first_prompt_are_isolated() {
+        let messages = conversation(&["shared opening prompt"]);
+        let a = body("session-alpha", messages.clone());
+        let b = body("session-beta", messages);
+        let sessions = Mutex::new(HashMap::new());
+        assert_eq!(
+            gate_decision_for_body(&a, &headers(None), &sessions),
+            Some(GateDecision::FullPass)
+        );
+        assert_eq!(
+            gate_decision_for_body(&b, &headers(None), &sessions),
+            Some(GateDecision::FullPass)
+        );
+        assert_eq!(sessions.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn missing_or_malformed_metadata_fails_open_without_state() {
+        let messages = conversation(&["human prompt"]);
+        let cases = [
+            json!({"messages": messages}),
+            json!({"metadata": {"user_id": "not-json"}, "messages": conversation(&["human prompt"])}),
+            json!({"metadata": {"user_id": "{}"}, "messages": conversation(&["human prompt"])}),
+        ];
+        let sessions = Mutex::new(HashMap::new());
+        for body in &cases {
+            assert_eq!(
+                gate_decision_for_body(body, &headers(None), &sessions),
+                None
+            );
+        }
+        assert!(sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_header_partitions_concurrent_sidechains() {
+        let request = body("parent-session", conversation(&["delegated prompt"]));
+        let parent = session_key(&request, &headers(None)).unwrap();
+        let agent_a = session_key(&request, &headers(Some("agent-a"))).unwrap();
+        let agent_b = session_key(&request, &headers(Some("agent-b"))).unwrap();
+        assert_ne!(parent, agent_a);
+        assert_ne!(agent_a, agent_b);
+
+        let oversized = "a".repeat(MAX_AGENT_ID_BYTES + 1);
+        assert_eq!(session_key(&request, &headers(Some(&oversized))), None);
+    }
+
+    #[test]
+    fn tool_loop_reuses_one_human_turn_decision() {
+        let sessions = Mutex::new(HashMap::new());
+        let mut messages = conversation(&["one human turn"]);
+        for i in 0..8 {
+            let request = body("tool-loop-session", messages.clone());
+            assert_eq!(
+                gate_decision_for_body(&request, &headers(None), &sessions),
+                Some(GateDecision::FullPass)
+            );
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": format!("tool-{i}"), "name": "Read", "input": {}}]
+            }));
+            messages.push(json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": format!("tool-{i}"), "content": "result"}]
+            }));
+        }
+        let map = sessions.lock().unwrap();
+        let state = map.values().next().unwrap();
+        assert_eq!(state.turn_count, 1);
+    }
+
+    #[test]
+    fn changed_and_repeated_identical_human_turns_advance() {
+        let sessions = Mutex::new(HashMap::new());
+        let first = body("cadence-session", conversation(&["same prompt"]));
+        let repeated = body(
+            "cadence-session",
+            conversation(&["same prompt", "same prompt"]),
+        );
+        let changed = body(
+            "cadence-session",
+            conversation(&["same prompt", "same prompt", "different prompt"]),
+        );
+        assert_eq!(
+            gate_decision_for_body(&first, &headers(None), &sessions),
+            Some(GateDecision::FullPass)
+        );
+        assert_eq!(
+            gate_decision_for_body(&repeated, &headers(None), &sessions),
+            Some(GateDecision::FullPass)
+        );
+        assert_eq!(
+            gate_decision_for_body(&changed, &headers(None), &sessions),
+            Some(GateDecision::FullPass)
+        );
+        assert_eq!(
+            sessions.lock().unwrap().values().next().unwrap().turn_count,
+            3
+        );
+    }
+
+    #[test]
+    fn compaction_count_shrink_does_not_advance() {
+        let sessions = Mutex::new(HashMap::new());
+        for turns in [
+            vec!["first"],
+            vec!["first", "second"],
+            vec!["first", "second", "third"],
+        ] {
+            let request = body("shrink-session", conversation(&turns));
+            gate_decision_for_body(&request, &headers(None), &sessions).unwrap();
+        }
+
+        let shrunk = body("shrink-session", conversation(&["third"]));
+        assert_eq!(
+            gate_decision_for_body(&shrunk, &headers(None), &sessions),
+            Some(GateDecision::FullPass)
+        );
+        assert_eq!(
+            sessions.lock().unwrap().values().next().unwrap().turn_count,
+            3
+        );
+
+        let next = body("shrink-session", conversation(&["third", "fourth"]));
+        assert_eq!(
+            gate_decision_for_body(&next, &headers(None), &sessions),
+            Some(GateDecision::Compress)
+        );
+    }
+
+    #[test]
+    fn first_three_human_turns_are_full_and_fourth_compresses() {
+        let sessions = Mutex::new(HashMap::new());
+        let expected = [
+            GateDecision::FullPass,
+            GateDecision::FullPass,
+            GateDecision::FullPass,
+            GateDecision::Compress,
+        ];
+        let all = ["one", "two", "three", "four"];
+        for (index, expected) in expected.iter().enumerate() {
+            let request = body("warmup-session", conversation(&all[..=index]));
+            assert_eq!(
+                gate_decision_for_body(&request, &headers(None), &sessions),
+                Some(*expected)
+            );
+        }
+    }
+
+    #[test]
+    fn force_full_cadence_counts_human_turns() {
+        let sessions = Mutex::new(HashMap::new());
+        let human_turns: Vec<String> = (1..=KISS_WARMUP_TURNS + KISS_FORCE_FULL_EVERY)
+            .map(|n| format!("turn {n}"))
+            .collect();
+        for index in 0..human_turns.len() {
+            let texts: Vec<&str> = human_turns[..=index].iter().map(String::as_str).collect();
+            let request = body("force-full-session", conversation(&texts));
+            let decision = gate_decision_for_body(&request, &headers(None), &sessions).unwrap();
+            if index + 1 == human_turns.len() {
+                assert_eq!(decision, GateDecision::FullPass);
+            } else if index >= KISS_WARMUP_TURNS as usize {
+                assert_eq!(decision, GateDecision::Compress);
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_header_bypasses_without_advancing() {
+        let sessions = Mutex::new(HashMap::new());
+        let request = body("compaction-session", conversation(&["human prompt"]));
+        let mut request_headers = headers(None);
+        request_headers.insert("x-cc-compaction-request", "1".parse().unwrap());
+        assert_eq!(
+            gate_decision_for_body(&request, &request_headers, &sessions),
+            None
+        );
+        assert!(sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compact_summaries_are_excluded_from_sparse_indices() {
+        let mut messages = vec![
+            json!({"role": "user", "isCompactSummary": true, "content": LONG}),
+            json!({"role": "assistant", "content": LONG}),
+        ];
+        for i in 0..10 {
+            messages.push(json!({"role": "assistant", "content": format!("recent {i}")}));
+        }
+        assert_eq!(compression_indices(&messages, 2), vec![1]);
+
+        messages[0] = json!({
+            "role": "user",
+            "content": format!("{CLAUDE_COMPACTED_PREAMBLE}Summary: retained context")
+        });
+        assert_eq!(compression_indices(&messages, 2), vec![1]);
+    }
+
+    #[test]
+    fn current_claude_wire_preamble_is_not_genuine_human_text() {
+        let summary = json!({
+            "role": "user",
+            "content": format!("{CLAUDE_COMPACTED_PREAMBLE}Summary: retained context")
+        });
+        let prompt = json!({
+            "role": "user",
+            "content": format!("{CLAUDE_COMPACTION_PROMPT_PREFIX} — you will fail the task.")
+        });
+        assert!(!is_genuine_user_message(&summary));
+        assert!(!is_genuine_user_message(&prompt));
+        assert_eq!(human_turn_marker(&[summary, prompt]), None);
+    }
+
+    #[test]
+    fn faux_and_pith_use_the_same_sparse_indices() {
+        let mut messages = current_turn_with_tool_pairs(6, true);
+        messages.insert(
+            0,
+            json!({"role": "user", "isCompactSummary": true, "content": LONG}),
+        );
+        let compress_before = messages.len() - KISS_RECENT_WINDOW;
+        let indices = compression_indices(&messages, compress_before);
+        let faux = apply_faux_at_indices(&messages, &indices);
+        let replacements: Vec<String> = indices
+            .iter()
+            .map(|index| format!("pith replacement {index}"))
+            .collect();
+        let pith = apply_pith_at_indices(&messages, &indices, &replacements).unwrap();
+
+        for index in 0..messages.len() {
+            if indices.contains(&index) {
+                if message_text(&messages[index]["content"]).is_empty() {
+                    assert_eq!(faux[index], messages[index]);
+                    assert_eq!(pith[index], messages[index]);
+                } else {
+                    assert_ne!(faux[index], messages[index]);
+                    assert_ne!(pith[index], messages[index]);
+                }
+            } else {
+                assert_eq!(faux[index], messages[index]);
+                assert_eq!(pith[index], messages[index]);
+            }
+        }
     }
 
     #[test]
     fn warmup_passes_through_untouched() {
         let original = sample_messages();
-        let sessions = Mutex::new(HashMap::new());
-        // First warmup turn must be a full pass — no compression.
-        let out = apply_kiss(&original, &sessions);
-        assert_eq!(out[0], original[0], "warmup turn must pass through verbatim");
+        let out = apply_kiss(&original, GateDecision::FullPass);
+        assert_eq!(
+            out[0], original[0],
+            "warmup turn must pass through verbatim"
+        );
     }
 
     #[tokio::test]
@@ -1124,14 +1562,18 @@ mod tests {
 
     #[test]
     fn test_deposit_turn_writes_two_experience_entries() {
-        use ng_tract::read::{TractReader, ReadResult};
+        use ng_tract::read::{ReadResult, TractReader};
         use ng_tract::TractEntry;
 
-        let tmp = std::env::temp_dir().join(format!("minitid_test_tract_{}.tract", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("minitid_test_tract_{}.tract", std::process::id()));
         std::env::set_var("CC_GATEWAY_TRACT_PATH", tmp.to_str().unwrap());
         let _ = std::fs::remove_file(&tmp);
 
-        deposit_turn(Some("what is the numpy issue".to_string()), "it's a stray .pth file".to_string());
+        deposit_turn(
+            Some("what is the numpy issue".to_string()),
+            "it's a stray .pth file".to_string(),
+        );
 
         let data = std::fs::read(&tmp).expect("tract file should exist");
         let mut reader = TractReader::new(&data);
