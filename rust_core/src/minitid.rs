@@ -39,6 +39,16 @@
 // How:  Parse metadata.user_id without logging it, track the latest genuine
 //       human marker/count, bypass native compaction requests, and fail open
 //       whenever stable request identity is unavailable.
+// [2026-09-13] Codex (GPT-5.6 Sol) — Harden cadence identity and state bounds
+// What: Detect Claude's native compaction prompt without relying on a header,
+//       derive turn identity from genuine human blocks only, and cap session
+//       cadence state with deterministic least-recently-used eviction.
+// Why:  The localhost miniTID route does not retain Claude's native compaction
+//       header, injected hook blocks changed the turn hash, and abandoned
+//       sessions otherwise accumulated for the lifetime of the daemon.
+// How:  Bypass on the latest user-role compaction prompt before state access,
+//       share one filtered human-text extractor with deposits and cadence, and
+//       keep an env-bounded access-order store that never evicts the active key.
 // -------------------
 //
 // KISS behaviour (mirrors kiss_filter.py):
@@ -55,6 +65,7 @@
 // env vars:
 //   MINITID_PORT      — listen port (default: 9090)
 //   MINITID_UPSTREAM  — upstream base URL (default: https://api.anthropic.com)
+//   MINITID_SESSION_CAPACITY — retained cadence sessions (default: 4096)
 //
 // Build:
 //   cargo build --release --features minitid
@@ -104,6 +115,9 @@ const DEFAULT_PORT: u16 = 9090;
 const KISS_RECENT_WINDOW: usize = 10;
 const KISS_WARMUP_TURNS: u32 = 3;
 const KISS_FORCE_FULL_EVERY: u32 = 20;
+const DEFAULT_SESSION_CAPACITY: usize = 4_096;
+const MIN_SESSION_CAPACITY: usize = 16;
+const MAX_SESSION_CAPACITY: usize = 65_536;
 
 // Maximum request body buffered before forwarding (20 MB covers any realistic
 // CC conversation; Anthropic will reject oversized bodies before we do).
@@ -132,12 +146,53 @@ enum GateDecision {
     Compress,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct KissSession {
     turn_count: u32,
     since_full: u32,
     human_marker: [u8; 32],
     visible_human_count: usize,
     decision: GateDecision,
+    last_access: u64,
+}
+
+struct SessionStore {
+    entries: HashMap<String, KissSession>,
+    access_clock: u64,
+    capacity: usize,
+}
+
+impl SessionStore {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            access_clock: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn next_access(&mut self) -> u64 {
+        self.access_clock = self.access_clock.saturating_add(1);
+        self.access_clock
+    }
+
+    fn evict_lru_for_new_session(&mut self) {
+        if self.entries.len() < self.capacity {
+            return;
+        }
+        let victim = self
+            .entries
+            .iter()
+            .min_by(|(key_a, a), (key_b, b)| {
+                a.last_access
+                    .cmp(&b.last_access)
+                    .then_with(|| key_a.cmp(key_b))
+            })
+            .map(|(key, _)| key.clone());
+        if let Some(key) = victim {
+            self.entries.remove(&key);
+        }
+    }
 }
 
 // ── Shared app state ────────────────────────────────────────────────────────
@@ -146,7 +201,7 @@ struct AppState {
     // Fallback upstream when the config file is absent/unreadable.
     upstream_fallback: String,
     client: Client,
-    sessions: Mutex<HashMap<String, KissSession>>,
+    sessions: Mutex<SessionStore>,
 }
 
 // Read the live upstream URL from ~/.config/minitid/upstream, falling back to
@@ -160,6 +215,17 @@ fn read_upstream(fallback: &str) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fallback.to_string())
+}
+
+fn session_capacity() -> usize {
+    configured_session_capacity(env::var("MINITID_SESSION_CAPACITY").ok().as_deref())
+}
+
+fn configured_session_capacity(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|capacity| capacity.clamp(MIN_SESSION_CAPACITY, MAX_SESSION_CAPACITY))
+        .unwrap_or(DEFAULT_SESSION_CAPACITY)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -201,10 +267,14 @@ fn has_exact_prefix(text: &str, prefix: &str) -> bool {
     text.as_bytes().get(..prefix.len()) == Some(prefix.as_bytes())
 }
 
-fn is_current_claude_compaction_text(text: &str) -> bool {
+fn is_claude_compaction_request_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     has_exact_prefix(trimmed, CLAUDE_COMPACTION_PROMPT_PREFIX)
-        || has_exact_prefix(trimmed, CLAUDE_COMPACTED_PREAMBLE)
+}
+
+fn is_claude_compacted_summary_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    has_exact_prefix(trimmed, CLAUDE_COMPACTED_PREAMBLE)
 }
 
 fn message_has_text_matching(msg: &Value, predicate: impl Fn(&str) -> bool) -> bool {
@@ -220,16 +290,24 @@ fn message_has_text_matching(msg: &Value, predicate: impl Fn(&str) -> bool) -> b
 
 fn is_compact_summary_message(msg: &Value) -> bool {
     msg["isCompactSummary"].as_bool() == Some(true)
-        || message_has_text_matching(msg, is_current_claude_compaction_text)
+        || message_has_text_matching(msg, is_claude_compacted_summary_text)
+}
+
+fn latest_user_role_is_compaction_request(messages: &[Value]) -> bool {
+    messages
+        .iter()
+        .rfind(|msg| msg["role"].as_str() == Some("user"))
+        .map(|msg| message_has_text_matching(msg, is_claude_compaction_request_text))
+        .unwrap_or(false)
 }
 
 fn human_turn_marker(messages: &[Value]) -> Option<([u8; 32], usize)> {
     let mut count = 0;
     let mut latest = None;
     for msg in messages {
-        if is_genuine_user_message(msg) {
+        if let Some(text) = genuine_user_text(msg) {
             count += 1;
-            latest = Some(message_text(&msg["content"]));
+            latest = Some(text);
         }
     }
     let latest = latest?;
@@ -241,13 +319,15 @@ fn human_turn_marker(messages: &[Value]) -> Option<([u8; 32], usize)> {
 fn decision_for_request(
     session_key: String,
     messages: &[Value],
-    sessions: &Mutex<HashMap<String, KissSession>>,
+    sessions: &Mutex<SessionStore>,
 ) -> Option<GateDecision> {
     let (human_marker, visible_human_count) = human_turn_marker(messages)?;
-    let mut map = sessions.lock().unwrap();
-    let Some(session) = map.get_mut(&session_key) else {
+    let mut store = sessions.lock().ok()?;
+    let access = store.next_access();
+    let Some(session) = store.entries.get_mut(&session_key) else {
         let decision = GateDecision::FullPass;
-        map.insert(
+        store.evict_lru_for_new_session();
+        store.entries.insert(
             session_key,
             KissSession {
                 turn_count: 1,
@@ -255,10 +335,12 @@ fn decision_for_request(
                 human_marker,
                 visible_human_count,
                 decision,
+                last_access: access,
             },
         );
         return Some(decision);
     };
+    session.last_access = access;
 
     let advances = human_marker != session.human_marker
         || (visible_human_count > session.visible_human_count
@@ -287,13 +369,16 @@ fn decision_for_request(
 fn gate_decision_for_body(
     body: &Value,
     headers: &HeaderMap,
-    sessions: &Mutex<HashMap<String, KissSession>>,
+    sessions: &Mutex<SessionStore>,
 ) -> Option<GateDecision> {
     if headers.contains_key("x-cc-compaction-request") {
         return None;
     }
-    let key = session_key(body, headers)?;
     let messages = body.get("messages")?.as_array()?;
+    if latest_user_role_is_compaction_request(messages) {
+        return None;
+    }
+    let key = session_key(body, headers)?;
     decision_for_request(key, messages, sessions)
 }
 
@@ -557,6 +642,7 @@ async fn apply_pith_peninsula(messages: &[Value], decision: GateDecision) -> Vec
 /// deliveries deposited verbatim as "user" experience.
 fn is_synthetic_harness_text(text: &str) -> bool {
     const MARKERS: &[&str] = &[
+        "[NeuroGraph Surfaced Knowledge]",
         "<task-notification>",
         "<system-reminder>",
         "<local-command-stdout>",
@@ -567,37 +653,53 @@ fn is_synthetic_harness_text(text: &str) -> bool {
 }
 
 /// Claude Code represents tool results and injected harness context as
-/// user-role messages too. This is the one message-level definition shared
-/// by raw last-user extraction and current-turn compression protection.
-fn is_genuine_user_message(msg: &Value) -> bool {
+/// user-role messages too. Return only genuine human text blocks so raw
+/// last-user deposit, turn cadence, and current-instruction protection all use
+/// one semantic boundary. A mixed array keeps every human block and excludes
+/// independently injected context blocks.
+fn genuine_user_text(msg: &Value) -> Option<String> {
     if msg["role"].as_str() != Some("user")
         || msg["isMeta"].as_bool() == Some(true)
         || is_compact_summary_message(msg)
     {
-        return false;
+        return None;
     }
-    match &msg["content"] {
-        Value::String(s) => !is_synthetic_harness_text(s),
+    let is_genuine = |text: &str| {
+        !text.trim().is_empty()
+            && !is_synthetic_harness_text(text)
+            && !is_claude_compaction_request_text(text)
+            && !is_claude_compacted_summary_text(text)
+    };
+    let text = match &msg["content"] {
+        Value::String(text) if is_genuine(text) => text.clone(),
         Value::Array(blocks) => {
+            // A tool-result delivery may carry neighboring text blocks from
+            // the harness. The whole user-role turn remains tool traffic.
             if blocks
                 .iter()
-                .any(|b| b["type"].as_str() == Some("tool_result"))
+                .any(|block| block["type"].as_str() == Some("tool_result"))
             {
-                return false;
+                return None;
             }
-            blocks.iter().any(|b| {
-                b["type"].as_str() == Some("text")
-                    && b["text"]
-                        .as_str()
-                        .map(|text| {
-                            !is_synthetic_harness_text(text)
-                                && !is_current_claude_compaction_text(text)
-                        })
-                        .unwrap_or(false)
-            })
+            blocks
+                .iter()
+                .filter(|block| block["type"].as_str() == Some("text"))
+                .filter_map(|block| block["text"].as_str())
+                .filter(|text| is_genuine(text))
+                .collect::<Vec<_>>()
+                .join("\n")
         }
-        _ => false,
+        _ => return None,
+    };
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
     }
+}
+
+fn is_genuine_user_message(msg: &Value) -> bool {
+    genuine_user_text(msg).is_some()
 }
 
 fn last_genuine_user_message_index(messages: &[Value]) -> Option<usize> {
@@ -607,26 +709,7 @@ fn last_genuine_user_message_index(messages: &[Value]) -> Option<usize> {
 fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
     let body: Value = serde_json::from_slice(body_bytes).ok()?;
     let messages = body["messages"].as_array()?;
-    for msg in messages.iter().rev() {
-        if !is_genuine_user_message(msg) {
-            continue;
-        }
-        if let Some(s) = msg["content"].as_str() {
-            return Some(s.to_string());
-        }
-        if let Some(blocks) = msg["content"].as_array() {
-            for b in blocks {
-                if b["type"].as_str() == Some("text") {
-                    if let Some(t) = b["text"].as_str() {
-                        if !is_synthetic_harness_text(t) {
-                            return Some(t.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+    messages.iter().rev().find_map(genuine_user_text)
 }
 
 /// CC_GATEWAY_TRACT_PATH (LAW 5) -- read independently here and by the
@@ -850,7 +933,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client: Client::builder().build().expect("reqwest client"),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(SessionStore::new(session_capacity())),
         upstream_fallback: upstream.clone(),
     });
 
@@ -893,6 +976,10 @@ mod tests {
         headers
     }
 
+    fn test_sessions() -> Mutex<SessionStore> {
+        Mutex::new(SessionStore::new(DEFAULT_SESSION_CAPACITY))
+    }
+
     fn body(session_id: &str, messages: Vec<Value>) -> Value {
         json!({
             "metadata": {
@@ -915,6 +1002,23 @@ mod tests {
             messages.push(json!({"role": "user", "content": text}));
         }
         messages
+    }
+
+    fn advance_human_turns(
+        sessions: &Mutex<SessionStore>,
+        session_id: &str,
+        human_texts: &[&str],
+    ) -> GateDecision {
+        let mut decision = GateDecision::FullPass;
+        for index in 0..human_texts.len() {
+            decision = gate_decision_for_body(
+                &body(session_id, conversation(&human_texts[..=index])),
+                &headers(None),
+                sessions,
+            )
+            .unwrap();
+        }
+        decision
     }
 
     // 12 messages: indices 0,1 fall in the compress range (12 - 10), the rest
@@ -1188,7 +1292,7 @@ mod tests {
         let messages = conversation(&["shared opening prompt"]);
         let a = body("session-alpha", messages.clone());
         let b = body("session-beta", messages);
-        let sessions = Mutex::new(HashMap::new());
+        let sessions = test_sessions();
         assert_eq!(
             gate_decision_for_body(&a, &headers(None), &sessions),
             Some(GateDecision::FullPass)
@@ -1197,7 +1301,7 @@ mod tests {
             gate_decision_for_body(&b, &headers(None), &sessions),
             Some(GateDecision::FullPass)
         );
-        assert_eq!(sessions.lock().unwrap().len(), 2);
+        assert_eq!(sessions.lock().unwrap().entries.len(), 2);
     }
 
     #[test]
@@ -1208,14 +1312,44 @@ mod tests {
             json!({"metadata": {"user_id": "not-json"}, "messages": conversation(&["human prompt"])}),
             json!({"metadata": {"user_id": "{}"}, "messages": conversation(&["human prompt"])}),
         ];
-        let sessions = Mutex::new(HashMap::new());
+        let sessions = test_sessions();
         for body in &cases {
             assert_eq!(
                 gate_decision_for_body(body, &headers(None), &sessions),
                 None
             );
         }
-        assert!(sessions.lock().unwrap().is_empty());
+        assert!(sessions.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn configured_session_capacity_is_finitely_clamped() {
+        assert_eq!(configured_session_capacity(None), DEFAULT_SESSION_CAPACITY);
+        assert_eq!(
+            configured_session_capacity(Some("invalid")),
+            DEFAULT_SESSION_CAPACITY
+        );
+        assert_eq!(configured_session_capacity(Some("0")), MIN_SESSION_CAPACITY);
+        assert_eq!(configured_session_capacity(Some("1")), MIN_SESSION_CAPACITY);
+        assert_eq!(configured_session_capacity(Some("128")), 128);
+        assert_eq!(
+            configured_session_capacity(Some("999999999")),
+            MAX_SESSION_CAPACITY
+        );
+    }
+
+    #[test]
+    fn poisoned_session_lock_fails_open() {
+        let sessions = test_sessions();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = sessions.lock().unwrap();
+            panic!("poison cadence state for regression coverage");
+        });
+        let request = body("poisoned-session", conversation(&["human prompt"]));
+        assert_eq!(
+            gate_decision_for_body(&request, &headers(None), &sessions),
+            None
+        );
     }
 
     #[test]
@@ -1233,7 +1367,7 @@ mod tests {
 
     #[test]
     fn tool_loop_reuses_one_human_turn_decision() {
-        let sessions = Mutex::new(HashMap::new());
+        let sessions = test_sessions();
         let mut messages = conversation(&["one human turn"]);
         for i in 0..8 {
             let request = body("tool-loop-session", messages.clone());
@@ -1251,13 +1385,13 @@ mod tests {
             }));
         }
         let map = sessions.lock().unwrap();
-        let state = map.values().next().unwrap();
+        let state = map.entries.values().next().unwrap();
         assert_eq!(state.turn_count, 1);
     }
 
     #[test]
     fn changed_and_repeated_identical_human_turns_advance() {
-        let sessions = Mutex::new(HashMap::new());
+        let sessions = test_sessions();
         let first = body("cadence-session", conversation(&["same prompt"]));
         let repeated = body(
             "cadence-session",
@@ -1280,14 +1414,21 @@ mod tests {
             Some(GateDecision::FullPass)
         );
         assert_eq!(
-            sessions.lock().unwrap().values().next().unwrap().turn_count,
+            sessions
+                .lock()
+                .unwrap()
+                .entries
+                .values()
+                .next()
+                .unwrap()
+                .turn_count,
             3
         );
     }
 
     #[test]
     fn compaction_count_shrink_does_not_advance() {
-        let sessions = Mutex::new(HashMap::new());
+        let sessions = test_sessions();
         for turns in [
             vec!["first"],
             vec!["first", "second"],
@@ -1303,7 +1444,14 @@ mod tests {
             Some(GateDecision::FullPass)
         );
         assert_eq!(
-            sessions.lock().unwrap().values().next().unwrap().turn_count,
+            sessions
+                .lock()
+                .unwrap()
+                .entries
+                .values()
+                .next()
+                .unwrap()
+                .turn_count,
             3
         );
 
@@ -1316,7 +1464,7 @@ mod tests {
 
     #[test]
     fn first_three_human_turns_are_full_and_fourth_compresses() {
-        let sessions = Mutex::new(HashMap::new());
+        let sessions = test_sessions();
         let expected = [
             GateDecision::FullPass,
             GateDecision::FullPass,
@@ -1335,7 +1483,7 @@ mod tests {
 
     #[test]
     fn force_full_cadence_counts_human_turns() {
-        let sessions = Mutex::new(HashMap::new());
+        let sessions = test_sessions();
         let human_turns: Vec<String> = (1..=KISS_WARMUP_TURNS + KISS_FORCE_FULL_EVERY)
             .map(|n| format!("turn {n}"))
             .collect();
@@ -1353,7 +1501,7 @@ mod tests {
 
     #[test]
     fn compaction_header_bypasses_without_advancing() {
-        let sessions = Mutex::new(HashMap::new());
+        let sessions = test_sessions();
         let request = body("compaction-session", conversation(&["human prompt"]));
         let mut request_headers = headers(None);
         request_headers.insert("x-cc-compaction-request", "1".parse().unwrap());
@@ -1361,7 +1509,207 @@ mod tests {
             gate_decision_for_body(&request, &request_headers, &sessions),
             None
         );
-        assert!(sessions.lock().unwrap().is_empty());
+        assert!(sessions.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn compaction_prompt_bypasses_without_header_or_state_change() {
+        let sessions = test_sessions();
+        let normal_messages = conversation(&["one", "two", "three", "four"]);
+        let normal = body("compaction-session", normal_messages.clone());
+        assert_eq!(
+            advance_human_turns(
+                &sessions,
+                "compaction-session",
+                &["one", "two", "three", "four"]
+            ),
+            GateDecision::Compress
+        );
+
+        let key = session_key(&normal, &headers(None)).unwrap();
+        let (before_map, before_clock) = {
+            let store = sessions.lock().unwrap();
+            (store.entries.clone(), store.access_clock)
+        };
+        let mut compacting_messages = normal_messages.clone();
+        compacting_messages.push(json!({"role": "assistant", "content": "ready"}));
+        compacting_messages.push(json!({
+            "role": "user",
+            "content": format!("{CLAUDE_COMPACTION_PROMPT_PREFIX}\n\nSummarize now.")
+        }));
+        let compacting = body("compaction-session", compacting_messages);
+        let original = compacting.clone();
+        assert_eq!(
+            gate_decision_for_body(&compacting, &headers(None), &sessions),
+            None
+        );
+        assert_eq!(compacting, original, "bypass must not mutate the body");
+        let store = sessions.lock().unwrap();
+        assert_eq!(store.entries, before_map);
+        assert_eq!(store.access_clock, before_clock);
+        drop(store);
+
+        let mut tool_loop = normal_messages;
+        tool_loop.push(json!({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}}]
+        }));
+        tool_loop.push(json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "result"}]
+        }));
+        assert_eq!(
+            gate_decision_for_body(
+                &body("compaction-session", tool_loop),
+                &headers(None),
+                &sessions
+            ),
+            Some(GateDecision::Compress)
+        );
+        assert_eq!(
+            sessions
+                .lock()
+                .unwrap()
+                .entries
+                .get(&key)
+                .unwrap()
+                .turn_count,
+            4
+        );
+    }
+
+    #[test]
+    fn compacted_summary_preamble_is_not_a_request_bypass() {
+        let sessions = test_sessions();
+        let mut messages = conversation(&["one", "two", "three", "four"]);
+        assert_eq!(
+            advance_human_turns(
+                &sessions,
+                "summary-session",
+                &["one", "two", "three", "four"]
+            ),
+            GateDecision::Compress
+        );
+        messages.push(json!({"role": "assistant", "content": "summary follows"}));
+        messages.push(json!({
+            "role": "user",
+            "content": format!("{CLAUDE_COMPACTED_PREAMBLE}retained context")
+        }));
+        assert_eq!(
+            gate_decision_for_body(
+                &body("summary-session", messages),
+                &headers(None),
+                &sessions
+            ),
+            Some(GateDecision::Compress)
+        );
+    }
+
+    #[test]
+    fn injected_blocks_do_not_advance_mixed_human_turn() {
+        let sessions = test_sessions();
+        assert_eq!(
+            advance_human_turns(&sessions, "mixed-block-session", &["one", "two", "three"]),
+            GateDecision::FullPass
+        );
+        let mut messages = conversation(&["one", "two", "three"]);
+        messages.push(json!({"role": "assistant", "content": "reply"}));
+        messages.push(json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "the real fourth instruction"},
+                {"type": "text", "text": "[NeuroGraph Surfaced Knowledge]\nold surface"},
+                {"type": "text", "text": "<system-reminder>old reminder</system-reminder>"},
+                {"type": "text", "text": "<task-notification>old task</task-notification>"},
+                {"type": "text", "text": "<local-command-stdout>old output</local-command-stdout>"},
+                {"type": "text", "text": "<local-command-caveat>old caveat</local-command-caveat>"}
+            ]
+        }));
+        let first = body("mixed-block-session", messages.clone());
+        assert_eq!(
+            gate_decision_for_body(&first, &headers(None), &sessions),
+            Some(GateDecision::Compress)
+        );
+
+        let blocks = messages.last_mut().unwrap()["content"]
+            .as_array_mut()
+            .unwrap();
+        blocks[1]["text"] = json!("[NeuroGraph Surfaced Knowledge]\nnew surface");
+        blocks[2]["text"] = json!("<system-reminder>new reminder</system-reminder>");
+        blocks[3]["text"] = json!("<task-notification>new task</task-notification>");
+        blocks[4]["text"] = json!("<local-command-stdout>new output</local-command-stdout>");
+        blocks[5]["text"] = json!("<local-command-caveat>new caveat</local-command-caveat>");
+        assert_eq!(
+            gate_decision_for_body(
+                &body("mixed-block-session", messages),
+                &headers(None),
+                &sessions
+            ),
+            Some(GateDecision::Compress)
+        );
+        let store = sessions.lock().unwrap();
+        let state = store.entries.values().next().unwrap();
+        assert_eq!(state.turn_count, 4);
+        assert_eq!(state.visible_human_count, 4);
+    }
+
+    #[test]
+    fn capped_session_store_evicts_stale_and_preserves_active_cadence() {
+        let sessions = Mutex::new(SessionStore::new(2));
+        let stale = body("stale-session", conversation(&["stale"]));
+        gate_decision_for_body(&stale, &headers(None), &sessions).unwrap();
+
+        let active_messages = conversation(&["one", "two", "three", "four"]);
+        let active = body("active-session", active_messages.clone());
+        assert_eq!(
+            advance_human_turns(
+                &sessions,
+                "active-session",
+                &["one", "two", "three", "four"]
+            ),
+            GateDecision::Compress
+        );
+        let stale_key = session_key(&stale, &headers(None)).unwrap();
+        let active_key = session_key(&active, &headers(None)).unwrap();
+
+        let newcomer = body("new-session", conversation(&["new"]));
+        gate_decision_for_body(&newcomer, &headers(None), &sessions).unwrap();
+        let newcomer_key = session_key(&newcomer, &headers(None)).unwrap();
+        {
+            let store = sessions.lock().unwrap();
+            assert_eq!(store.entries.len(), 2);
+            assert!(!store.entries.contains_key(&stale_key));
+            assert!(store.entries.contains_key(&active_key));
+            assert!(store.entries.contains_key(&newcomer_key));
+        }
+
+        let mut active_tool_loop = active_messages;
+        active_tool_loop.push(json!({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tool", "name": "Read", "input": {}}]
+        }));
+        active_tool_loop.push(json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tool", "content": "result"}]
+        }));
+        assert_eq!(
+            gate_decision_for_body(
+                &body("active-session", active_tool_loop),
+                &headers(None),
+                &sessions
+            ),
+            Some(GateDecision::Compress)
+        );
+        assert_eq!(
+            sessions
+                .lock()
+                .unwrap()
+                .entries
+                .get(&active_key)
+                .unwrap()
+                .turn_count,
+            4
+        );
     }
 
     #[test]
@@ -1483,6 +1831,23 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_mixed_array_keeps_human_blocks_only() {
+        let body = br#"{"messages":[{
+            "role":"user",
+            "content":[
+                {"type":"text","text":"first human block"},
+                {"type":"text","text":"[NeuroGraph Surfaced Knowledge]\nchanging surface"},
+                {"type":"text","text":"<system-reminder>changing reminder</system-reminder>"},
+                {"type":"text","text":"second human block"}
+            ]
+        }]}"#;
+        assert_eq!(
+            extract_last_user_message(body),
+            Some("first human block\nsecond human block".to_string())
+        );
+    }
+
+    #[test]
     fn test_extract_last_user_message_returns_none_on_malformed_body() {
         let body = b"not json";
         assert_eq!(extract_last_user_message(body), None);
@@ -1546,6 +1911,20 @@ mod tests {
             {"role":"user","content":"the real question"},
             {"role":"assistant","content":"..."},
             {"role":"user","content":[{"type":"tool_result","content":"..."}]}
+        ]}"#;
+        let result = extract_last_user_message(body);
+        assert_eq!(result, Some("the real question".to_string()));
+    }
+
+    #[test]
+    fn test_extract_skips_tool_result_turn_with_neighboring_text() {
+        let body = br#"{"messages":[
+            {"role":"user","content":"the real question"},
+            {"role":"assistant","content":"..."},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tool-1","content":"result"},
+                {"type":"text","text":"neighboring harness text that is not a human turn"}
+            ]}
         ]}"#;
         let result = extract_last_user_message(body);
         assert_eq!(result, Some("the real question".to_string()));
