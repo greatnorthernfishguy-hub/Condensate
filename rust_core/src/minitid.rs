@@ -20,6 +20,17 @@
 //       never stalls); JSON newline frames; splice preserves tool_use/
 //       tool_result; fail-soft → inline faux compression on any daemon failure.
 //       Default OFF (unchanged apply_kiss); socket via MINITID_PENINSULA_SOCK.
+// [2026-09-12] Codex (GPT-5.6 Sol) — Preserve the live human instruction
+// What: Exclude the latest genuine user message, as a complete Value, from
+//       both faux-KISS and Pith history compression; use the same genuine-user
+//       predicate for turn deposit and compression protection.
+// Why:  Five tool-use/result pairs can push the current instruction outside
+//       the ten-message numeric window during the same turn. Pith then reduced
+//       the live task to a keyframe and the working CC lost its assignment.
+// How:  Build a sparse eligible-index mask, send only eligible history to
+//       Pith, splice results through that mask, and reuse it for fail-soft faux
+//       compression. The previous human turn becomes eligible when a newer
+//       genuine human instruction arrives.
 // -------------------
 //
 // KISS behaviour (mirrors kiss_filter.py):
@@ -229,6 +240,46 @@ fn compress_message_content(content: &Value) -> Value {
     }
 }
 
+/// Indices before `compress_before` that may be compressed. The latest
+/// genuine human message is the live instruction for the current top-level
+/// turn; tool-use/result traffic can push it outside the numeric recent window
+/// without making it history.
+fn compression_indices(messages: &[Value], compress_before: usize) -> Vec<usize> {
+    let protected = last_genuine_user_message_index(messages);
+    (0..compress_before)
+        .filter(|i| Some(*i) != protected)
+        .collect()
+}
+
+/// Apply the in-process faux compressor to exactly the eligible old messages.
+/// Both the normal faux path and the Pith failure fallback use this helper so
+/// daemon availability cannot change current-turn continuity.
+fn apply_faux_at_indices(messages: &[Value], indices: &[usize]) -> Vec<Value> {
+    let mut out = messages.to_vec();
+    for &i in indices {
+        out[i]["content"] = compress_message_content(&messages[i]["content"]);
+    }
+    out
+}
+
+/// Splice positionally aligned Pith results back through their sparse source
+/// indices. A mismatched response is unusable and leaves fallback policy to
+/// the caller.
+fn apply_pith_at_indices(
+    messages: &[Value],
+    indices: &[usize],
+    compressed: &[String],
+) -> Option<Vec<Value>> {
+    if compressed.len() != indices.len() {
+        return None;
+    }
+    let mut out = messages.to_vec();
+    for (&i, text) in indices.iter().zip(compressed) {
+        out[i]["content"] = set_compressed_text(&messages[i]["content"], text);
+    }
+    Some(out)
+}
+
 /// Apply KISS to a messages array.  Returns the original slice if this turn
 /// qualifies as a full pass (warmup / GOP boundary), otherwise returns a new
 /// Vec with old-message content compressed.
@@ -252,15 +303,8 @@ fn apply_kiss(messages: &[Value], sessions: &Mutex<HashMap<String, KissSession>>
     }
 
     let compress_before = n - KISS_RECENT_WINDOW;
-    messages.iter().enumerate().map(|(i, msg)| {
-        if i < compress_before {
-            let mut m = msg.clone();
-            m["content"] = compress_message_content(&msg["content"]);
-            m
-        } else {
-            msg.clone()
-        }
-    }).collect()
+    let indices = compression_indices(messages, compress_before);
+    apply_faux_at_indices(messages, &indices)
 }
 
 // ============================================================================
@@ -367,34 +411,25 @@ async fn apply_pith_peninsula(messages: &[Value], sessions: &Mutex<HashMap<Strin
         return messages.to_vec();
     }
     let compress_before = n - KISS_RECENT_WINDOW;
-    let older: Vec<String> = messages[..compress_before].iter()
-        .map(|m| message_text(&m["content"])).collect();
+    let indices = compression_indices(messages, compress_before);
+    if indices.is_empty() {
+        return messages.to_vec();
+    }
+    let older: Vec<String> = indices.iter()
+        .map(|&i| message_text(&messages[i]["content"])).collect();
     let compressed = daemon_compress_history(older).await;
     match compressed {
-        Some(c) if c.len() == compress_before => {
-            messages.iter().enumerate().map(|(i, msg)| {
-                if i < compress_before {
-                    let mut m = msg.clone();
-                    m["content"] = set_compressed_text(&msg["content"], &c[i]);
-                    m
-                } else { msg.clone() }
-            }).collect()
-        }
+        Some(c) => apply_pith_at_indices(messages, &indices, &c)
+            .unwrap_or_else(|| apply_faux_at_indices(messages, &indices)),
         // Fallback: faux compression inline (do NOT call apply_kiss -> no double gate).
-        _ => messages.iter().enumerate().map(|(i, msg)| {
-            if i < compress_before {
-                let mut m = msg.clone();
-                m["content"] = compress_message_content(&msg["content"]);
-                m
-            } else { msg.clone() }
-        }).collect(),
+        None => apply_faux_at_indices(messages, &indices),
     }
 }
 
-/// The genuine last user message, extracted from the request body BEFORE
-/// KISS's compression mutates it. KISS only compresses OLDER history, so
-/// the last message is always the real one -- this must be captured
-/// independent of and before apply_kiss() runs on the messages array.
+/// The latest genuine user message, extracted from the request body BEFORE
+/// KISS's compression mutates it. Later user-role entries may be tool results
+/// or injected harness context, so this uses the same genuine-user predicate
+/// as current-turn compression protection.
 /// Harness-injected content delivered as a plain `type: "text"` block inside a
 /// synthetic user-role turn -- background Task-tool completions, system
 /// reminders, and local-command output all arrive this way, not as a
@@ -413,36 +448,44 @@ fn is_synthetic_harness_text(text: &str) -> bool {
     MARKERS.iter().any(|m| trimmed.starts_with(m))
 }
 
+/// Claude Code represents tool results and injected harness context as
+/// user-role messages too. This is the one message-level definition shared
+/// by raw last-user extraction and current-turn compression protection.
+fn is_genuine_user_message(msg: &Value) -> bool {
+    if msg["role"].as_str() != Some("user")
+        || msg["isMeta"].as_bool() == Some(true)
+        || msg["isCompactSummary"].as_bool() == Some(true)
+    {
+        return false;
+    }
+    match &msg["content"] {
+        Value::String(s) => !is_synthetic_harness_text(s),
+        Value::Array(blocks) => {
+            if blocks.iter().any(|b| b["type"].as_str() == Some("tool_result")) {
+                return false;
+            }
+            blocks.iter().any(|b| {
+                b["type"].as_str() == Some("text")
+                    && b["text"].as_str()
+                        .map(|text| !is_synthetic_harness_text(text))
+                        .unwrap_or(false)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn last_genuine_user_message_index(messages: &[Value]) -> Option<usize> {
+    messages.iter().rposition(is_genuine_user_message)
+}
+
 fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
     let body: Value = serde_json::from_slice(body_bytes).ok()?;
     let messages = body["messages"].as_array()?;
     for msg in messages.iter().rev() {
-        if msg["role"].as_str() != Some("user") {
-            continue;
-        }
-        // Mirror Claude Code's own genuine-last-user-message filter: CC marks
-        // synthetic / already-summarized turns with message-level boolean
-        // fields, not just string markers in the text. A message is skipped
-        // entirely when isMeta or isCompactSummary is explicitly `true`, or
-        // when its content contains a tool_result block -- absent, false, or
-        // non-bool values must NOT trigger a skip (field presence alone is
-        // not truthiness).
-        if msg["isMeta"].as_bool() == Some(true) {
-            continue;
-        }
-        if msg["isCompactSummary"].as_bool() == Some(true) {
-            continue;
-        }
-        if let Some(blocks) = msg["content"].as_array() {
-            if blocks.iter().any(|b| b["type"].as_str() == Some("tool_result")) {
-                continue;
-            }
-        }
+        if !is_genuine_user_message(msg) { continue; }
         if let Some(s) = msg["content"].as_str() {
-            if !is_synthetic_harness_text(s) {
-                return Some(s.to_string());
-            }
-            continue;
+            return Some(s.to_string());
         }
         if let Some(blocks) = msg["content"].as_array() {
             for b in blocks {
@@ -548,8 +591,8 @@ async fn proxy(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // Extract the last user message BEFORE KISS mutation — the last message is
-    // always genuine (uncompressed) since KISS only compresses older history.
+    // Extract the latest genuine user message BEFORE KISS mutation. Trailing
+    // user-role entries may be tool results or injected harness context.
     let last_user_message = if is_messages {
         extract_last_user_message(&body_bytes)
     } else {
@@ -730,6 +773,146 @@ mod tests {
             }));
         }
         v
+    }
+
+    const INCIDENT_TASK: &str = "You are the bounded source-and-runtime analyst for the current Claude Code NeuroGraph surfacing mission. Trace the exact path, preserve all restrictions, write the requested PLAN.md, and do not edit repositories or runtime state. This text intentionally exceeds the Pith keyframe budget.";
+
+    fn current_turn_with_tool_pairs(pair_count: usize, array_prompt: bool) -> Vec<Value> {
+        let first = if array_prompt {
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": INCIDENT_TASK},
+                    {"type": "text", "text": "The second human text block must also survive."}
+                ]
+            })
+        } else {
+            json!({"role": "user", "content": INCIDENT_TASK})
+        };
+        let mut messages = vec![first];
+        for i in 0..pair_count {
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": format!("tool_{i}"),
+                    "name": "Read",
+                    "input": {"file_path": format!("file_{i}.rs")}
+                }]
+            }));
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": format!("tool_{i}"),
+                    "content": format!("tool output {i}")
+                }]
+            }));
+        }
+        messages
+    }
+
+    #[test]
+    fn current_human_task_survives_tool_growth_in_faux_path() {
+        // One human task + five tool-use/result pairs = 11 entries. Previously
+        // index 0 fell below n-10 and was compressed during the same user turn.
+        let original = current_turn_with_tool_pairs(5, false);
+        assert_eq!(original.len(), 11);
+        let out = warm_and_apply(&original);
+        assert_eq!(out[0], original[0]);
+        assert!(out[0]["content"].as_str().unwrap().contains("PLAN.md"));
+    }
+
+    #[test]
+    fn current_multiblock_human_message_is_preserved_as_whole_value() {
+        let original = current_turn_with_tool_pairs(6, true);
+        let compress_before = original.len() - KISS_RECENT_WINDOW;
+        let indices = compression_indices(&original, compress_before);
+        assert!(!indices.contains(&0));
+        let out = apply_faux_at_indices(&original, &indices);
+        assert_eq!(out[0], original[0]);
+        assert_eq!(out[0]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pith_sparse_splice_preserves_current_human_value() {
+        let mut original = current_turn_with_tool_pairs(6, true);
+        original[1]["content"] = json!([
+            {"type": "text", "text": "old assistant explanation"},
+            {
+                "type": "tool_use",
+                "id": "tool_0",
+                "name": "Read",
+                "input": {"file_path": "file_0.rs"}
+            }
+        ]);
+        let compress_before = original.len() - KISS_RECENT_WINDOW;
+        let indices = compression_indices(&original, compress_before);
+        assert_eq!(indices, vec![1, 2]);
+        let replacements = vec!["assistant keyframe".to_string(), "tool-result text".to_string()];
+        let out = apply_pith_at_indices(&original, &indices, &replacements).unwrap();
+        assert_eq!(out[0], original[0]);
+        assert_eq!(message_text(&out[1]["content"]), "assistant keyframe");
+        assert_eq!(out[1]["content"][1], original[1]["content"][1]);
+        // A tool_result has no text block, so set_compressed_text leaves its
+        // content unchanged and therefore cannot break the tool pair.
+        assert_eq!(out[2], original[2]);
+    }
+
+    #[test]
+    fn pith_length_mismatch_is_rejected_for_fallback() {
+        let original = current_turn_with_tool_pairs(6, false);
+        let indices = compression_indices(&original, original.len() - KISS_RECENT_WINDOW);
+        assert!(apply_pith_at_indices(&original, &indices, &["one".to_string()]).is_none());
+        let fallback = apply_faux_at_indices(&original, &indices);
+        assert_eq!(fallback[0], original[0]);
+    }
+
+    #[test]
+    fn newer_human_turn_releases_prior_human_turn_for_compression() {
+        let mut original = vec![
+            json!({"role": "user", "content": INCIDENT_TASK}),
+            json!({"role": "assistant", "content": LONG}),
+            json!({"role": "user", "content": "new genuine instruction that must remain verbatim even after enough later tool traffic pushes it outside the numeric recent window"}),
+        ];
+        for i in 0..6 {
+            original.push(json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": format!("later_{i}"), "name": "Read", "input": {}}]
+            }));
+            original.push(json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": format!("later_{i}"), "content": "result"}]
+            }));
+        }
+        let indices = compression_indices(&original, original.len() - KISS_RECENT_WINDOW);
+        assert!(indices.contains(&0));
+        assert!(!indices.contains(&2));
+        let out = apply_faux_at_indices(&original, &indices);
+        assert_ne!(out[0], original[0]);
+        assert_eq!(out[2], original[2]);
+    }
+
+    #[test]
+    fn synthetic_user_entries_do_not_steal_current_human_protection() {
+        let mut messages = current_turn_with_tool_pairs(5, false);
+        messages.push(json!({
+            "role": "user",
+            "isMeta": true,
+            "content": "meta"
+        }));
+        messages.push(json!({
+            "role": "user",
+            "isCompactSummary": true,
+            "content": "summary"
+        }));
+        messages.push(json!({
+            "role": "user",
+            "content": "<system-reminder>injected</system-reminder>"
+        }));
+        assert_eq!(last_genuine_user_message_index(&messages), Some(0));
+        let indices = compression_indices(&messages, messages.len() - KISS_RECENT_WINDOW);
+        assert!(!indices.contains(&0));
     }
 
     #[test]
