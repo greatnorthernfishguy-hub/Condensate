@@ -49,6 +49,16 @@
 // How:  Bypass on the latest user-role compaction prompt before state access,
 //       share one filtered human-text extractor with deposits and cadence, and
 //       keep an env-bounded access-order store that never evicts the active key.
+// [2026-09-13] Codex (GPT-5.6 Sol) — Compose each request from the live CC mind
+// What: Replace peninsula history keyframes with one fresh provider_context
+//       assembled from CC's live NeuroGraph, the exact current instruction and
+//       Quest orientation, and the intact current tool episode.
+// Why:  Replaying or periodically restoring transcript history is not Pith.
+//       Provider context must come from the substrate's current learned
+//       topology and activation on every request, including warmup/GOP turns.
+// How:  Extract the already-rendered Quest text from Claude's request (never
+//       Quest storage), cue the existing daemon socket verb, evict obsolete
+//       history only after a valid fresh response, and fail open unchanged.
 // -------------------
 //
 // KISS behaviour (mirrors kiss_filter.py):
@@ -66,6 +76,7 @@
 //   MINITID_PORT      — listen port (default: 9090)
 //   MINITID_UPSTREAM  — upstream base URL (default: https://api.anthropic.com)
 //   MINITID_SESSION_CAPACITY — retained cadence sessions (default: 4096)
+//   MINITID_PITH_TOOL_TAIL_BYTES — exact recent tool-tail target (default: 65536)
 //
 // Build:
 //   cargo build --release --features minitid
@@ -100,9 +111,9 @@ use reqwest::Client;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-// [2026-07-16 DudeMan CC] substrate-peninsula (P1): blocking Unix-socket client to
-// the CC daemon's compress_history handler, run on the blocking pool so the async
-// runtime is never stalled. Gated off by default (MINITID_PITH_PENINSULA).
+// Blocking Unix-socket client to the CC daemon's read-only provider_context
+// handler, run on the blocking pool so the async runtime is never stalled.
+// Gated off by default (MINITID_PITH_PENINSULA).
 use std::env;
 use std::io::{Read as _PenRead, Write as _PenWrite};
 use std::net::SocketAddr;
@@ -228,10 +239,29 @@ fn configured_session_capacity(value: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_SESSION_CAPACITY)
 }
 
+fn pith_tool_tail_bytes() -> usize {
+    configured_pith_tool_tail_bytes(env::var("MINITID_PITH_TOOL_TAIL_BYTES").ok().as_deref())
+}
+
+fn configured_pith_tool_tail_bytes(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|bytes| bytes.clamp(MIN_PITH_TOOL_TAIL_BYTES, MAX_PITH_TOOL_TAIL_BYTES))
+        .unwrap_or(DEFAULT_PITH_TOOL_TAIL_BYTES)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 const MAX_SESSION_ID_BYTES: usize = 512;
 const MAX_AGENT_ID_BYTES: usize = 128;
+const NEUROGRAPH_SURFACED_MARKER: &str = "[NeuroGraph Surfaced Knowledge]";
+const QUEST_TRACKER_BANNER: &str =
+    "ACTIVE QUEST TRAIL for this session (injected by the Quest Tracker).";
+const MAX_PROVIDER_CONTEXT_CHARS: usize = 40_000;
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 256 * 1024;
+const DEFAULT_PITH_TOOL_TAIL_BYTES: usize = 64 * 1024;
+const MIN_PITH_TOOL_TAIL_BYTES: usize = 8 * 1024;
+const MAX_PITH_TOOL_TAIL_BYTES: usize = 1024 * 1024;
 const CLAUDE_COMPACTION_PROMPT_PREFIX: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n- You already have all the context you need in the conversation above.\n- Tool calls will be REJECTED and will waste your only turn";
 const CLAUDE_COMPACTED_PREAMBLE: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
 
@@ -469,24 +499,6 @@ fn apply_faux_at_indices(messages: &[Value], indices: &[usize]) -> Vec<Value> {
     out
 }
 
-/// Splice positionally aligned Pith results back through their sparse source
-/// indices. A mismatched response is unusable and leaves fallback policy to
-/// the caller.
-fn apply_pith_at_indices(
-    messages: &[Value],
-    indices: &[usize],
-    compressed: &[String],
-) -> Option<Vec<Value>> {
-    if compressed.len() != indices.len() {
-        return None;
-    }
-    let mut out = messages.to_vec();
-    for (&i, text) in indices.iter().zip(compressed) {
-        out[i]["content"] = set_compressed_text(&messages[i]["content"], text);
-    }
-    Some(out)
-}
-
 /// Apply KISS to a messages array.  Returns the original slice if this turn
 /// qualifies as a full pass (warmup / GOP boundary), otherwise returns a new
 /// Vec with old-message content compressed.
@@ -502,27 +514,29 @@ fn apply_kiss(messages: &[Value], decision: GateDecision) -> Vec<Value> {
 }
 
 // ============================================================================
-// Substrate peninsula (P1) — substrate-informed history compression via the CC
-// daemon's Pith, the real replacement for the crude apply_kiss() above.
-// Gated off by default (MINITID_PITH_PENINSULA unset). On ANY failure the
-// caller falls back to faux KISS, so the request path never depends on the
-// daemon being up. [2026-07-16 DudeMan CC]
+// Substrate peninsula — fresh provider context from CC's living NeuroGraph.
+// Gated off by default (MINITID_PITH_PENINSULA unset).  Obsolete history is
+// evicted only after the daemon returns a valid fresh context.  Any failure
+// leaves the original request untouched.
 // ============================================================================
 
-/// Call the CC daemon's `compress_history` handler over its Unix socket.
-/// Blocking socket I/O on the blocking pool (never stalls the async runtime),
-/// bounded by an overall timeout. Text in, text out. None on any error.
-async fn daemon_compress_history(turns: Vec<String>) -> Option<Vec<String>> {
+/// Call the CC daemon's read-only `provider_context` handler.  The request
+/// carries only attention cues already present in this request; it never sends
+/// transcript history.  Accept only the producer's closed fresh states.
+async fn daemon_provider_context(
+    current_instruction: String,
+    quest_focus: String,
+) -> Option<String> {
     let sock = std::env::var("MINITID_PENINSULA_SOCK").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/josh".into());
         format!("{}/.claude/plugins/neurograph/daemon.sock", home)
     });
-    let fut = tokio::task::spawn_blocking(move || -> Option<Vec<String>> {
+    let fut = tokio::task::spawn_blocking(move || -> Option<String> {
         let mut stream = UnixStream::connect(&sock).ok()?;
         let t = std::time::Duration::from_millis(1500);
         stream.set_read_timeout(Some(t)).ok()?;
         stream.set_write_timeout(Some(t)).ok()?;
-        let req = serde_json::json!({"event": "compress_history", "data": {"turns": turns}});
+        let req = provider_context_request(&current_instruction, &quest_focus);
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
         stream.write_all(&line).ok()?;
@@ -534,17 +548,17 @@ async fn daemon_compress_history(turns: Vec<String>) -> Option<Vec<String>> {
                 break;
             }
             buf.extend_from_slice(&chunk[..nread]);
+            if buf.len() > MAX_PROVIDER_RESPONSE_BYTES {
+                return None;
+            }
             if buf.last() == Some(&b'\n') {
                 break;
             }
         }
-        let resp: Value = serde_json::from_slice(&buf).ok()?;
-        let arr = resp.get("compressed")?.as_array()?;
-        Some(
-            arr.iter()
-                .map(|v| v.as_str().unwrap_or("").to_string())
-                .collect(),
-        )
+        if buf.last() != Some(&b'\n') {
+            return None;
+        }
+        parse_provider_response(&buf)
     });
     match tokio::time::timeout(std::time::Duration::from_millis(2000), fut).await {
         Ok(Ok(v)) => v,
@@ -552,81 +566,400 @@ async fn daemon_compress_history(turns: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
-/// Joined text of a message's text blocks (or its string content) — what the
-/// substrate hashed the turn on, and what gets compressed.
-fn message_text(content: &Value) -> String {
+fn provider_context_request(current_instruction: &str, quest_focus: &str) -> Value {
+    serde_json::json!({
+        "event": "provider_context",
+        "data": {
+            "current_instruction": current_instruction,
+            "quest_focus": quest_focus,
+        }
+    })
+}
+
+fn parse_provider_response(bytes: &[u8]) -> Option<String> {
+    let resp: Value = serde_json::from_slice(bytes).ok()?;
+    if resp.get("ok")?.as_bool()? != true {
+        return None;
+    }
+    let state = resp.get("state")?.as_str()?;
+    if resp.get("source")?.as_str()? != "cc_neurograph_topology" {
+        return None;
+    }
+    resp.get("coherence")?.as_str()?;
+    let anchors = resp.get("anchors")?.as_array()?;
+    let warnings = resp.get("warnings")?.as_array()?;
+    if !anchors.iter().all(Value::is_string) || !warnings.iter().all(Value::is_string) {
+        return None;
+    }
+    let assemblies = resp.get("assemblies")?.as_u64()?;
+    if !matches!((state, assemblies), ("ok", 1..) | ("empty", 0)) {
+        return None;
+    }
+    let context = resp.get("context")?.as_str()?;
+    let context_chars = context.chars().count();
+    if context.trim().is_empty() || context_chars > MAX_PROVIDER_CONTEXT_CHARS {
+        return None;
+    }
+    Some(context.to_string())
+}
+
+fn content_texts(content: &Value) -> Vec<&str> {
     match content {
-        Value::String(s) => s.clone(),
+        Value::String(text) => vec![text.as_str()],
         Value::Array(blocks) => blocks
             .iter()
-            .filter_map(|b| {
-                if b["type"].as_str() == Some("text") {
-                    b["text"].as_str()
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+            .filter(|block| block["type"].as_str() == Some("text"))
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
-/// Replace a message's text content with the compressed text, preserving
-/// tool_use/tool_result blocks verbatim (never blank — mirrors the array-content
-/// fix). Multiple text blocks collapse into one compressed block.
-fn set_compressed_text(content: &Value, compressed: &str) -> Value {
-    if compressed.is_empty() {
-        return content.clone();
+/// Pull the latest bounded Quest orientation out of the rendered Claude
+/// request.  SessionStart wraps it in a system-reminder; Quest's banner is the
+/// stable owned boundary.  The extracted bytes begin at that banner and stop
+/// before Claude's wrapper close, so unrelated hook context is not promoted.
+fn verified_quest_text<'a>(msg: &Value, text: &'a str) -> Result<Option<&'a str>, ()> {
+    if msg["role"].as_str() != Some("user") {
+        return Ok(None);
     }
-    match content {
-        Value::String(_) => Value::String(compressed.to_string()),
-        Value::Array(blocks) => {
-            let mut out: Vec<Value> = Vec::new();
-            let mut text_done = false;
-            for b in blocks {
-                if b["type"].as_str() == Some("text") {
-                    if !text_done {
-                        let mut x = b.clone();
-                        x["text"] = Value::String(compressed.to_string());
-                        out.push(x);
-                        text_done = true;
-                    } // subsequent text blocks collapse away
-                } else {
-                    out.push(b.clone());
-                }
+    let trimmed = text.trim_start();
+    let verified_envelope =
+        trimmed.starts_with("<system-reminder>\nSessionStart hook additional context: ");
+    if !verified_envelope && msg["isMeta"].as_bool() != Some(true) {
+        return Ok(None);
+    }
+    let mut starts = text
+        .match_indices(QUEST_TRACKER_BANNER)
+        .map(|(index, _)| index);
+    let Some(start) = starts.next() else {
+        return Ok(None);
+    };
+    if starts.next().is_some() {
+        return Err(());
+    }
+    let remainder = &text[start..];
+    let end = remainder
+        .find("\n</system-reminder>")
+        .unwrap_or(remainder.len());
+    Ok(Some(&remainder[..end]))
+}
+
+fn extract_quest_focus(messages: &[Value]) -> Result<Option<String>, ()> {
+    for msg in messages.iter().rev() {
+        for text in content_texts(&msg["content"]).into_iter().rev() {
+            if let Some(quest) = verified_quest_text(msg, text)? {
+                return Ok(Some(quest.to_string()));
             }
-            Value::Array(out)
         }
-        _ => content.clone(),
+    }
+    Ok(None)
+}
+
+fn verified_quest_rails(messages: &[Value]) -> Result<Vec<String>, ()> {
+    let mut rails = Vec::new();
+    for msg in messages {
+        for text in content_texts(&msg["content"]) {
+            if let Some(quest) = verified_quest_text(msg, text)? {
+                rails.push(quest.to_string());
+            }
+        }
+    }
+    Ok(rails)
+}
+
+fn is_standalone_neurograph_surface_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with(NEUROGRAPH_SURFACED_MARKER) {
+        return true;
+    }
+    let Some(reminder) = trimmed.strip_prefix("<system-reminder>\n") else {
+        return false;
+    };
+    let reminder = reminder.trim_start();
+    let boundary = " hook additional context: ";
+    let Some(split) = reminder.find(boundary) else {
+        return false;
+    };
+    let event = &reminder[..split];
+    if event.is_empty() || event.len() > 32 || !event.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    reminder[split + boundary.len()..].starts_with(NEUROGRAPH_SURFACED_MARKER)
+}
+
+/// Remove only independently identifiable synthetic NG text blocks.  Every
+/// neighboring human/tool/reminder block is cloned byte-for-byte.  If the
+/// marker is embedded inside inseparable text, decline the rewrite.
+fn strip_neurograph_surface(msg: &Value) -> Result<Option<Value>, ()> {
+    if msg["role"].as_str() != Some("user") {
+        return Ok(Some(msg.clone()));
+    }
+    match &msg["content"] {
+        Value::String(text) => {
+            if is_standalone_neurograph_surface_text(text) {
+                Ok(None)
+            } else if text.contains(NEUROGRAPH_SURFACED_MARKER) {
+                Err(())
+            } else {
+                Ok(Some(msg.clone()))
+            }
+        }
+        Value::Array(blocks) => {
+            let mut kept = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                if block["type"].as_str() == Some("text") {
+                    if let Some(text) = block["text"].as_str() {
+                        if is_standalone_neurograph_surface_text(text) {
+                            continue;
+                        }
+                        if text.contains(NEUROGRAPH_SURFACED_MARKER) {
+                            return Err(());
+                        }
+                    }
+                }
+                kept.push(block.clone());
+            }
+            if kept.is_empty() {
+                Ok(None)
+            } else if kept.len() == blocks.len() {
+                Ok(Some(msg.clone()))
+            } else {
+                let mut cleaned = msg.clone();
+                cleaned["content"] = Value::Array(kept);
+                Ok(Some(cleaned))
+            }
+        }
+        _ => Ok(Some(msg.clone())),
     }
 }
 
-/// Peninsula KISS: compress older-than-window turns via the daemon's substrate
-/// Pith instead of the 60-char cut. The caller supplies the same human-turn
-/// decision used by faux KISS. On any daemon failure or a length mismatch,
-/// this falls back to faux compression inline without re-gating.
-async fn apply_pith_peninsula(messages: &[Value], decision: GateDecision) -> Vec<Value> {
-    let n = messages.len();
-    if decision == GateDecision::FullPass || n <= KISS_RECENT_WINDOW {
-        return messages.to_vec();
-    }
-    let compress_before = n - KISS_RECENT_WINDOW;
-    let indices = compression_indices(messages, compress_before);
-    if indices.is_empty() {
-        return messages.to_vec();
-    }
-    let older: Vec<String> = indices
+fn count_marker(messages: &[Value], marker: &str) -> usize {
+    messages
         .iter()
-        .map(|&i| message_text(&messages[i]["content"]))
-        .collect();
-    let compressed = daemon_compress_history(older).await;
-    match compressed {
-        Some(c) => apply_pith_at_indices(messages, &indices, &c)
-            .unwrap_or_else(|| apply_faux_at_indices(messages, &indices)),
-        // Fallback: faux compression inline (do NOT call apply_kiss -> no double gate).
-        None => apply_faux_at_indices(messages, &indices),
+        .flat_map(|msg| content_texts(&msg["content"]))
+        .map(|text| text.matches(marker).count())
+        .sum()
+}
+
+fn tool_ids(msg: &Value, block_type: &str, id_field: &str) -> Vec<String> {
+    match &msg["content"] {
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block["type"].as_str() == Some(block_type))
+            .filter_map(|block| block[id_field].as_str())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
     }
+}
+
+fn message_has_tool_traffic(msg: &Value) -> bool {
+    match &msg["content"] {
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            matches!(
+                block["type"].as_str(),
+                Some("tool_use") | Some("tool_result")
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn suffix_has_complete_tool_pairs(episode: &[Value], start: usize) -> bool {
+    for (offset, msg) in episode[start..].iter().enumerate() {
+        let result_pos = start + offset;
+        for result_id in tool_ids(msg, "tool_result", "tool_use_id") {
+            if !episode[start..result_pos].iter().any(|candidate| {
+                tool_ids(candidate, "tool_use", "id")
+                    .iter()
+                    .any(|use_id| use_id == &result_id)
+            }) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn serialized_messages_bytes(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .map(|msg| {
+            serde_json::to_vec(msg)
+                .map(|bytes| bytes.len())
+                .unwrap_or(MAX_BODY)
+        })
+        .sum()
+}
+
+/// Keep the exact current human turn plus a small, pair-aware recent suffix.
+/// Resolved old pairs fall away together.  A retained result pulls its matching
+/// use into the suffix, while every still-unresolved use remains visible.
+fn bounded_current_episode(cleaned: &[Value], tool_tail_bytes: usize) -> Option<Vec<Value>> {
+    let current = cleaned.first()?.clone();
+    let episode = &cleaned[1..];
+    if episode.is_empty() {
+        return Some(vec![current]);
+    }
+    let mut start = episode.len().saturating_sub(KISS_RECENT_WINDOW);
+
+    // An unresolved tool call is unfinished business even if it is older than
+    // the ordinary recent suffix.
+    let mut unresolved_positions = Vec::new();
+    for (use_pos, msg) in episode.iter().enumerate() {
+        for use_id in tool_ids(msg, "tool_use", "id") {
+            let resolved = episode[use_pos + 1..].iter().any(|later| {
+                tool_ids(later, "tool_result", "tool_use_id")
+                    .iter()
+                    .any(|result_id| result_id == &use_id)
+            });
+            if !resolved {
+                unresolved_positions.push(use_pos);
+                start = start.min(use_pos);
+            }
+        }
+    }
+
+    // Never retain a result without the assistant message that issued it.
+    loop {
+        let mut adjusted = start;
+        for (offset, msg) in episode[start..].iter().enumerate() {
+            let result_pos = start + offset;
+            for result_id in tool_ids(msg, "tool_result", "tool_use_id") {
+                let use_pos = episode[..result_pos].iter().rposition(|candidate| {
+                    tool_ids(candidate, "tool_use", "id")
+                        .iter()
+                        .any(|use_id| use_id == &result_id)
+                })?;
+                adjusted = adjusted.min(use_pos);
+            }
+        }
+        if adjusted == start {
+            break;
+        }
+        start = adjusted;
+    }
+
+    // A configured byte envelope prevents ten enormous tool messages from becoming
+    // another context window.  Admission stays whole-message and pair-aware.
+    // The newest indivisible pair (or unresolved call) is the semantic floor:
+    // it remains exact even if that one unit alone exceeds this target.
+    if serialized_messages_bytes(&episode[start..]) > tool_tail_bytes {
+        let safe_candidates: Vec<usize> = (start + 1..episode.len())
+            .filter(|candidate| {
+                !unresolved_positions.iter().any(|pos| pos < candidate)
+                    && suffix_has_complete_tool_pairs(episode, *candidate)
+            })
+            .collect();
+        if let Some(candidate) = safe_candidates
+            .iter()
+            .copied()
+            .find(|candidate| serialized_messages_bytes(&episode[*candidate..]) <= tool_tail_bytes)
+            .or_else(|| safe_candidates.last().copied())
+        {
+            start = candidate;
+        }
+    }
+
+    let mut out = Vec::with_capacity(1 + episode.len() - start);
+    out.push(current);
+    out.extend_from_slice(&episode[start..]);
+    Some(out)
+}
+
+/// Compose a bounded L1 only from the fresh topology response and the live
+/// request tail. Retained messages stay exact unless an independently
+/// identified NG text block is removed; every neighboring block stays exact.
+fn compose_provider_messages(
+    messages: &[Value],
+    provider_context: &str,
+    quest_focus: Option<&str>,
+) -> Option<Vec<Value>> {
+    if provider_context.trim().is_empty()
+        || provider_context.chars().count() > MAX_PROVIDER_CONTEXT_CHARS
+        || provider_context.contains(NEUROGRAPH_SURFACED_MARKER)
+        || provider_context.contains(QUEST_TRACKER_BANNER)
+    {
+        return None;
+    }
+    let current = last_genuine_user_message_index(messages)?;
+    let mut cleaned_messages = Vec::new();
+    for msg in &messages[current..] {
+        if msg["isMeta"].as_bool() == Some(true) || is_compact_summary_message(msg) {
+            if message_has_tool_traffic(msg) {
+                return None;
+            }
+            continue;
+        }
+        if let Some(cleaned) = strip_neurograph_surface(msg).ok()? {
+            cleaned_messages.push(cleaned);
+        }
+    }
+    let tail = bounded_current_episode(&cleaned_messages, pith_tool_tail_bytes())?;
+
+    let quest_rails_in_tail = verified_quest_rails(&tail).ok()?;
+    if quest_rails_in_tail.len() > 1 {
+        return None;
+    }
+    let mut out = vec![serde_json::json!({
+        "role": "user",
+        "content": format!("{NEUROGRAPH_SURFACED_MARKER}\n\n{provider_context}"),
+    })];
+    if quest_rails_in_tail.is_empty() {
+        if let Some(quest) = quest_focus.filter(|text| !text.is_empty()) {
+            out.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
+                ),
+            }));
+        }
+    }
+    out.extend(tail);
+    if count_marker(&out, NEUROGRAPH_SURFACED_MARKER) != 1 {
+        return None;
+    }
+    let expected_quest = usize::from(quest_focus.map(|text| !text.is_empty()).unwrap_or(false));
+    let verified_out = verified_quest_rails(&out).ok()?;
+    if verified_out.len() != expected_quest {
+        return None;
+    }
+    if let Some(expected) = quest_focus.filter(|text| !text.is_empty()) {
+        if verified_out.first().map(String::as_str) != Some(expected) {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Build fresh context on every Pith-enabled provider request.  Warmup and GOP
+/// cadence never restore raw history.  The old request survives byte-for-byte
+/// whenever the daemon or composition boundary is unavailable.
+async fn apply_pith_peninsula(messages: &[Value], decision: GateDecision) -> Vec<Value> {
+    let Some(current_instruction) = messages.iter().rev().find_map(genuine_user_text) else {
+        return messages.to_vec();
+    };
+    let Ok(quest_focus) = extract_quest_focus(messages) else {
+        return messages.to_vec();
+    };
+    let Some(context) =
+        daemon_provider_context(current_instruction, quest_focus.clone().unwrap_or_default()).await
+    else {
+        return messages.to_vec();
+    };
+    apply_provider_result(messages, decision, Some(&context), quest_focus.as_deref())
+}
+
+fn apply_provider_result(
+    messages: &[Value],
+    _decision: GateDecision,
+    provider_context: Option<&str>,
+    quest_focus: Option<&str>,
+) -> Vec<Value> {
+    provider_context
+        .and_then(|context| compose_provider_messages(messages, context, quest_focus))
+        .unwrap_or_else(|| messages.to_vec())
 }
 
 /// The latest genuine user message, extracted from the request body BEFORE
@@ -642,7 +975,7 @@ async fn apply_pith_peninsula(messages: &[Value], decision: GateDecision) -> Vec
 /// deliveries deposited verbatim as "user" experience.
 fn is_synthetic_harness_text(text: &str) -> bool {
     const MARKERS: &[&str] = &[
-        "[NeuroGraph Surfaced Knowledge]",
+        NEUROGRAPH_SURFACED_MARKER,
         "<task-notification>",
         "<system-reminder>",
         "<local-command-stdout>",
@@ -1109,40 +1442,120 @@ mod tests {
     }
 
     #[test]
-    fn pith_sparse_splice_preserves_current_human_value() {
-        let mut original = current_turn_with_tool_pairs(6, true);
-        original[1]["content"] = json!([
-            {"type": "text", "text": "old assistant explanation"},
-            {
-                "type": "tool_use",
-                "id": "tool_0",
-                "name": "Read",
-                "input": {"file_path": "file_0.rs"}
-            }
-        ]);
-        let compress_before = original.len() - KISS_RECENT_WINDOW;
-        let indices = compression_indices(&original, compress_before);
-        assert_eq!(indices, vec![1, 2]);
-        let replacements = vec![
-            "assistant keyframe".to_string(),
-            "tool-result text".to_string(),
+    fn provider_composition_evicts_old_history_and_keeps_live_rails_once() {
+        let quest = format!(
+            "{QUEST_TRACKER_BANNER} This is what you were working on and why.\n\nCurrent: Slice B"
+        );
+        let wrapped_quest = format!(
+            "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
+        );
+        let current = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": INCIDENT_TASK}]
+        });
+        let messages = vec![
+            json!({"role": "user", "content": wrapped_quest}),
+            json!({"role": "assistant", "content": LONG}),
+            current.clone(),
         ];
-        let out = apply_pith_at_indices(&original, &indices, &replacements).unwrap();
-        assert_eq!(out[0], original[0]);
-        assert_eq!(message_text(&out[1]["content"]), "assistant keyframe");
-        assert_eq!(out[1]["content"][1], original[1]["content"][1]);
-        // A tool_result has no text block, so set_compressed_text leaves its
-        // content unchanged and therefore cannot break the tool pair.
-        assert_eq!(out[2], original[2]);
+        let extracted = extract_quest_focus(&messages).unwrap().unwrap();
+        assert_eq!(extracted, quest);
+        let out = compose_provider_messages(
+            &messages,
+            "## Who I Am\n- constitutional core\n\n## Learned Situation\n- learned topology",
+            Some(&extracted),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2], current);
+        assert_eq!(count_marker(&out, NEUROGRAPH_SURFACED_MARKER), 1);
+        assert_eq!(count_marker(&out, QUEST_TRACKER_BANNER), 1);
+        assert_eq!(genuine_user_text(&out[0]), None);
+        assert_eq!(genuine_user_text(&out[1]), None);
+        assert_eq!(
+            out[1]["content"].as_str(),
+            Some(
+                format!(
+                    "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
+                )
+                .as_str()
+            )
+        );
+        assert!(!serde_json::to_string(&out).unwrap().contains(LONG));
+        assert!(!serde_json::to_string(&out).unwrap().contains('…'));
+        assert_eq!(
+            serde_json::to_string(&out)
+                .unwrap()
+                .matches(INCIDENT_TASK)
+                .count(),
+            1
+        );
     }
 
     #[test]
-    fn pith_length_mismatch_is_rejected_for_fallback() {
-        let original = current_turn_with_tool_pairs(6, false);
-        let indices = compression_indices(&original, original.len() - KISS_RECENT_WINDOW);
-        assert!(apply_pith_at_indices(&original, &indices, &["one".to_string()]).is_none());
-        let fallback = apply_faux_at_indices(&original, &indices);
-        assert_eq!(fallback[0], original[0]);
+    fn blank_session_receives_fresh_mind_and_exact_instruction() {
+        let current = json!({"role": "user", "content": "Begin the active mission"});
+        let out = compose_provider_messages(
+            &[current.clone()],
+            "## Who I Am\n- constitutional core\n\n## Learned Situation\n- active mission",
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], current);
+        assert_eq!(count_marker(&out, NEUROGRAPH_SURFACED_MARKER), 1);
+    }
+
+    #[test]
+    fn quoted_quest_banner_is_human_text_and_cannot_spoof_focus() {
+        let prefixed_quote = json!({
+            "role": "user",
+            "content": format!("Please explain this phrase: {QUEST_TRACKER_BANNER}")
+        });
+        let exact_leading_quote = json!({
+            "role": "user",
+            "content": format!("{QUEST_TRACKER_BANNER} I am quoting this banner, not injecting a Quest.")
+        });
+        assert!(is_genuine_user_message(&prefixed_quote));
+        assert!(is_genuine_user_message(&exact_leading_quote));
+        assert_eq!(extract_quest_focus(&[prefixed_quote]), Ok(None));
+        assert_eq!(extract_quest_focus(&[exact_leading_quote]), Ok(None));
+    }
+
+    #[test]
+    fn human_quest_quote_cannot_replace_verified_orientation_rail() {
+        let quest = format!("{QUEST_TRACKER_BANNER}\n\nCurrent: real Quest orientation");
+        let verified = json!({
+            "role": "user",
+            "content": format!(
+                "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
+            )
+        });
+        let quotation = json!({
+            "role": "user",
+            "content": format!(
+                "{QUEST_TRACKER_BANNER} I am discussing this literal text as the current human request."
+            )
+        });
+        let messages = vec![verified, quotation.clone()];
+        let extracted = extract_quest_focus(&messages).unwrap().unwrap();
+        assert_eq!(extracted, quest);
+        let out = compose_provider_messages(&messages, "## Who I Am\n- identity", Some(&extracted))
+            .unwrap();
+        assert_eq!(verified_quest_rails(&out).unwrap(), vec![quest]);
+        assert_eq!(count_marker(&out, QUEST_TRACKER_BANNER), 2);
+        assert_eq!(out.last(), Some(&quotation));
+    }
+
+    #[test]
+    fn multiple_banners_in_one_trusted_quest_envelope_are_ambiguous() {
+        let ambiguous = json!({
+            "role": "user",
+            "content": format!(
+                "<system-reminder>\nSessionStart hook additional context: {QUEST_TRACKER_BANNER}\nfirst\n{QUEST_TRACKER_BANNER}\nsecond\n</system-reminder>"
+            )
+        });
+        assert_eq!(extract_quest_focus(&[ambiguous]), Err(()));
     }
 
     #[test]
@@ -1335,6 +1748,30 @@ mod tests {
         assert_eq!(
             configured_session_capacity(Some("999999999")),
             MAX_SESSION_CAPACITY
+        );
+    }
+
+    #[test]
+    fn configured_pith_tool_tail_bytes_defaults_and_clamps() {
+        assert_eq!(
+            configured_pith_tool_tail_bytes(None),
+            DEFAULT_PITH_TOOL_TAIL_BYTES
+        );
+        assert_eq!(
+            configured_pith_tool_tail_bytes(Some("malformed")),
+            DEFAULT_PITH_TOOL_TAIL_BYTES
+        );
+        assert_eq!(
+            configured_pith_tool_tail_bytes(Some("0")),
+            MIN_PITH_TOOL_TAIL_BYTES
+        );
+        assert_eq!(
+            configured_pith_tool_tail_bytes(Some("65536")),
+            DEFAULT_PITH_TOOL_TAIL_BYTES
+        );
+        assert_eq!(
+            configured_pith_tool_tail_bytes(Some("999999999")),
+            MAX_PITH_TOOL_TAIL_BYTES
         );
     }
 
@@ -1746,35 +2183,303 @@ mod tests {
     }
 
     #[test]
-    fn faux_and_pith_use_the_same_sparse_indices() {
-        let mut messages = current_turn_with_tool_pairs(6, true);
-        messages.insert(
-            0,
-            json!({"role": "user", "isCompactSummary": true, "content": LONG}),
-        );
-        let compress_before = messages.len() - KISS_RECENT_WINDOW;
-        let indices = compression_indices(&messages, compress_before);
-        let faux = apply_faux_at_indices(&messages, &indices);
-        let replacements: Vec<String> = indices
-            .iter()
-            .map(|index| format!("pith replacement {index}"))
-            .collect();
-        let pith = apply_pith_at_indices(&messages, &indices, &replacements).unwrap();
+    fn mixed_human_and_surface_blocks_keep_human_block_exact() {
+        let human =
+            json!({"type": "text", "text": INCIDENT_TASK, "cache_control": {"type": "ephemeral"}});
+        let noise =
+            json!({"type": "text", "text": format!("{NEUROGRAPH_SURFACED_MARKER}\nold noise")});
+        let current = json!({"role": "user", "content": [human.clone(), noise]});
+        let out = compose_provider_messages(&[current], "## Who I Am\n- identity", None).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["content"].as_array().unwrap(), &[human]);
+        assert_eq!(count_marker(&out, NEUROGRAPH_SURFACED_MARKER), 1);
+    }
 
-        for index in 0..messages.len() {
-            if indices.contains(&index) {
-                if message_text(&messages[index]["content"]).is_empty() {
-                    assert_eq!(faux[index], messages[index]);
-                    assert_eq!(pith[index], messages[index]);
-                } else {
-                    assert_ne!(faux[index], messages[index]);
-                    assert_ne!(pith[index], messages[index]);
-                }
-            } else {
-                assert_eq!(faux[index], messages[index]);
-                assert_eq!(pith[index], messages[index]);
+    #[test]
+    fn mixed_tool_result_and_surface_keep_tool_block_exact() {
+        let human = json!({"role": "user", "content": INCIDENT_TASK});
+        let use_message = json!({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tool-live", "name": "Read", "input": {"file_path": "x"}}]
+        });
+        let result = json!({"type": "tool_result", "tool_use_id": "tool-live", "content": "exact output", "is_error": false});
+        let delivery = json!({
+            "role": "user",
+            "content": [
+                result.clone(),
+                {"type": "text", "text": format!("{NEUROGRAPH_SURFACED_MARKER}\nold noise")}
+            ]
+        });
+        let out = compose_provider_messages(
+            &[human.clone(), use_message.clone(), delivery],
+            "## Who I Am\n- identity",
+            None,
+        )
+        .unwrap();
+        assert_eq!(out[1], human);
+        assert_eq!(out[2], use_message);
+        assert_eq!(out[3]["content"].as_array().unwrap(), &[result]);
+    }
+
+    #[test]
+    fn event_prefixed_surface_wrappers_are_removed_but_quotes_are_not() {
+        for event in ["UserPromptSubmit", "PreToolUse", "SessionStart"] {
+            let wrapped = format!(
+                "<system-reminder>\n{event} hook additional context: {NEUROGRAPH_SURFACED_MARKER}\nold\n</system-reminder>"
+            );
+            assert!(is_standalone_neurograph_surface_text(&wrapped));
+        }
+        let quote = format!("Human quotation before {NEUROGRAPH_SURFACED_MARKER} must remain");
+        assert!(!is_standalone_neurograph_surface_text(&quote));
+        let messages = vec![
+            json!({"role": "user", "content": INCIDENT_TASK}),
+            json!({"role": "user", "content": quote}),
+        ];
+        assert_eq!(
+            apply_provider_result(
+                &messages,
+                GateDecision::Compress,
+                Some("## Who I Am\n- identity"),
+                None,
+            ),
+            messages,
+            "an inseparable marker quote must fail open"
+        );
+    }
+
+    #[test]
+    fn meta_and_compact_clutter_leave_l1_but_tool_metadata_fails_open() {
+        let human = json!({"role": "user", "content": INCIDENT_TASK});
+        let meta = json!({"role": "user", "isMeta": true, "content": "stale harness data"});
+        let compact =
+            json!({"role": "user", "isCompactSummary": true, "content": "old L3 summary"});
+        let out = compose_provider_messages(
+            &[human.clone(), meta, compact],
+            "## Who I Am\n- identity",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                json!({"role": "user", "content": format!("{NEUROGRAPH_SURFACED_MARKER}\n\n## Who I Am\n- identity")}),
+                human.clone(),
+            ]
+        );
+
+        let suspicious = json!({
+            "role": "user",
+            "isMeta": true,
+            "content": [{"type": "tool_result", "tool_use_id": "live", "content": "result"}]
+        });
+        let original = vec![human, suspicious];
+        assert_eq!(
+            apply_provider_result(
+                &original,
+                GateDecision::Compress,
+                Some("## Who I Am\n- identity"),
+                None,
+            ),
+            original
+        );
+    }
+
+    #[test]
+    fn long_tool_turn_is_bounded_pair_complete_and_exact() {
+        let original = current_turn_with_tool_pairs(50, true);
+        let out = compose_provider_messages(
+            &original,
+            "## Who I Am\n- identity\n\n## Learned Situation\n- current",
+            None,
+        )
+        .unwrap();
+        // Surface + exact human + five complete recent pairs.
+        assert_eq!(out.len(), 12);
+        assert_eq!(out[1], original[0]);
+        assert_eq!(&out[2..], &original[original.len() - KISS_RECENT_WINDOW..]);
+        for msg in &out {
+            for result_id in tool_ids(msg, "tool_result", "tool_use_id") {
+                assert!(out.iter().any(|candidate| {
+                    tool_ids(candidate, "tool_use", "id")
+                        .iter()
+                        .any(|use_id| use_id == &result_id)
+                }));
             }
         }
+    }
+
+    #[test]
+    fn tool_tail_byte_budget_admits_whole_pairs_only() {
+        let mut original = vec![json!({"role": "user", "content": INCIDENT_TASK})];
+        let large_result = "x".repeat(20_000);
+        for i in 0..20 {
+            original.push(json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": format!("big-{i}"), "name": "Read", "input": {}}]
+            }));
+            original.push(json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": format!("big-{i}"), "content": large_result.clone()}]
+            }));
+        }
+        let out = compose_provider_messages(&original, "## Who I Am\n- identity", None).unwrap();
+        let exact_tail = &out[2..];
+        assert!(serialized_messages_bytes(exact_tail) <= DEFAULT_PITH_TOOL_TAIL_BYTES);
+        assert_eq!(exact_tail.len() % 2, 0);
+        for msg in exact_tail {
+            for result_id in tool_ids(msg, "tool_result", "tool_use_id") {
+                assert!(exact_tail.iter().any(|candidate| {
+                    tool_ids(candidate, "tool_use", "id").contains(&result_id)
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_pairs_reduce_to_newest_indivisible_pair() {
+        let mut original = vec![json!({"role": "user", "content": INCIDENT_TASK})];
+        let oversized = "z".repeat(DEFAULT_PITH_TOOL_TAIL_BYTES + 1024);
+        for i in 0..8 {
+            original.push(json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": format!("huge-{i}"), "name": "Read", "input": {}}]
+            }));
+            original.push(json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": format!("huge-{i}"), "content": oversized.clone()}]
+            }));
+        }
+        let out = compose_provider_messages(&original, "## Who I Am\n- identity", None).unwrap();
+        assert_eq!(out.len(), 4, "surface + human + newest whole pair");
+        assert_eq!(&out[2..], &original[original.len() - 2..]);
+        assert!(serialized_messages_bytes(&out[2..]) > DEFAULT_PITH_TOOL_TAIL_BYTES);
+    }
+
+    #[test]
+    fn provider_socket_request_contains_cues_and_no_history() {
+        let request = provider_context_request(INCIDENT_TASK, "current Quest focus");
+        assert_eq!(request["event"], "provider_context");
+        assert_eq!(request["data"]["current_instruction"], INCIDENT_TASK);
+        assert_eq!(request["data"]["quest_focus"], "current Quest focus");
+        assert!(request.get("messages").is_none());
+        assert!(request["data"].get("turns").is_none());
+        assert!(request["data"].get("history").is_none());
+    }
+
+    #[test]
+    fn provider_response_contract_rejects_every_unavailable_shape() {
+        let valid = json!({
+            "ok": true,
+            "state": "empty",
+            "context": "## Who I Am\n- identity",
+            "source": "cc_neurograph_topology",
+            "coherence": "empty",
+            "anchors": [],
+            "warnings": ["topology_empty"],
+            "assemblies": 0
+        });
+        assert_eq!(
+            parse_provider_response(&serde_json::to_vec(&valid).unwrap()),
+            Some("## Who I Am\n- identity".to_string())
+        );
+        let populated = json!({
+            "ok": true,
+            "state": "ok",
+            "context": "## Who I Am\n- identity\n\n## Learned Situation\n- connected",
+            "source": "cc_neurograph_topology",
+            "coherence": "shared",
+            "anchors": ["commit:abc123"],
+            "warnings": ["coherence_unknown"],
+            "assemblies": 1
+        });
+        assert!(parse_provider_response(&serde_json::to_vec(&populated).unwrap()).is_some());
+        for invalid in [
+            json!({"ok": false, "state": "unavailable", "context": "status", "source": "cc_neurograph_topology", "coherence": "unavailable", "anchors": [], "warnings": ["ng_unavailable"], "assemblies": 0}),
+            json!({"ok": true, "state": "other", "context": "context", "source": "cc_neurograph_topology", "coherence": "empty", "anchors": [], "warnings": [], "assemblies": 0}),
+            json!({"ok": true, "state": "ok", "context": "", "source": "cc_neurograph_topology", "coherence": "shared", "anchors": [], "warnings": [], "assemblies": 1}),
+            json!({"ok": true, "state": "ok", "context": "context", "source": "database", "coherence": "shared", "anchors": [], "warnings": [], "assemblies": 1}),
+            json!({"ok": true, "state": "ok", "context": "context", "source": "cc_neurograph_topology", "coherence": "shared", "anchors": [], "warnings": []}),
+            json!({"ok": true, "state": "ok", "context": "context", "source": "cc_neurograph_topology", "coherence": 7, "anchors": [], "warnings": [], "assemblies": 1}),
+            json!({"ok": true, "state": "ok", "context": "context", "source": "cc_neurograph_topology", "coherence": "shared", "anchors": "path", "warnings": [], "assemblies": 1}),
+            json!({"ok": true, "state": "ok", "context": "context", "source": "cc_neurograph_topology", "coherence": "shared", "anchors": [], "warnings": [4], "assemblies": 1}),
+            json!({"ok": true, "state": "empty", "context": "context", "source": "cc_neurograph_topology", "coherence": "empty", "anchors": [], "warnings": [], "assemblies": 1}),
+            json!({"ok": true, "state": "ok", "context": "context", "source": "cc_neurograph_topology", "coherence": "shared", "anchors": [], "warnings": [], "assemblies": -1}),
+        ] {
+            assert_eq!(
+                parse_provider_response(&serde_json::to_vec(&invalid).unwrap()),
+                None
+            );
+        }
+        assert_eq!(parse_provider_response(b"not json"), None);
+    }
+
+    #[test]
+    fn every_provider_failure_preserves_original_without_faux_keyframes() {
+        let original = current_turn_with_tool_pairs(8, false);
+        for failed in [
+            None,
+            Some(""),
+            Some(NEUROGRAPH_SURFACED_MARKER),
+            Some(QUEST_TRACKER_BANNER),
+        ] {
+            assert_eq!(
+                apply_provider_result(&original, GateDecision::Compress, failed, None),
+                original,
+            );
+        }
+        assert!(serde_json::to_string(&original)
+            .unwrap()
+            .contains(INCIDENT_TASK));
+        assert!(!serde_json::to_string(&original).unwrap().contains('…'));
+    }
+
+    #[test]
+    fn successful_pith_never_replays_history_on_warmup_or_gop() {
+        let mut original = conversation(&["one", "two", "three", INCIDENT_TASK]);
+        for i in 0..12 {
+            original.push(json!({"role": "assistant", "content": format!("obsolete history {i}")}));
+        }
+        for legacy_decision in [GateDecision::FullPass, GateDecision::Compress] {
+            let out = apply_provider_result(
+                &original,
+                legacy_decision,
+                Some("## Who I Am\n- identity\n\n## Learned Situation\n- fresh"),
+                None,
+            );
+            assert_eq!(out[1]["content"], INCIDENT_TASK);
+            assert!(!serde_json::to_string(&out)
+                .unwrap()
+                .contains("obsolete history 0"));
+        }
+    }
+
+    #[test]
+    fn composing_messages_cannot_change_model_system_or_tools() {
+        let original = json!({
+            "model": "any-provider-model",
+            "system": [{"type": "text", "text": "static system"}],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old reply"},
+                {"role": "user", "content": INCIDENT_TASK}
+            ]
+        });
+        let mut rewritten = original.clone();
+        rewritten["messages"] = Value::Array(
+            compose_provider_messages(
+                original["messages"].as_array().unwrap(),
+                "## Who I Am\n- model-neutral identity",
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(rewritten["model"], original["model"]);
+        assert_eq!(rewritten["system"], original["system"]);
+        assert_eq!(rewritten["tools"], original["tools"]);
+        assert!(!serde_json::to_string(&rewritten["messages"])
+            .unwrap()
+            .contains("old reply"));
     }
 
     #[test]
