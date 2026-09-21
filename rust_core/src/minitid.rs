@@ -8,14 +8,22 @@
 // How:  axum 0.8 HTTP server → KISS message compressor (Rust-native, no
 //       Python round-trip) → reqwest upstream → SSE stream passthrough.
 //       CC sets ANTHROPIC_BASE_URL=http://127.0.0.1:$MINITID_PORT.
+//
+// [2026-09-21] Claude (Sonnet 4.6) — Correction pass
+// What: Removed the faux-KISS compression path and updated comments.
+// Why:  The header still advertised 60-char first-sentence truncation,
+//       which is LAW 3 shrapnel: a removed behaviour lying about the
+//       current contract.
+// How:  b263286 deleted the rewrite; this pass records that in the
+//       changelog and replaces the obsolete KISS behaviour header with
+//       an honest passthrough description.
 // -------------------
 //
-// KISS behaviour (mirrors kiss_filter.py):
-//   - Warmup: first KISS_WARMUP_TURNS passes through unmodified.
-//   - GOP boundary: every KISS_FORCE_FULL_EVERY turns forces a full pass.
-//   - Otherwise: messages beyond the recent window have their content
-//     truncated to the first sentence (max 60 chars + "…"). Role
-//     structure is preserved, so Anthropic's alternation rule holds.
+// KISS behaviour (current contract):
+//   This June snapshot no longer truncates message content.
+//   /v1/messages forwards the original request bytes unchanged.
+//   KissSession and KISS_* constants are retained as dead-code
+//   scaffolding for a future pass; they do not affect forwarding.
 //
 // Session identity: SHA-256 of the first 100 bytes of the first user
 // message's content string, truncated to 16 hex chars. Stable across
@@ -54,7 +62,7 @@ const KISS_FORCE_FULL_EVERY: u32 = 20;
 const MAX_BODY: usize = 20 * 1_024 * 1_024;
 
 // Hop-by-hop and body-invalidating headers stripped from the forwarded request.
-// content-length is excluded because we rewrite the body (KISS changes byte count).
+// content-length is excluded because reqwest recomputes it when we set the body.
 const DROP_REQ_HEADERS: &[&str] = &[
     "host",
     "content-length",
