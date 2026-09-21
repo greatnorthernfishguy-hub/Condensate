@@ -19,7 +19,20 @@
 // How:  blocking UnixStream on spawn_blocking + tokio timeout (async runtime
 //       never stalls); JSON newline frames; splice preserves tool_use/
 //       tool_result; fail-soft → inline faux compression on any daemon failure.
-//       Default OFF (unchanged apply_kiss); socket via MINITID_PENINSULA_SOCK.
+//       Default OFF (honest passthrough); socket via MINITID_PENINSULA_SOCK.
+// [2026-09-21] OpenCode (kimi-k2.7-code) — delete faux `apply_kiss`
+// What: remove compress_content, compress_message_content, compression_indices,
+//       apply_faux_at_indices, apply_kiss, and all tests that asserted the
+//       60-char first-sentence truncation as desired behavior.
+// Why:  Lane 4 of kiss-pith-zone-20260920. Real KISS lives in cc_ng_organism.py;
+//       the Rust proxy's faux stopgap was a misnamed, shittier Pith job. Honest
+//       passthrough (forward the request byte-for-byte) is the correct fallback
+//       when the peninsula is off or unavailable.
+// How:  Introduce rewrite_request_body(); return None for peninsula-off so the
+//       caller forwards the original body_bytes unchanged. Keep gate_decision_for_body
+//       and KISS_RECENT_WINDOW untouched (the latter is still used by Pith's
+//       bounded_current_episode). KISS_RECENT_WINDOW was NOT deleted because it
+//       has a live Pith caller outside the faux-KISS set.
 // [2026-09-12] Codex (GPT-5.6 Sol) — Preserve the live human instruction
 // What: Exclude the latest genuine user message, as a complete Value, from
 //       both faux-KISS and Pith history compression; use the same genuine-user
@@ -61,12 +74,12 @@
 //       history only after a valid fresh response, and fail open unchanged.
 // -------------------
 //
-// KISS behaviour (mirrors kiss_filter.py):
+// Cadence behaviour (input-side gating, mirrors cc_ng_organism.py KISS):
 //   - Warmup: first KISS_WARMUP_TURNS passes through unmodified.
 //   - GOP boundary: every KISS_FORCE_FULL_EVERY turns forces a full pass.
-//   - Otherwise: messages beyond the recent window have their content
-//     truncated to the first sentence (max 60 chars + "…"). Role
-//     structure is preserved, so Anthropic's alternation rule holds.
+//   - The proxy itself no longer truncates message content. When the Pith
+//     peninsula is enabled, composition happens via the daemon; when it is
+//     off or unavailable, the request is forwarded byte-for-byte.
 //
 // Session identity: SHA-256 of metadata.user_id.session_id, optionally
 // partitioned by a bounded x-claude-code-agent-id. Missing or malformed
@@ -410,107 +423,6 @@ fn gate_decision_for_body(
     }
     let key = session_key(body, headers)?;
     decision_for_request(key, messages, sessions)
-}
-
-/// Compress a single message's content to first sentence, max 60 chars + "…".
-/// Matches the KISSFilter summary_parts logic from kiss_filter.py.
-fn compress_content(s: &str) -> String {
-    let trimmed = s.trim();
-    // First sentence = text before the first '.'
-    let sentence = trimmed.split('.').next().unwrap_or(trimmed);
-    if trimmed.len() <= 60 {
-        trimmed.to_string()
-    } else {
-        let cut = sentence
-            .char_indices()
-            .take(60)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(60.min(sentence.len()));
-        format!("{}…", &sentence[..cut])
-    }
-}
-
-/// Compress a message's `content` value, handling BOTH the bare-string form
-/// and the Anthropic block-array form that Claude Code always sends.
-///
-/// - String: compressed in place.
-/// - Array: only `text` blocks are compressed; `tool_use` / `tool_result`
-///   and any other block type are preserved verbatim (compressing them would
-///   destroy tool-call pairing and break the request).
-///
-/// Guard: a block/string is only replaced when the compressed result is
-/// non-empty. This prevents blanking content (e.g. whitespace-only text →
-/// "") which Anthropic rejects with 400 "content blocks must be non-empty" —
-/// the exact bug that took CC offline 2026-06-23.
-fn compress_message_content(content: &Value) -> Value {
-    match content {
-        Value::String(s) => {
-            let c = compress_content(s);
-            if c.is_empty() {
-                content.clone()
-            } else {
-                Value::String(c)
-            }
-        }
-        Value::Array(blocks) => {
-            let nb: Vec<Value> = blocks
-                .iter()
-                .map(|b| {
-                    if b["type"].as_str() == Some("text") {
-                        if let Some(t) = b["text"].as_str() {
-                            let c = compress_content(t);
-                            if !c.is_empty() {
-                                let mut x = b.clone();
-                                x["text"] = Value::String(c);
-                                return x;
-                            }
-                        }
-                    }
-                    b.clone()
-                })
-                .collect();
-            Value::Array(nb)
-        }
-        // null / number / bool: leave untouched (never produced by the API).
-        _ => content.clone(),
-    }
-}
-
-/// Indices before `compress_before` that may be compressed. The latest
-/// genuine human message is the live instruction for the current top-level
-/// turn; tool-use/result traffic can push it outside the numeric recent window
-/// without making it history.
-fn compression_indices(messages: &[Value], compress_before: usize) -> Vec<usize> {
-    let protected = last_genuine_user_message_index(messages);
-    (0..compress_before)
-        .filter(|i| Some(*i) != protected && !is_compact_summary_message(&messages[*i]))
-        .collect()
-}
-
-/// Apply the in-process faux compressor to exactly the eligible old messages.
-/// Both the normal faux path and the Pith failure fallback use this helper so
-/// daemon availability cannot change current-turn continuity.
-fn apply_faux_at_indices(messages: &[Value], indices: &[usize]) -> Vec<Value> {
-    let mut out = messages.to_vec();
-    for &i in indices {
-        out[i]["content"] = compress_message_content(&messages[i]["content"]);
-    }
-    out
-}
-
-/// Apply KISS to a messages array.  Returns the original slice if this turn
-/// qualifies as a full pass (warmup / GOP boundary), otherwise returns a new
-/// Vec with old-message content compressed.
-fn apply_kiss(messages: &[Value], decision: GateDecision) -> Vec<Value> {
-    let n = messages.len();
-    if decision == GateDecision::FullPass || n <= KISS_RECENT_WINDOW {
-        return messages.to_vec();
-    }
-
-    let compress_before = n - KISS_RECENT_WINDOW;
-    let indices = compression_indices(messages, compress_before);
-    apply_faux_at_indices(messages, &indices)
 }
 
 // ============================================================================
@@ -1118,6 +1030,30 @@ fn reconstruct_assistant_text(sse_bytes: &[u8]) -> String {
     out
 }
 
+/// Rewrite a `/v1/messages` request body when the Pith peninsula is enabled.
+/// Returns `Some(rewritten_bytes)` when the peninsula composes a new context,
+/// or `None` when the peninsula is off or any precondition fails.  `None`
+/// means the caller must forward the original bytes byte-for-byte.
+async fn rewrite_request_body(
+    body_bytes: &[u8],
+    headers: &HeaderMap,
+    sessions: &Mutex<SessionStore>,
+    peninsula_enabled: bool,
+) -> Option<Vec<u8>> {
+    let mut body = serde_json::from_slice::<Value>(body_bytes).ok()?;
+    let arr = body["messages"].as_array().cloned()?;
+    let decision = gate_decision_for_body(&body, headers, sessions)?;
+    if peninsula_enabled {
+        body["messages"] = Value::Array(apply_pith_peninsula(&arr, decision).await);
+        serde_json::to_vec(&body).ok()
+    } else {
+        // Honest passthrough: when the peninsula is off or unavailable the
+        // request goes upstream byte-for-byte rather than applying the faux
+        // KISS truncation.
+        None
+    }
+}
+
 // ── Proxy handler ────────────────────────────────────────────────────────────
 
 async fn proxy(
@@ -1149,30 +1085,14 @@ async fn proxy(
     // cannot consume a human-turn gate decision.
     // Rewrite messages only when Claude supplied stable request identity and a
     // genuine human marker. Every other case fails open without shared state.
+    let peninsula_enabled = std::env::var("MINITID_PITH_PENINSULA")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let body_bytes = if is_messages {
-        let rewritten = 'rewrite: {
-            let Ok(mut body) = serde_json::from_slice::<Value>(&body_bytes) else {
-                break 'rewrite None;
-            };
-            let Some(arr) = body["messages"].as_array().cloned() else {
-                break 'rewrite None;
-            };
-            let Some(decision) = gate_decision_for_body(&body, &headers, &state.sessions) else {
-                break 'rewrite None;
-            };
-            body["messages"] = Value::Array(
-                if std::env::var("MINITID_PITH_PENINSULA")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-                {
-                    apply_pith_peninsula(&arr, decision).await
-                } else {
-                    apply_kiss(&arr, decision)
-                },
-            );
-            break 'rewrite serde_json::to_vec(&body).ok();
-        };
-        rewritten.map(Into::into).unwrap_or(body_bytes)
+        rewrite_request_body(&body_bytes, &headers, &state.sessions, peninsula_enabled)
+            .await
+            .map(Into::into)
+            .unwrap_or(body_bytes)
     } else {
         body_bytes
     };
@@ -1282,10 +1202,9 @@ async fn main() {
 // ── Tests ────────────────────────────────────────────────────────────────────
 // Run: cargo test --features minitid --bin minitid
 //
-// These exercise the KISS transformation directly — no network. They guard
-// the 2026-06-23 regression: array-form content (Claude Code's only form) must
-// have ONLY text blocks compressed; tool_use / tool_result blocks must survive
-// intact; nothing may be blanked to "".
+// These exercise the proxy's request handling and the Pith peninsula directly
+// — no network. Faux KISS truncation has been removed; the honest failure mode
+// is byte-for-byte passthrough when the peninsula is off or unavailable.
 
 #[cfg(test)]
 mod tests {
@@ -1293,10 +1212,6 @@ mod tests {
     use serde_json::json;
 
     const LONG: &str = "This is a deliberately long earlier message that exceeds the sixty character KISS threshold and should be compressed.";
-
-    fn compress_with_faux(messages: &[Value]) -> Vec<Value> {
-        apply_kiss(messages, GateDecision::Compress)
-    }
 
     fn headers(agent_id: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1420,28 +1335,6 @@ mod tests {
     }
 
     #[test]
-    fn current_human_task_survives_tool_growth_in_faux_path() {
-        // One human task + five tool-use/result pairs = 11 entries. Previously
-        // index 0 fell below n-10 and was compressed during the same user turn.
-        let original = current_turn_with_tool_pairs(5, false);
-        assert_eq!(original.len(), 11);
-        let out = compress_with_faux(&original);
-        assert_eq!(out[0], original[0]);
-        assert!(out[0]["content"].as_str().unwrap().contains("PLAN.md"));
-    }
-
-    #[test]
-    fn current_multiblock_human_message_is_preserved_as_whole_value() {
-        let original = current_turn_with_tool_pairs(6, true);
-        let compress_before = original.len() - KISS_RECENT_WINDOW;
-        let indices = compression_indices(&original, compress_before);
-        assert!(!indices.contains(&0));
-        let out = apply_faux_at_indices(&original, &indices);
-        assert_eq!(out[0], original[0]);
-        assert_eq!(out[0]["content"].as_array().unwrap().len(), 2);
-    }
-
-    #[test]
     fn provider_composition_evicts_old_history_and_keeps_live_rails_once() {
         let quest = format!(
             "{QUEST_TRACKER_BANNER} This is what you were working on and why.\n\nCurrent: Slice B"
@@ -1556,135 +1449,6 @@ mod tests {
             )
         });
         assert_eq!(extract_quest_focus(&[ambiguous]), Err(()));
-    }
-
-    #[test]
-    fn newer_human_turn_releases_prior_human_turn_for_compression() {
-        let mut original = vec![
-            json!({"role": "user", "content": INCIDENT_TASK}),
-            json!({"role": "assistant", "content": LONG}),
-            json!({"role": "user", "content": "new genuine instruction that must remain verbatim even after enough later tool traffic pushes it outside the numeric recent window"}),
-        ];
-        for i in 0..6 {
-            original.push(json!({
-                "role": "assistant",
-                "content": [{"type": "tool_use", "id": format!("later_{i}"), "name": "Read", "input": {}}]
-            }));
-            original.push(json!({
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": format!("later_{i}"), "content": "result"}]
-            }));
-        }
-        let indices = compression_indices(&original, original.len() - KISS_RECENT_WINDOW);
-        assert!(indices.contains(&0));
-        assert!(!indices.contains(&2));
-        let out = apply_faux_at_indices(&original, &indices);
-        assert_ne!(out[0], original[0]);
-        assert_eq!(out[2], original[2]);
-    }
-
-    #[test]
-    fn synthetic_user_entries_do_not_steal_current_human_protection() {
-        let mut messages = current_turn_with_tool_pairs(5, false);
-        messages.push(json!({
-            "role": "user",
-            "isMeta": true,
-            "content": "meta"
-        }));
-        messages.push(json!({
-            "role": "user",
-            "isCompactSummary": true,
-            "content": "summary"
-        }));
-        messages.push(json!({
-            "role": "user",
-            "content": "<system-reminder>injected</system-reminder>"
-        }));
-        assert_eq!(last_genuine_user_message_index(&messages), Some(0));
-        let indices = compression_indices(&messages, messages.len() - KISS_RECENT_WINDOW);
-        assert!(!indices.contains(&0));
-    }
-
-    #[test]
-    fn text_blocks_compressed_tool_blocks_preserved() {
-        let original = sample_messages();
-        let out = compress_with_faux(&original);
-
-        // Index 0: text block compressed, tool_result untouched.
-        let blocks0 = out[0]["content"].as_array().expect("array content");
-        assert_eq!(blocks0.len(), 2, "block count must be preserved");
-        let t0 = blocks0[0]["text"].as_str().unwrap();
-        assert!(!t0.is_empty(), "text block must never be blanked");
-        assert!(t0.len() < LONG.len(), "text block should be compressed");
-        assert_eq!(
-            blocks0[1], original[0]["content"][1],
-            "tool_result block must survive verbatim"
-        );
-
-        // Index 1: text block compressed, tool_use untouched (input intact).
-        let blocks1 = out[1]["content"].as_array().unwrap();
-        assert_eq!(
-            blocks1[1], original[1]["content"][1],
-            "tool_use block must survive verbatim"
-        );
-        assert_eq!(blocks1[1]["input"]["command"], "ls -la");
-    }
-
-    #[test]
-    fn recent_window_untouched() {
-        let original = sample_messages();
-        let out = compress_with_faux(&original);
-        // Indices 2..12 are the recent window — byte-identical.
-        for i in 2..original.len() {
-            assert_eq!(
-                out[i], original[i],
-                "recent message {} must be untouched",
-                i
-            );
-        }
-    }
-
-    #[test]
-    fn no_message_is_blanked() {
-        let out = compress_with_faux(&sample_messages());
-        for (i, m) in out.iter().enumerate() {
-            match &m["content"] {
-                Value::String(s) => assert!(!s.is_empty(), "msg {} string blanked", i),
-                Value::Array(blocks) => {
-                    for b in blocks {
-                        if b["type"].as_str() == Some("text") {
-                            assert!(
-                                !b["text"].as_str().unwrap_or("").is_empty(),
-                                "msg {} text block blanked",
-                                i
-                            );
-                        }
-                    }
-                }
-                _ => panic!("unexpected content shape"),
-            }
-        }
-    }
-
-    #[test]
-    fn whitespace_only_text_block_not_blanked() {
-        // A text block that would compress to "" must be left as-is, not blanked.
-        let content = json!([{"type": "text", "text": "   "}]);
-        let out = compress_message_content(&content);
-        assert_eq!(
-            out, content,
-            "whitespace block must be preserved, not blanked"
-        );
-    }
-
-    #[test]
-    fn string_content_still_compresses() {
-        // Back-compat: bare-string content (non-CC clients) still works.
-        let content = Value::String(LONG.to_string());
-        let out = compress_message_content(&content);
-        let s = out.as_str().unwrap();
-        assert!(!s.is_empty());
-        assert!(s.len() < LONG.len());
     }
 
     #[test]
@@ -2150,24 +1914,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_summaries_are_excluded_from_sparse_indices() {
-        let mut messages = vec![
-            json!({"role": "user", "isCompactSummary": true, "content": LONG}),
-            json!({"role": "assistant", "content": LONG}),
-        ];
-        for i in 0..10 {
-            messages.push(json!({"role": "assistant", "content": format!("recent {i}")}));
-        }
-        assert_eq!(compression_indices(&messages, 2), vec![1]);
-
-        messages[0] = json!({
-            "role": "user",
-            "content": format!("{CLAUDE_COMPACTED_PREAMBLE}Summary: retained context")
-        });
-        assert_eq!(compression_indices(&messages, 2), vec![1]);
-    }
-
-    #[test]
     fn current_claude_wire_preamble_is_not_genuine_human_text() {
         let summary = json!({
             "role": "user",
@@ -2482,13 +2228,47 @@ mod tests {
             .contains("old reply"));
     }
 
-    #[test]
-    fn warmup_passes_through_untouched() {
+    #[tokio::test]
+    async fn peninsula_off_passes_messages_through_byte_identical() {
+        // When the Pith peninsula is OFF, the proxy must forward the exact
+        // request bytes unchanged. Computing the gate decision still advances
+        // session cadence, but no rewriting happens.
         let original = sample_messages();
-        let out = apply_kiss(&original, GateDecision::FullPass);
+        let request_body = body("peninsula-off-session", original.clone());
+        let body_bytes = serde_json::to_vec(&request_body).unwrap();
+        let sessions = test_sessions();
+
+        let rewritten = rewrite_request_body(&body_bytes, &headers(None), &sessions, false).await;
         assert_eq!(
-            out[0], original[0],
-            "warmup turn must pass through verbatim"
+            rewritten, None,
+            "peninsula-off must leave the original request bytes untouched"
+        );
+
+        // Gate side effects still happened: first human turn is a FullPass.
+        assert_eq!(
+            gate_decision_for_body(&request_body, &headers(None), &sessions),
+            Some(GateDecision::FullPass)
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_passes_through_untouched() {
+        // During warmup the gate returns FullPass, but the peninsula-off path
+        // must still leave the original request byte-for-byte. Passthrough is
+        // now the universal honest failure mode, not a faux-KISS special case.
+        let original = sample_messages();
+        let request_body = body("warmup-session", original.clone());
+        let body_bytes = serde_json::to_vec(&request_body).unwrap();
+        let sessions = test_sessions();
+
+        let rewritten = rewrite_request_body(&body_bytes, &headers(None), &sessions, false).await;
+        assert_eq!(
+            rewritten, None,
+            "warmup turn must pass through the proxy untouched"
+        );
+        assert_eq!(
+            gate_decision_for_body(&request_body, &headers(None), &sessions),
+            Some(GateDecision::FullPass)
         );
     }
 
