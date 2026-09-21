@@ -135,97 +135,6 @@ fn session_id(messages: &[Value]) -> String {
     hex[..16].to_string()
 }
 
-/// Compress a single message's content to first sentence, max 60 chars + "…".
-/// Matches the KISSFilter summary_parts logic from kiss_filter.py.
-fn compress_content(s: &str) -> String {
-    let trimmed = s.trim();
-    // First sentence = text before the first '.'
-    let sentence = trimmed.split('.').next().unwrap_or(trimmed);
-    if trimmed.len() <= 60 {
-        trimmed.to_string()
-    } else {
-        let cut = sentence.char_indices()
-            .take(60)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(60.min(sentence.len()));
-        format!("{}…", &sentence[..cut])
-    }
-}
-
-/// Compress a message's `content` value, handling BOTH the bare-string form
-/// and the Anthropic block-array form that Claude Code always sends.
-///
-/// - String: compressed in place.
-/// - Array: only `text` blocks are compressed; `tool_use` / `tool_result`
-///   and any other block type are preserved verbatim (compressing them would
-///   destroy tool-call pairing and break the request).
-///
-/// Guard: a block/string is only replaced when the compressed result is
-/// non-empty. This prevents blanking content (e.g. whitespace-only text →
-/// "") which Anthropic rejects with 400 "content blocks must be non-empty" —
-/// the exact bug that took CC offline 2026-06-23.
-fn compress_message_content(content: &Value) -> Value {
-    match content {
-        Value::String(s) => {
-            let c = compress_content(s);
-            if c.is_empty() { content.clone() } else { Value::String(c) }
-        }
-        Value::Array(blocks) => {
-            let nb: Vec<Value> = blocks.iter().map(|b| {
-                if b["type"].as_str() == Some("text") {
-                    if let Some(t) = b["text"].as_str() {
-                        let c = compress_content(t);
-                        if !c.is_empty() {
-                            let mut x = b.clone();
-                            x["text"] = Value::String(c);
-                            return x;
-                        }
-                    }
-                }
-                b.clone()
-            }).collect();
-            Value::Array(nb)
-        }
-        // null / number / bool: leave untouched (never produced by the API).
-        _ => content.clone(),
-    }
-}
-
-/// Apply KISS to a messages array.  Returns the original slice if this turn
-/// qualifies as a full pass (warmup / GOP boundary), otherwise returns a new
-/// Vec with old-message content compressed.
-fn apply_kiss(messages: &[Value], sessions: &Mutex<HashMap<String, KissSession>>) -> Vec<Value> {
-    let n = messages.len();
-    let sid = session_id(messages);
-
-    let full_pass = {
-        let mut map = sessions.lock().unwrap();
-        let s = map.entry(sid).or_insert(KissSession { turn_count: 0, since_full: 0 });
-        s.turn_count  += 1;
-        s.since_full  += 1;
-        let full = s.turn_count <= KISS_WARMUP_TURNS
-                || s.since_full  >= KISS_FORCE_FULL_EVERY;
-        if full { s.since_full = 0; }
-        full
-    };
-
-    if full_pass || n <= KISS_RECENT_WINDOW {
-        return messages.to_vec();
-    }
-
-    let compress_before = n - KISS_RECENT_WINDOW;
-    messages.iter().enumerate().map(|(i, msg)| {
-        if i < compress_before {
-            let mut m = msg.clone();
-            m["content"] = compress_message_content(&msg["content"]);
-            m
-        } else {
-            msg.clone()
-        }
-    }).collect()
-}
-
 // ── Proxy handler ────────────────────────────────────────────────────────────
 
 async fn proxy(
@@ -241,27 +150,13 @@ async fn proxy(
     let is_messages = method == axum::http::Method::POST
         && uri.path() == "/v1/messages";
 
-    // Buffer the request body (needed for KISS rewrite; also needed to forward).
+    // Buffer the request body for forwarding.
     let body_bytes = axum::body::to_bytes(req.into_body(), MAX_BODY)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // Rewrite messages array when applicable.
-    let body_bytes = if is_messages {
-        match serde_json::from_slice::<Value>(&body_bytes) {
-            Ok(mut body) => {
-                if let Some(arr) = body["messages"].as_array().cloned() {
-                    body["messages"] = Value::Array(apply_kiss(&arr, &state.sessions));
-                }
-                serde_json::to_vec(&body)
-                    .unwrap_or_else(|_| body_bytes.to_vec())
-                    .into()
-            }
-            Err(_) => body_bytes,
-        }
-    } else {
-        body_bytes
-    };
+    // This June snapshot no longer rewrites /v1/messages. Honest passthrough
+    // forwards the original bytes unchanged.
 
     // Build upstream URL — read config file live so switching providers
     // takes effect immediately without restarting the service.
@@ -329,122 +224,13 @@ async fn main() {
 // ── Tests ────────────────────────────────────────────────────────────────────
 // Run: cargo test --features minitid --bin minitid
 //
-// These exercise the KISS transformation directly — no network. They guard
-// the 2026-06-23 regression: array-form content (Claude Code's only form) must
-// have ONLY text blocks compressed; tool_use / tool_result blocks must survive
-// intact; nothing may be blanked to "".
+// Faux KISS compression has been removed from this demo snapshot. The only
+// remaining test covers session identity extraction from array-form content.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    const LONG: &str = "This is a deliberately long earlier message that exceeds the sixty character KISS threshold and should be compressed.";
-
-    // Call apply_kiss enough times to clear warmup (3 turns) so the 4th turn
-    // actually compresses. Same messages → same session id → same counter.
-    fn warm_and_apply(messages: &[Value]) -> Vec<Value> {
-        let sessions = Mutex::new(HashMap::new());
-        let mut out = messages.to_vec();
-        for _ in 0..(KISS_WARMUP_TURNS + 1) {
-            out = apply_kiss(messages, &sessions);
-        }
-        out
-    }
-
-    // 12 messages: indices 0,1 fall in the compress range (12 - 10), the rest
-    // are the recent window. Index 0 carries a tool_result, index 1 a tool_use.
-    fn sample_messages() -> Vec<Value> {
-        let mut v = vec![
-            json!({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": LONG},
-                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "important tool output"}
-                ]
-            }),
-            json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": LONG},
-                    {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "ls -la"}}
-                ]
-            }),
-        ];
-        for i in 0..10 {
-            v.push(json!({
-                "role": if i % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("recent message {}", i)
-            }));
-        }
-        v
-    }
-
-    #[test]
-    fn text_blocks_compressed_tool_blocks_preserved() {
-        let original = sample_messages();
-        let out = warm_and_apply(&original);
-
-        // Index 0: text block compressed, tool_result untouched.
-        let blocks0 = out[0]["content"].as_array().expect("array content");
-        assert_eq!(blocks0.len(), 2, "block count must be preserved");
-        let t0 = blocks0[0]["text"].as_str().unwrap();
-        assert!(!t0.is_empty(), "text block must never be blanked");
-        assert!(t0.len() < LONG.len(), "text block should be compressed");
-        assert_eq!(blocks0[1], original[0]["content"][1], "tool_result block must survive verbatim");
-
-        // Index 1: text block compressed, tool_use untouched (input intact).
-        let blocks1 = out[1]["content"].as_array().unwrap();
-        assert_eq!(blocks1[1], original[1]["content"][1], "tool_use block must survive verbatim");
-        assert_eq!(blocks1[1]["input"]["command"], "ls -la");
-    }
-
-    #[test]
-    fn recent_window_untouched() {
-        let original = sample_messages();
-        let out = warm_and_apply(&original);
-        // Indices 2..12 are the recent window — byte-identical.
-        for i in 2..original.len() {
-            assert_eq!(out[i], original[i], "recent message {} must be untouched", i);
-        }
-    }
-
-    #[test]
-    fn no_message_is_blanked() {
-        let out = warm_and_apply(&sample_messages());
-        for (i, m) in out.iter().enumerate() {
-            match &m["content"] {
-                Value::String(s) => assert!(!s.is_empty(), "msg {} string blanked", i),
-                Value::Array(blocks) => {
-                    for b in blocks {
-                        if b["type"].as_str() == Some("text") {
-                            assert!(!b["text"].as_str().unwrap_or("").is_empty(),
-                                "msg {} text block blanked", i);
-                        }
-                    }
-                }
-                _ => panic!("unexpected content shape"),
-            }
-        }
-    }
-
-    #[test]
-    fn whitespace_only_text_block_not_blanked() {
-        // A text block that would compress to "" must be left as-is, not blanked.
-        let content = json!([{"type": "text", "text": "   "}]);
-        let out = compress_message_content(&content);
-        assert_eq!(out, content, "whitespace block must be preserved, not blanked");
-    }
-
-    #[test]
-    fn string_content_still_compresses() {
-        // Back-compat: bare-string content (non-CC clients) still works.
-        let content = Value::String(LONG.to_string());
-        let out = compress_message_content(&content);
-        let s = out.as_str().unwrap();
-        assert!(!s.is_empty());
-        assert!(s.len() < LONG.len());
-    }
 
     #[test]
     fn session_id_handles_array_content() {
@@ -455,14 +241,5 @@ mod tests {
         assert_eq!(id_a.len(), 16);
         assert_ne!(id_a, id_b, "distinct first messages must yield distinct session ids");
         assert_eq!(id_a, session_id(&a), "session id must be stable");
-    }
-
-    #[test]
-    fn warmup_passes_through_untouched() {
-        let original = sample_messages();
-        let sessions = Mutex::new(HashMap::new());
-        // First warmup turn must be a full pass — no compression.
-        let out = apply_kiss(&original, &sessions);
-        assert_eq!(out[0], original[0], "warmup turn must pass through verbatim");
     }
 }
