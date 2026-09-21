@@ -20,19 +20,6 @@
 //       never stalls); JSON newline frames; splice preserves tool_use/
 //       tool_result; fail-soft → inline faux compression on any daemon failure.
 //       Default OFF (honest passthrough); socket via MINITID_PENINSULA_SOCK.
-// [2026-09-21] OpenCode (kimi-k2.7-code) — delete faux `apply_kiss`
-// What: remove compress_content, compress_message_content, compression_indices,
-//       apply_faux_at_indices, apply_kiss, and all tests that asserted the
-//       60-char first-sentence truncation as desired behavior.
-// Why:  Lane 4 of kiss-pith-zone-20260920. Real KISS lives in cc_ng_organism.py;
-//       the Rust proxy's faux stopgap was a misnamed, shittier Pith job. Honest
-//       passthrough (forward the request byte-for-byte) is the correct fallback
-//       when the peninsula is off or unavailable.
-// How:  Introduce rewrite_request_body(); return None for peninsula-off so the
-//       caller forwards the original body_bytes unchanged. Keep gate_decision_for_body
-//       and KISS_RECENT_WINDOW untouched (the latter is still used by Pith's
-//       bounded_current_episode). KISS_RECENT_WINDOW was NOT deleted because it
-//       has a live Pith caller outside the faux-KISS set.
 // [2026-09-12] Codex (GPT-5.6 Sol) — Preserve the live human instruction
 // What: Exclude the latest genuine user message, as a complete Value, from
 //       both faux-KISS and Pith history compression; use the same genuine-user
@@ -72,6 +59,20 @@
 // How:  Extract the already-rendered Quest text from Claude's request (never
 //       Quest storage), cue the existing daemon socket verb, evict obsolete
 //       history only after a valid fresh response, and fail open unchanged.
+//
+// [2026-09-21] OpenCode (kimi-k2.7-code) — delete faux `apply_kiss`
+// What: remove compress_content, compress_message_content, compression_indices,
+//       apply_faux_at_indices, apply_kiss, and all tests that asserted the
+//       60-char first-sentence truncation as desired behavior.
+// Why:  Lane 4 of kiss-pith-zone-20260920. Real KISS lives in cc_ng_organism.py;
+//       the Rust proxy's faux stopgap was a misnamed, shittier Pith job. Honest
+//       passthrough (forward the request byte-for-byte) is the correct fallback
+//       when the peninsula is off or unavailable.
+// How:  Introduce rewrite_request_body(); return None for peninsula-off so the
+//       caller forwards the original body_bytes unchanged. Keep gate_decision_for_body
+//       and KISS_RECENT_WINDOW untouched (the latter is still used by Pith's
+//       bounded_current_episode). KISS_RECENT_WINDOW was NOT deleted because it
+//       has a live Pith caller outside the faux-KISS set.
 // -------------------
 //
 // Cadence behaviour (input-side gating, mirrors cc_ng_organism.py KISS):
@@ -874,10 +875,10 @@ fn apply_provider_result(
         .unwrap_or_else(|| messages.to_vec())
 }
 
-/// The latest genuine user message, extracted from the request body BEFORE
-/// KISS's compression mutates it. Later user-role entries may be tool results
-/// or injected harness context, so this uses the same genuine-user predicate
-/// as current-turn compression protection.
+/// Extract the genuine user message from the original request bytes before any
+/// peninsula rewrite, and deposit from those original bytes. Later user-role
+/// entries may be tool results or injected harness context, so this uses the
+/// same genuine-user predicate as current-turn compression protection.
 /// Harness-injected content delivered as a plain `type: "text"` block inside a
 /// synthetic user-role turn -- background Task-tool completions, system
 /// reminders, and local-command output all arrive this way, not as a
@@ -1068,13 +1069,13 @@ async fn proxy(
 
     let is_messages = method == axum::http::Method::POST && uri.path() == "/v1/messages";
 
-    // Buffer the request body (needed for KISS rewrite; also needed to forward).
+    // Buffer the request body to extract/deposit and to optionally rewrite via the peninsula.
     let body_bytes = axum::body::to_bytes(req.into_body(), MAX_BODY)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // Extract the latest genuine user message BEFORE KISS mutation. Trailing
-    // user-role entries may be tool results or injected harness context.
+    // Extract the latest genuine user message from the original bytes, before any
+    // rewrite. Trailing user-role entries may be tool results or injected harness context.
     let last_user_message = if is_messages {
         extract_last_user_message(&body_bytes)
     } else {
@@ -1211,7 +1212,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const LONG: &str = "This is a deliberately long earlier message that exceeds the sixty character KISS threshold and should be compressed.";
+    const LONG: &str = "This is a deliberately long earlier message used as a long-history string for Pith tests.";
 
     fn headers(agent_id: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
