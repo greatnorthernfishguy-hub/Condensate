@@ -73,14 +73,22 @@
 //       and KISS_RECENT_WINDOW untouched (the latter is still used by Pith's
 //       bounded_current_episode). KISS_RECENT_WINDOW was NOT deleted because it
 //       has a live Pith caller outside the faux-KISS set.
+// [2026-09-22] Chief (OpenCode) — Correct stale cadence comment
+// What: Replace the "Cadence behaviour (input-side gating...)" header so it no
+//       longer claims the Rust proxy performs KISS warmup/GOP gating.
+// Why:  LAW 3 shrapnel: a comment describing behaviour that was removed when
+//       faux apply_kiss was deleted. The proxy is now honest passthrough or
+//       peninsula rewrite; cadence decisions live in cc_ng_organism.py.
+// How:  Rewrote the cadence comment block and kept KISS_WARMUP_TURNS /
+//       KISS_FORCE_FULL_EVERY as dead-code scaffolding for a future pass.
 // -------------------
 //
-// Cadence behaviour (input-side gating, mirrors cc_ng_organism.py KISS):
-//   - Warmup: first KISS_WARMUP_TURNS passes through unmodified.
-//   - GOP boundary: every KISS_FORCE_FULL_EVERY turns forces a full pass.
-//   - The proxy itself no longer truncates message content. When the Pith
-//     peninsula is enabled, composition happens via the daemon; when it is
-//     off or unavailable, the request is forwarded byte-for-byte.
+// Cadence behaviour:
+//   This binary no longer performs input-side KISS cadence gating.
+//   Warmup, GOP boundary, and full-pass decisions live in cc_ng_organism.py.
+//   The proxy either forwards the request bytes unchanged or, when the Pith
+//   peninsula is enabled and available, rewrites the body via the daemon.
+//   It never truncates message content itself.
 //
 // Session identity: SHA-256 of metadata.user_id.session_id, optionally
 // partitioned by a bounded x-claude-code-agent-id. Missing or malformed
