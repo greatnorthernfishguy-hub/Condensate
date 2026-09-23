@@ -81,14 +81,47 @@
 //       peninsula rewrite; cadence decisions live in cc_ng_organism.py.
 // How:  Rewrote the cadence comment block and kept KISS_WARMUP_TURNS /
 //       KISS_FORCE_FULL_EVERY as dead-code scaffolding for a future pass.
+// SUPERSEDED 2026-09-23 (zone manager, kiss-pith-to-spec-20260923, law-enforcer
+//   review before an unrelated fast-forward merge to master) — this entry's own
+//   "How" was itself wrong, kept for history, not guidance; see the entry below.
+// [2026-09-23] zone manager (kiss-pith-to-spec-20260923) — correct the correction
+// What: fix two false claims the 2026-09-22 comment introduced. (1) It called
+//       KISS_WARMUP_TURNS/KISS_FORCE_FULL_EVERY "dead-code scaffolding" — they
+//       are read on every /v1/messages request via decision_for_request()
+//       (:409), which mutates live per-session state (turn_count, since_full).
+//       (2) It attributed warmup/GOP/full-pass decisions to cc_ng_organism.py —
+//       grepped that file on NeuroGraph main (f322bad): no warmup/GOP/cadence
+//       logic exists there. Its KISS is the input-boundary redundancy gate
+//       (:1430-1561), a different mechanism entirely.
+// Why:  LAW 4 (fix interface/contract mismatches at the source) — a comment
+//       correcting stale shrapnel that is itself factually wrong is still
+//       shrapnel. Caught by neurograph-law-enforcer review before this zone's
+//       unrelated fast-forward of this commit onto master (kiss-pith-to-spec-
+//       20260923 build order item: Contested §5, Executive Packet 068).
+// How:  The constants ARE still computed live (decision_for_request, :371-414,
+//       returns a GateDecision); the computed decision is what's unused —
+//       apply_provider_result's `_decision: GateDecision` parameter (:876)
+//       discards it. gate_decision_for_body (:421) still separately gates
+//       *whether the peninsula rewrite runs at all* (session identity +
+//       compaction-request bypass) — that gating is real and live, distinct
+//       from the discarded warmup/GOP value. No file currently applies
+//       cadence-based compression; that removed cc_ng_organism.py attribution
+//       is not replaced with a new one because none exists. Whether to wire
+//       the computed decision to something or delete the computation entirely
+//       is an open design call, not resolved by this comment fix.
 // -------------------
 //
 // Cadence behaviour:
-//   This binary no longer performs input-side KISS cadence gating.
-//   Warmup, GOP boundary, and full-pass decisions live in cc_ng_organism.py.
-//   The proxy either forwards the request bytes unchanged or, when the Pith
-//   peninsula is enabled and available, rewrites the body via the daemon.
-//   It never truncates message content itself.
+//   This binary computes a per-session warmup/GOP decision on every request
+//   (decision_for_request: turn_count vs KISS_WARMUP_TURNS, since_full vs
+//   KISS_FORCE_FULL_EVERY) but nothing currently acts on the result — it is
+//   passed to apply_provider_result() and discarded there. Separately,
+//   gate_decision_for_body() gates whether the peninsula rewrite path runs at
+//   all (session identity + a compaction-request bypass); that gating is
+//   live and does matter. The proxy either forwards the request bytes
+//   unchanged (peninsula off) or, when the peninsula is enabled and
+//   available, rewrites the body via the daemon. It never truncates message
+//   content itself.
 //
 // Session identity: SHA-256 of metadata.user_id.session_id, optionally
 // partitioned by a bounded x-claude-code-agent-id. Missing or malformed
