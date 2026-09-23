@@ -108,15 +108,37 @@
 //       cadence-based compression; that removed cc_ng_organism.py attribution
 //       is not replaced with a new one because none exists. Whether to wire
 //       the computed decision to something or delete the computation entirely
-//       is an open design call, not resolved by this comment fix.
+//       is an open design call, not resolved by this comment fix (punchlisted:
+//       docs/punchlist/open/condensate.md #481).
+// [2026-09-23] zone manager (kiss-pith-to-spec-20260923) — env-var-ify the
+//   cadence thresholds (Contested item 5, Executive Packet 068 ruling)
+// What: KISS_WARMUP_TURNS/KISS_FORCE_FULL_EVERY became
+//       DEFAULT_KISS_WARMUP_TURNS/DEFAULT_KISS_FORCE_FULL_EVERY, read through
+//       new kiss_warmup_turns()/kiss_force_full_every() accessors that honor
+//       MINITID_KISS_WARMUP_TURNS/MINITID_KISS_FORCE_FULL_EVERY (clamped,
+//       same configured_*(Option<&str>) pattern as session_capacity/
+//       pith_tool_tail_bytes above).
+// Why:  LAW 5 — hardcoded values that belong in environment variables. The
+//       "dead scaffolding" half of item 5's ruling was ruled out first: these
+//       constants are read live every request (see the 2026-09-23 entry
+//       above), so removal was never valid; env var was the only remaining
+//       option.
+// How:  decision_for_request's threshold comparison now calls the accessors
+//       instead of the bare constants; existing tests keep asserting default
+//       behavior against the renamed DEFAULT_* constants directly (still
+//       exercises the real accessor path via gate_decision_for_body — this
+//       is not env-isolation, just keeping fixture math legible), plus new
+//       configured_kiss_warmup_turns/configured_kiss_force_full_every tests
+//       mirroring configured_session_capacity_is_finitely_clamped.
 // -------------------
 //
 // Cadence behaviour:
 //   This binary computes a per-session warmup/GOP decision on every request
-//   (decision_for_request: turn_count vs KISS_WARMUP_TURNS, since_full vs
-//   KISS_FORCE_FULL_EVERY) but nothing currently acts on the result — it is
-//   passed to apply_provider_result() and discarded there. Separately,
-//   gate_decision_for_body() gates whether the peninsula rewrite path runs at
+//   (decision_for_request: turn_count vs kiss_warmup_turns(), since_full vs
+//   kiss_force_full_every() — both env-overridable, LAW 5) but nothing
+//   currently acts on the result — it is passed to apply_provider_result()
+//   and discarded there. Separately, gate_decision_for_body() gates whether
+//   the peninsula rewrite path runs at
 //   all (session identity + a compaction-request bypass); that gating is
 //   live and does matter. The proxy either forwards the request bytes
 //   unchanged (peninsula off) or, when the peninsula is enabled and
@@ -176,11 +198,15 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
-// ── KISS constants (env-overridable in a future pass) ──────────────────────
+// ── KISS constants ───────────────────────────────────────────────────────
 const DEFAULT_PORT: u16 = 9090;
 const KISS_RECENT_WINDOW: usize = 10;
-const KISS_WARMUP_TURNS: u32 = 3;
-const KISS_FORCE_FULL_EVERY: u32 = 20;
+const DEFAULT_KISS_WARMUP_TURNS: u32 = 3;
+const MIN_KISS_WARMUP_TURNS: u32 = 0;
+const MAX_KISS_WARMUP_TURNS: u32 = 100;
+const DEFAULT_KISS_FORCE_FULL_EVERY: u32 = 20;
+const MIN_KISS_FORCE_FULL_EVERY: u32 = 1;
+const MAX_KISS_FORCE_FULL_EVERY: u32 = 1_000;
 const DEFAULT_SESSION_CAPACITY: usize = 4_096;
 const MIN_SESSION_CAPACITY: usize = 16;
 const MAX_SESSION_CAPACITY: usize = 65_536;
@@ -292,6 +318,28 @@ fn configured_session_capacity(value: Option<&str>) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .map(|capacity| capacity.clamp(MIN_SESSION_CAPACITY, MAX_SESSION_CAPACITY))
         .unwrap_or(DEFAULT_SESSION_CAPACITY)
+}
+
+fn kiss_warmup_turns() -> u32 {
+    configured_kiss_warmup_turns(env::var("MINITID_KISS_WARMUP_TURNS").ok().as_deref())
+}
+
+fn configured_kiss_warmup_turns(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|turns| turns.clamp(MIN_KISS_WARMUP_TURNS, MAX_KISS_WARMUP_TURNS))
+        .unwrap_or(DEFAULT_KISS_WARMUP_TURNS)
+}
+
+fn kiss_force_full_every() -> u32 {
+    configured_kiss_force_full_every(env::var("MINITID_KISS_FORCE_FULL_EVERY").ok().as_deref())
+}
+
+fn configured_kiss_force_full_every(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|turns| turns.clamp(MIN_KISS_FORCE_FULL_EVERY, MAX_KISS_FORCE_FULL_EVERY))
+        .unwrap_or(DEFAULT_KISS_FORCE_FULL_EVERY)
 }
 
 fn pith_tool_tail_bytes() -> usize {
@@ -439,7 +487,7 @@ fn decision_for_request(
     session.turn_count += 1;
     session.since_full += 1;
     let full =
-        session.turn_count <= KISS_WARMUP_TURNS || session.since_full >= KISS_FORCE_FULL_EVERY;
+        session.turn_count <= kiss_warmup_turns() || session.since_full >= kiss_force_full_every();
     if full {
         session.since_full = 0;
     }
@@ -1558,6 +1606,45 @@ mod tests {
     }
 
     #[test]
+    fn configured_kiss_warmup_turns_defaults_and_clamps() {
+        assert_eq!(configured_kiss_warmup_turns(None), DEFAULT_KISS_WARMUP_TURNS);
+        assert_eq!(
+            configured_kiss_warmup_turns(Some("invalid")),
+            DEFAULT_KISS_WARMUP_TURNS
+        );
+        assert_eq!(
+            configured_kiss_warmup_turns(Some("0")),
+            MIN_KISS_WARMUP_TURNS
+        );
+        assert_eq!(configured_kiss_warmup_turns(Some("7")), 7);
+        assert_eq!(
+            configured_kiss_warmup_turns(Some("999999999")),
+            MAX_KISS_WARMUP_TURNS
+        );
+    }
+
+    #[test]
+    fn configured_kiss_force_full_every_defaults_and_clamps() {
+        assert_eq!(
+            configured_kiss_force_full_every(None),
+            DEFAULT_KISS_FORCE_FULL_EVERY
+        );
+        assert_eq!(
+            configured_kiss_force_full_every(Some("invalid")),
+            DEFAULT_KISS_FORCE_FULL_EVERY
+        );
+        assert_eq!(
+            configured_kiss_force_full_every(Some("0")),
+            MIN_KISS_FORCE_FULL_EVERY
+        );
+        assert_eq!(configured_kiss_force_full_every(Some("50")), 50);
+        assert_eq!(
+            configured_kiss_force_full_every(Some("999999999")),
+            MAX_KISS_FORCE_FULL_EVERY
+        );
+    }
+
+    #[test]
     fn configured_pith_tool_tail_bytes_defaults_and_clamps() {
         assert_eq!(
             configured_pith_tool_tail_bytes(None),
@@ -1727,7 +1814,7 @@ mod tests {
     #[test]
     fn force_full_cadence_counts_human_turns() {
         let sessions = test_sessions();
-        let human_turns: Vec<String> = (1..=KISS_WARMUP_TURNS + KISS_FORCE_FULL_EVERY)
+        let human_turns: Vec<String> = (1..=DEFAULT_KISS_WARMUP_TURNS + DEFAULT_KISS_FORCE_FULL_EVERY)
             .map(|n| format!("turn {n}"))
             .collect();
         for index in 0..human_turns.len() {
@@ -1736,7 +1823,7 @@ mod tests {
             let decision = gate_decision_for_body(&request, &headers(None), &sessions).unwrap();
             if index + 1 == human_turns.len() {
                 assert_eq!(decision, GateDecision::FullPass);
-            } else if index >= KISS_WARMUP_TURNS as usize {
+            } else if index >= DEFAULT_KISS_WARMUP_TURNS as usize {
                 assert_eq!(decision, GateDecision::Compress);
             }
         }
