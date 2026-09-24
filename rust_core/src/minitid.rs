@@ -130,6 +130,36 @@
 //       is not env-isolation, just keeping fixture math legible), plus new
 //       configured_kiss_warmup_turns/configured_kiss_force_full_every tests
 //       mirroring configured_session_capacity_is_finitely_clamped.
+// [2026-09-23] zone manager (kiss-pith-to-spec-20260923) — close the
+//   daemon-absent test gap on the peninsula compose path (Executive Packet
+//   090/068(1) readiness bar: tests green ahead of live activation)
+// What: extracted peninsula_sock_path() out of daemon_provider_context() and
+//       threaded the socket path as a parameter through apply_pith_peninsula()
+//       and daemon_provider_context(). peninsula_sock_path() itself mirrors
+//       cc_gateway_tract_path()'s shape (own env read, own default, called at
+//       its one production site) rather than the file's separate
+//       configured_*(Option<&str>) injection pattern -- both follow the same
+//       env-source-of-truth principle (LAW 6, no new pattern), just via two
+//       different existing shapes already in the file. Added two tests
+//       exercising the exact condition observed
+//       live on the running instance today (MINITID_PITH_PENINSULA=1,
+//       daemon.sock absent): peninsula_on_with_daemon_absent_fails_open_byte_
+//       identical (full apply_pith_peninsula path) and
+//       daemon_provider_context_returns_none_when_socket_absent (socket layer
+//       in isolation).
+// Why:  requirements-trace-001.md's live-state snapshot documents this exact
+//       passthrough condition as PITH-16's current status, but no test in this
+//       file exercised peninsula_enabled=true at all — every rewrite_request_
+//       body test used false. A behavior this central to the zone's build
+//       order (PITH-16 is the org's declared next build item, Packet 090)
+//       had no regression guard for its own documented current state.
+// How:  Chose parameter injection over std::env::set_var in tests to avoid
+//       mutating process-global state (the file's own configured_*() split
+//       exists for the same reason); did not thread a sock parameter through
+//       rewrite_request_body() itself since its only production caller already
+//       resolves the real path via peninsula_sock_path() and a third test at
+//       that level would only re-test a one-line delegation. cargo test:
+//       57 passed, 0 failed (was 55).
 // -------------------
 //
 // Cadence behaviour:
@@ -522,17 +552,28 @@ fn gate_decision_for_body(
 // leaves the original request untouched.
 // ============================================================================
 
+/// Read MINITID_PENINSULA_SOCK (LAW 5), falling back to the default daemon
+/// socket path under $HOME. Mirrors cc_gateway_tract_path()'s shape: its own
+/// env read, its own default, called directly at its one production use site
+/// -- not the file's separate configured_*(Option<&str>) injection pattern,
+/// just the same env-source-of-truth principle (LAW 6). Split out as its own
+/// function so tests can inject an absent path directly instead of mutating
+/// process-global env state.
+fn peninsula_sock_path() -> String {
+    std::env::var("MINITID_PENINSULA_SOCK").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/josh".into());
+        format!("{}/.claude/plugins/neurograph/daemon.sock", home)
+    })
+}
+
 /// Call the CC daemon's read-only `provider_context` handler.  The request
 /// carries only attention cues already present in this request; it never sends
 /// transcript history.  Accept only the producer's closed fresh states.
 async fn daemon_provider_context(
     current_instruction: String,
     quest_focus: String,
+    sock: String,
 ) -> Option<String> {
-    let sock = std::env::var("MINITID_PENINSULA_SOCK").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/josh".into());
-        format!("{}/.claude/plugins/neurograph/daemon.sock", home)
-    });
     let fut = tokio::task::spawn_blocking(move || -> Option<String> {
         let mut stream = UnixStream::connect(&sock).ok()?;
         let t = std::time::Duration::from_millis(1500);
@@ -938,15 +979,23 @@ fn compose_provider_messages(
 /// Build fresh context on every Pith-enabled provider request.  Warmup and GOP
 /// cadence never restore raw history.  The old request survives byte-for-byte
 /// whenever the daemon or composition boundary is unavailable.
-async fn apply_pith_peninsula(messages: &[Value], decision: GateDecision) -> Vec<Value> {
+async fn apply_pith_peninsula(
+    messages: &[Value],
+    decision: GateDecision,
+    sock: String,
+) -> Vec<Value> {
     let Some(current_instruction) = messages.iter().rev().find_map(genuine_user_text) else {
         return messages.to_vec();
     };
     let Ok(quest_focus) = extract_quest_focus(messages) else {
         return messages.to_vec();
     };
-    let Some(context) =
-        daemon_provider_context(current_instruction, quest_focus.clone().unwrap_or_default()).await
+    let Some(context) = daemon_provider_context(
+        current_instruction,
+        quest_focus.clone().unwrap_or_default(),
+        sock,
+    )
+    .await
     else {
         return messages.to_vec();
     };
@@ -1134,7 +1183,8 @@ async fn rewrite_request_body(
     let arr = body["messages"].as_array().cloned()?;
     let decision = gate_decision_for_body(&body, headers, sessions)?;
     if peninsula_enabled {
-        body["messages"] = Value::Array(apply_pith_peninsula(&arr, decision).await);
+        body["messages"] =
+            Value::Array(apply_pith_peninsula(&arr, decision, peninsula_sock_path()).await);
         serde_json::to_vec(&body).ok()
     } else {
         // Honest passthrough: when the peninsula is off or unavailable the
@@ -2378,6 +2428,49 @@ mod tests {
             gate_decision_for_body(&request_body, &headers(None), &sessions),
             Some(GateDecision::FullPass)
         );
+    }
+
+    #[tokio::test]
+    async fn peninsula_on_with_daemon_absent_fails_open_byte_identical() {
+        // Live-current-state regression guard (requirements-trace-001.md
+        // PITH-16): MINITID_PITH_PENINSULA=1 with daemon.sock absent is the
+        // exact condition observed on the running instance today. The whole
+        // request must reach the proxy's caller unchanged -- never block,
+        // panic, or silently drop content -- and this must hold without
+        // mutating process-global env state, so the socket path is injected
+        // directly rather than read from MINITID_PENINSULA_SOCK.
+        let original = sample_messages();
+        let request_body = body("peninsula-on-daemon-absent-session", original.clone());
+        let sessions = test_sessions();
+        let missing_sock = format!("/tmp/minitid-test-no-daemon-{}.sock", std::process::id());
+
+        let decision = gate_decision_for_body(&request_body, &headers(None), &sessions)
+            .expect("first human turn yields a decision");
+        let rewritten = apply_pith_peninsula(
+            request_body["messages"].as_array().unwrap(),
+            decision,
+            missing_sock,
+        )
+        .await;
+        assert_eq!(
+            rewritten, original,
+            "daemon-absent must fail open to the exact original messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_provider_context_returns_none_when_socket_absent() {
+        // Isolates the socket layer itself: connect() failure must surface as
+        // None within the function's own bounded timeout, not hang or error
+        // out to the caller.
+        let missing_sock = format!("/tmp/minitid-test-no-daemon-{}.sock", std::process::id());
+        let out = daemon_provider_context(
+            "some current instruction".to_string(),
+            String::new(),
+            missing_sock,
+        )
+        .await;
+        assert_eq!(out, None);
     }
 
     #[tokio::test]
