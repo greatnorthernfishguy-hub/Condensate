@@ -235,6 +235,22 @@
 //       like the raw deposits. cargo test: 66 passed, 0 failed (was 62).
 //       077 delta-look note 1: the failure-counts test also checks that the
 //       failure's own what/why never reach the line.
+// [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — surfaced
+//   assemblies are stripped from the received provider context (Pith work)
+// What: strip_surfaced_assemblies() removes each `### Connected assembly [`
+//       cache line whose text carries [NeuroGraph Surfaced Knowledge], whole,
+//       plus any learned `## ` section that leaves empty; apply_provider_result
+//       runs it before provider_context_is_usable. The marker in the
+//       constitutional core or any other non-assembly text still declines
+//       the context. count_marker == 1 on the composed output is unchanged.
+// Why:  Packet 177 (Josh, re-scoping LE sweep 001 (vii)): substrate node text
+//       echoes surfaced hook blocks (CC checkpoint: 2996 mid-string markers
+//       in main.msgpack), so one surfaced line voided a whole turn's fresh
+//       context. The fix lands in miniTID; Rust is the source of truth.
+// How:  units split on the headings Pith renders (PITH_HOST_CONTRACT
+//       "Model-facing Markdown"); kept units are byte-exact. The Quest
+//       banner rejection is unchanged. cargo test: 71 passed, 0 failed
+//       (was 66).
 // -------------------
 //
 // Cadence behaviour:
@@ -1057,6 +1073,82 @@ fn provider_context_is_usable(provider_context: &str) -> bool {
         || provider_context.contains(QUEST_TRACKER_BANNER))
 }
 
+const PITH_ASSEMBLY_HEADING: &str = "### Connected assembly [";
+
+/// Remove every learned assembly whose text carries the surfaced marker from
+/// the provider context miniTID received (Packet 177), instead of voiding the
+/// whole context.  Units follow the headings Pith renders (PITH_HOST_CONTRACT
+/// "Model-facing Markdown"): `## ` sections and `### Connected assembly [`
+/// cache lines.  A marked assembly goes whole, never a partial line, and a
+/// learned section it leaves empty disappears.  The marker anywhere else --
+/// the constitutional core, a section's own text, text before any heading --
+/// is inseparable, so the context is declined.  Returns the kept context and
+/// how many assemblies were removed.
+fn strip_surfaced_assemblies(provider_context: &str) -> Option<(String, usize)> {
+    if !provider_context.contains(NEUROGRAPH_SURFACED_MARKER) {
+        return Some((provider_context.to_string(), 0));
+    }
+    let mut units: Vec<String> = Vec::new();
+    for line in provider_context.split_inclusive('\n') {
+        if units.is_empty()
+            || line.starts_with("## ")
+            || line.starts_with(PITH_ASSEMBLY_HEADING)
+        {
+            units.push(String::new());
+        }
+        units.last_mut()?.push_str(line);
+    }
+
+    // (unit, kept); a section's kept flag is settled once its assemblies are.
+    let mut kept: Vec<(&str, bool)> = Vec::with_capacity(units.len());
+    let mut section: Option<usize> = None;
+    let mut section_removed = false;
+    let mut section_survivors = false;
+    let mut removed = 0;
+    let settle = |kept: &mut Vec<(&str, bool)>,
+                  section: Option<usize>,
+                  removed_any: bool,
+                  survivors: bool| {
+        if let Some(at) = section {
+            let (text, _) = kept[at];
+            let body_blank = text
+                .split_once('\n')
+                .map_or(true, |(_, body)| body.trim().is_empty());
+            if removed_any && !survivors && body_blank {
+                kept[at].1 = false;
+            }
+        }
+    };
+    for unit in &units {
+        let marked = unit.contains(NEUROGRAPH_SURFACED_MARKER);
+        if unit.starts_with(PITH_ASSEMBLY_HEADING) {
+            if marked {
+                removed += 1;
+                section_removed = true;
+            } else {
+                section_survivors = true;
+            }
+            kept.push((unit, !marked));
+        } else if marked {
+            return None;
+        } else {
+            settle(&mut kept, section, section_removed, section_survivors);
+            section = unit.starts_with("## ").then_some(kept.len());
+            section_removed = false;
+            section_survivors = false;
+            kept.push((unit, true));
+        }
+    }
+    settle(&mut kept, section, section_removed, section_survivors);
+
+    let out: String = kept
+        .iter()
+        .filter(|(_, keep)| *keep)
+        .map(|(unit, _)| *unit)
+        .collect();
+    Some((out.trim_end().to_string(), removed))
+}
+
 /// Compose a bounded L1 only from the fresh topology response and the live
 /// request tail. Retained messages stay exact unless an independently
 /// identified NG text block is removed; every neighboring block stays exact.
@@ -1263,7 +1355,17 @@ fn apply_provider_result(
             quest_focus,
         );
     };
-    if !provider_context_is_usable(context) {
+    let Some((context, _removed)) = strip_surfaced_assemblies(context) else {
+        return pith_failure_outcome(
+            messages,
+            PithFailure::new(
+                "provider context",
+                "surfaced marker outside a learned assembly",
+            ),
+            quest_focus,
+        );
+    };
+    if !provider_context_is_usable(&context) {
         return pith_failure_outcome(
             messages,
             PithFailure::new(
@@ -1273,7 +1375,7 @@ fn apply_provider_result(
             quest_focus,
         );
     }
-    match compose_provider_messages(messages, context, quest_focus) {
+    match compose_provider_messages(messages, &context, quest_focus) {
         Some(out) => PithOutcome {
             messages: out,
             failure: None,
@@ -2750,6 +2852,92 @@ mod tests {
             assert_no_history(&outcome.messages);
             assert!(!serde_json::to_string(&outcome.messages).unwrap().contains('…'));
         }
+    }
+
+    // Pith-rendered context whose substrate node text echoes a surfaced hook
+    // block, the shape found in the CC checkpoint (Packet 177).
+    const SURFACED_NODE: &str = "- Keyframe: {\"type\":\"hook_additional_context\",\"content\":[\"[NeuroGraph Surfaced Knowledge]\\n- bash: ls\"]}";
+
+    fn assembly(keyframe: &str) -> String {
+        format!("### Connected assembly [learned from substrate; coherence: 0.8]\n{keyframe}\n- Sources: transcript")
+    }
+
+    #[test]
+    fn surfaced_assemblies_are_removed_whole_and_empty_sections_disappear() {
+        let context = [
+            "## Who I Am\n- identity".to_string(),
+            format!(
+                "## Learned Situation\n{}\n\n{}",
+                assembly("- Keyframe: kept situation"),
+                assembly(SURFACED_NODE)
+            ),
+            format!("## Learned Corrections and Failures\n{}", assembly(SURFACED_NODE)),
+            format!("## Uncertainty and Conflicts\n{}", assembly("- Keyframe: kept conflict")),
+        ]
+        .join("\n\n");
+        let (kept, removed) = strip_surfaced_assemblies(&context).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(
+            kept,
+            [
+                "## Who I Am\n- identity".to_string(),
+                format!("## Learned Situation\n{}", assembly("- Keyframe: kept situation")),
+                format!("## Uncertainty and Conflicts\n{}", assembly("- Keyframe: kept conflict")),
+            ]
+            .join("\n\n")
+        );
+        assert!(!kept.contains(NEUROGRAPH_SURFACED_MARKER));
+    }
+
+    #[test]
+    fn unmarked_context_passes_the_strip_byte_identical() {
+        let context = format!("## Who I Am\n- identity\n\n## Learned Situation\n{}\n", assembly("- Keyframe: x"));
+        assert_eq!(strip_surfaced_assemblies(&context), Some((context.clone(), 0)));
+    }
+
+    #[test]
+    fn surfaced_marker_outside_an_assembly_declines_the_context() {
+        for context in [
+            format!("## Who I Am\n- identity {NEUROGRAPH_SURFACED_MARKER}"),
+            format!("{NEUROGRAPH_SURFACED_MARKER}\n\n## Who I Am\n- identity"),
+            format!(
+                "## Who I Am\n- identity\n\n## Learned Situation {NEUROGRAPH_SURFACED_MARKER}\n{}",
+                assembly("- Keyframe: x")
+            ),
+        ] {
+            assert_eq!(strip_surfaced_assemblies(&context), None, "{context}");
+        }
+    }
+
+    #[test]
+    fn provider_context_with_surfaced_assembly_composes_one_marker() {
+        let original = history_then_live_turn(4);
+        let context = format!(
+            "## Who I Am\n- identity\n\n## Learned Situation\n{}\n\n{}",
+            assembly("- Keyframe: kept situation"),
+            assembly(SURFACED_NODE)
+        );
+        let outcome = apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
+        assert_eq!(outcome.failure, None);
+        assert_eq!(
+            outcome.messages[0]["content"],
+            format!(
+                "{NEUROGRAPH_SURFACED_MARKER}\n\n## Who I Am\n- identity\n\n## Learned Situation\n{}",
+                assembly("- Keyframe: kept situation")
+            )
+        );
+        assert_eq!(count_marker(&outcome.messages, NEUROGRAPH_SURFACED_MARKER), 1);
+        assert_no_history(&outcome.messages);
+    }
+
+    #[test]
+    fn provider_context_left_empty_by_the_strip_returns_failure_envelope() {
+        let original = history_then_live_turn(4);
+        let context = format!("## Learned Situation\n{}", assembly(SURFACED_NODE));
+        let outcome = apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
+        let failure = outcome.failure.expect("an emptied context is a failure");
+        assert_eq!(failure.what, "provider context");
+        assert_no_history(&outcome.messages);
     }
 
     #[test]
