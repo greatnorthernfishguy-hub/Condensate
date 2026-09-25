@@ -221,7 +221,8 @@
 //   counts line for the live-swap measurement (Pith work)
 // What: proxy writes one stderr (journald) line per /v1/messages request:
 //       path class (pith / failure / compaction / unparsable), msgs_in,
-//       msgs_out, bytes_in, bytes_out, notice, human_turns_out. Counts only:
+//       msgs_out, bytes_in, bytes_out, notice, human_turns_out (and, since
+//       the stripped= entry below, stripped). Counts only:
 //       no message text, no headers, no session identity. The notice prefix
 //       is now the named PITH_NOTICE_PREFIX (notice text unchanged) so the
 //       counts line can recognise the notice it must not count as a human turn.
@@ -238,7 +239,8 @@
 // [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — surfaced
 //   assemblies are stripped from the received provider context (Pith work)
 // What: strip_rail_marked_assemblies() removes each `### Connected assembly [`
-//       cache line whose text carries [NeuroGraph Surfaced Knowledge], whole,
+//       cache line whose text carries [NeuroGraph Surfaced Knowledge] (or,
+//       per Packet 178 below, the exact Quest banner), whole,
 //       plus any learned `## ` section that leaves empty; apply_provider_result
 //       runs it before provider_context_is_usable. The marker in the
 //       constitutional core or any other non-assembly text still declines
@@ -259,6 +261,20 @@
 //       cover raw newlines, relation/sources-only markers and both whys,
 //       and the alert section fixture is bullets as Pith renders it.
 //       cargo test: 73 passed, 0 failed.
+// [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — stripped=
+//   count on the per-request counts line (Pith work)
+// What: the counts line ends with stripped=N, the number of learned
+//       assemblies strip_rail_marked_assemblies removed from that request's
+//       provider context, for either rail marker, in one field. It is also
+//       reported when the strip leaves nothing usable and the request takes
+//       the failure envelope. 0 on every path without a provider pass.
+// Why:  Chief P177 ruling 7 + Packet 178: the measurement window must show
+//       how often the strip fires; counts only, no content.
+// How:  PithOutcome and PithRewrite carry the count; request_counts_line
+//       takes it as an argument, so it is still a pure function and
+//       rewrite_request_body still only rewrites (LAW 4). The changelog
+//       What above now names the banner (077 turn-2 note 2). cargo test:
+//       74 passed, 0 failed (was 73).
 // -------------------
 //
 // Cadence behaviour:
@@ -1279,11 +1295,14 @@ impl GateRefusal {
 }
 
 /// The provider-bound result of one Pith pass.  `failure` is Some exactly
-/// when `messages` is the failure envelope.
+/// when `messages` is the failure envelope.  `stripped` counts the learned
+/// assemblies removed from the received provider context for a live rail
+/// marker (either reason), whether or not the pass then succeeded.
 #[derive(Debug, PartialEq)]
 struct PithOutcome {
     messages: Vec<Value>,
     failure: Option<PithFailure>,
+    stripped: usize,
 }
 
 /// Pith PRD §12.1 failure envelope: the explicit notice, the Quest rail only
@@ -1325,6 +1344,7 @@ fn pith_failure_outcome(
     PithOutcome {
         messages: failure_envelope(messages, &failure, quest_focus),
         failure: Some(failure),
+        stripped: 0,
     }
 }
 
@@ -1381,7 +1401,7 @@ fn apply_provider_result(
             quest_focus,
         );
     };
-    let Some((context, _removed)) = strip_rail_marked_assemblies(context) else {
+    let Some((context, stripped)) = strip_rail_marked_assemblies(context) else {
         return pith_failure_outcome(
             messages,
             PithFailure::new(
@@ -1392,25 +1412,32 @@ fn apply_provider_result(
         );
     };
     if !provider_context_is_usable(&context) {
-        return pith_failure_outcome(
-            messages,
-            PithFailure::new(
-                "provider context",
-                "empty, oversized, or carrying a live rail marker",
-            ),
-            quest_focus,
-        );
+        return PithOutcome {
+            stripped,
+            ..pith_failure_outcome(
+                messages,
+                PithFailure::new(
+                    "provider context",
+                    "empty, oversized, or carrying a live rail marker",
+                ),
+                quest_focus,
+            )
+        };
     }
     match compose_provider_messages(messages, &context, quest_focus) {
         Some(out) => PithOutcome {
             messages: out,
             failure: None,
+            stripped,
         },
-        None => pith_failure_outcome(
-            messages,
-            PithFailure::new("composition", "live tail or rail verification failed"),
-            quest_focus,
-        ),
+        None => PithOutcome {
+            stripped,
+            ..pith_failure_outcome(
+                messages,
+                PithFailure::new("composition", "live tail or rail verification failed"),
+                quest_focus,
+            )
+        },
     }
 }
 
@@ -1587,6 +1614,7 @@ fn reconstruct_assistant_text(sse_bytes: &[u8]) -> String {
 struct PithRewrite {
     body: Option<Vec<u8>>,
     failure: Option<PithFailure>,
+    stripped: usize,
 }
 
 /// Run every `/v1/messages` request body through Pith.  The result is either
@@ -1613,6 +1641,7 @@ async fn rewrite_request_body(
                     "request body",
                     format!("not valid JSON: {err}"),
                 )),
+                stripped: 0,
             }
         }
     };
@@ -1628,6 +1657,7 @@ async fn rewrite_request_body(
                 return PithRewrite {
                     body: None,
                     failure: None,
+                    stripped: 0,
                 };
             };
             let Some(messages) = body["messages"].as_array().cloned() else {
@@ -1635,6 +1665,7 @@ async fn rewrite_request_body(
                 return PithRewrite {
                     body: None,
                     failure: Some(failure),
+                    stripped: 0,
                 };
             };
             let quest_focus = extract_quest_focus(&messages).ok().flatten();
@@ -1648,6 +1679,7 @@ async fn rewrite_request_body(
     PithRewrite {
         body: Some(bytes),
         failure: outcome.failure,
+        stripped: outcome.stripped,
     }
 }
 
@@ -1674,7 +1706,10 @@ fn is_pith_notice(msg: &Value) -> bool {
 /// headers or session identity.  `notice` is read from the forwarded messages,
 /// not from the path class, and the notice is not counted as a human turn,
 /// so `human_turns_out` above 1 outside compaction means history was replayed.
-fn request_counts_line(path: &str, original: &[u8], forwarded: &[u8]) -> String {
+/// `stripped` is the count of learned assemblies miniTID removed from the
+/// received provider context (Packet 177/178); the daemon's own assembly
+/// count overstates what reached the model by exactly that much.
+fn request_counts_line(path: &str, stripped: usize, original: &[u8], forwarded: &[u8]) -> String {
     let messages_of = |bytes: &[u8]| {
         serde_json::from_slice::<Value>(bytes)
             .ok()
@@ -1693,7 +1728,7 @@ fn request_counts_line(path: &str, original: &[u8], forwarded: &[u8]) -> String 
         .filter(|msg| is_genuine_user_message(msg))
         .count();
     format!(
-        "miniTID request path={path} msgs_in={msgs_in} msgs_out={} bytes_in={} bytes_out={} notice={notice} human_turns_out={human_turns_out}",
+        "miniTID request path={path} msgs_in={msgs_in} msgs_out={} bytes_in={} bytes_out={} notice={notice} human_turns_out={human_turns_out} stripped={stripped}",
         out.len(),
         original.len(),
         forwarded.len(),
@@ -1737,6 +1772,7 @@ async fn proxy(
             rewrite_request_body(&body_bytes, &headers, &state.sessions, peninsula_sock_path())
                 .await;
         let path = request_path_class(&rewrite);
+        let stripped = rewrite.stripped;
         if let Some(failure) = rewrite.failure {
             tokio::spawn(async move {
                 deposit_pith_failure(&cc_gateway_tract_path(), &failure);
@@ -1746,7 +1782,7 @@ async fn proxy(
         let forwarded: axum::body::Bytes = rewrite.body.map(Into::into).unwrap_or(body_bytes);
         let counted = forwarded.clone();
         tokio::spawn(async move {
-            eprintln!("{}", request_counts_line(path, &original, &counted));
+            eprintln!("{}", request_counts_line(path, stripped, &original, &counted));
         });
         forwarded
     } else {
@@ -3178,11 +3214,16 @@ mod tests {
         .await;
         let forwarded = rewrite.body.clone().expect("the envelope rewrites the body");
         let failure = rewrite.failure.as_ref().expect("the daemon is absent");
-        let line = request_counts_line(request_path_class(&rewrite), &original, &forwarded);
+        let line = request_counts_line(
+            request_path_class(&rewrite),
+            rewrite.stripped,
+            &original,
+            &forwarded,
+        );
         assert_eq!(
             line,
             format!(
-                "miniTID request path=failure msgs_in=13 msgs_out=10 bytes_in={} bytes_out={} notice=true human_turns_out=1",
+                "miniTID request path=failure msgs_in=13 msgs_out=10 bytes_in={} bytes_out={} notice=true human_turns_out=1 stripped=0",
                 original.len(),
                 forwarded.len()
             )
@@ -3212,9 +3253,33 @@ mod tests {
             .expect("usable context composes");
         let original = serde_json::to_vec(&json!({"messages": messages})).unwrap();
         let forwarded = serde_json::to_vec(&json!({"messages": out})).unwrap();
-        let line = request_counts_line("pith", &original, &forwarded);
+        let line = request_counts_line("pith", 0, &original, &forwarded);
         assert!(line.contains(" msgs_in=13 msgs_out=10 "), "{line}");
-        assert!(line.ends_with(" notice=false human_turns_out=1"), "{line}");
+        assert!(line.ends_with(" notice=false human_turns_out=1 stripped=0"), "{line}");
+    }
+
+    #[test]
+    fn counts_line_reports_assemblies_stripped_for_either_rail_marker() {
+        let messages = history_then_live_turn(4);
+        let original = serde_json::to_vec(&json!({"messages": messages})).unwrap();
+        let context = format!(
+            "## Who I Am\n- identity\n\n## Learned Situation\n{}\n\n{}\n\n{}",
+            assembly("- Keyframe: kept situation"),
+            assembly(SURFACED_NODE),
+            assembly(BANNER_NODE)
+        );
+        let outcome = apply_provider_result(&messages, GateDecision::Compress, Some(&context), None);
+        assert_eq!((outcome.failure.as_ref(), outcome.stripped), (None, 2));
+        let forwarded = serde_json::to_vec(&json!({"messages": outcome.messages})).unwrap();
+        let line = request_counts_line("pith", outcome.stripped, &original, &forwarded);
+        assert!(line.ends_with(" notice=false human_turns_out=1 stripped=2"), "{line}");
+        assert!(!line.contains("Keyframe") && !line.contains("Quest"), "{line}");
+
+        // A context the strip empties is a failure that still reports the count.
+        let emptied = format!("## Learned Situation\n{}", assembly(BANNER_NODE));
+        let outcome = apply_provider_result(&messages, GateDecision::Compress, Some(&emptied), None);
+        assert!(outcome.failure.is_some());
+        assert_eq!(outcome.stripped, 1);
     }
 
     #[test]
@@ -3222,12 +3287,12 @@ mod tests {
         // Compaction forwards the original bytes, so its replayed human turns
         // are visible in the count; an unparsable body counts zero messages.
         let original = serde_json::to_vec(&json!({"messages": history_then_live_turn(4)})).unwrap();
-        let line = request_counts_line("compaction", &original, &original);
+        let line = request_counts_line("compaction", 0, &original, &original);
         assert!(line.contains("path=compaction msgs_in=13 msgs_out=13 "), "{line}");
-        assert!(line.ends_with(" notice=false human_turns_out=3"), "{line}");
+        assert!(line.ends_with(" notice=false human_turns_out=3 stripped=0"), "{line}");
         assert_eq!(
-            request_counts_line("unparsable", b"not json", b"not json"),
-            "miniTID request path=unparsable msgs_in=0 msgs_out=0 bytes_in=8 bytes_out=8 notice=false human_turns_out=0"
+            request_counts_line("unparsable", 0, b"not json", b"not json"),
+            "miniTID request path=unparsable msgs_in=0 msgs_out=0 bytes_in=8 bytes_out=8 notice=false human_turns_out=0 stripped=0"
         );
     }
 
@@ -3235,7 +3300,11 @@ mod tests {
     fn request_path_class_names_each_rewrite_outcome() {
         let failure = || Some(PithFailure::new("request body", "no messages array"));
         let class = |body: Option<Vec<u8>>, failure: Option<PithFailure>| {
-            request_path_class(&PithRewrite { body, failure })
+            request_path_class(&PithRewrite {
+                body,
+                failure,
+                stripped: 0,
+            })
         };
         assert_eq!(class(Some(Vec::new()), None), "pith");
         assert_eq!(class(Some(Vec::new()), failure()), "failure");
@@ -3373,6 +3442,7 @@ mod tests {
             PithRewrite {
                 body: None,
                 failure: Some(PithFailure::new("request body", "no messages array")),
+                stripped: 0,
             }
         );
         assert!(sessions.lock().unwrap().entries.is_empty());
@@ -3398,6 +3468,7 @@ mod tests {
             PithRewrite {
                 body: None,
                 failure: None,
+                stripped: 0,
             }
         );
 
@@ -3419,6 +3490,7 @@ mod tests {
             PithRewrite {
                 body: None,
                 failure: None,
+                stripped: 0,
             }
         );
         assert!(sessions.lock().unwrap().entries.is_empty());
