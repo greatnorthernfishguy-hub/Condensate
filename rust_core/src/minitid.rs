@@ -217,6 +217,22 @@
 //       main must not carry an inaccurate comment about envelope semantics.
 // How:  comment/label text changed in place; one test added. cargo test: 62
 //       passed, 0 failed (was 61).
+// [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — per-request
+//   counts line for the live-swap measurement (Pith work)
+// What: proxy writes one stderr (journald) line per /v1/messages request:
+//       path class (pith / failure / compaction / unparsable), msgs_in,
+//       msgs_out, bytes_in, bytes_out, notice, human_turns_out. Counts only:
+//       no message text, no headers, no session identity. The notice prefix
+//       is now the named PITH_NOTICE_PREFIX (notice text unchanged) so the
+//       counts line can recognise the notice it must not count as a human turn.
+// Why:  Packet 173(4): "(i) done" is measured live from requests leaving
+//       miniTID, evidence = counts per request, not content; chief ruling (A)
+//       on the live-swap runbook (docs 1382add1 §5.1). This binary had no
+//       per-request output, so the measurement had no source.
+// How:  request_path_class() + request_counts_line() are pure and separate
+//       from rewrite_request_body(), which still only rewrites (LAW 4). The
+//       line is built and written in a spawned task, off the request path,
+//       like the raw deposits. cargo test: 66 passed, 0 failed (was 62).
 // -------------------
 //
 // Cadence behaviour:
@@ -230,7 +246,8 @@
 //   by Pith: fresh daemon context on success, the failure envelope on any
 //   failure. Only Claude's native compaction request and a body that is
 //   not valid JSON or has no message array are forwarded unchanged. It
-//   never truncates message content itself.
+//   never truncates message content itself. Each /v1/messages request also
+//   writes one counts-only line to stderr (see request_counts_line).
 //
 // Session identity: SHA-256 of metadata.user_id.session_id, optionally
 // partitioned by a bounded x-claude-code-agent-id. Missing or malformed
@@ -1087,6 +1104,7 @@ fn compose_provider_messages(
 }
 
 const PITH_NOTICE_WHY_MAX: usize = 200;
+const PITH_NOTICE_PREFIX: &str = "[Pith unavailable: ";
 
 /// What Pith could not do for this request and why.  Rendered two ways: a
 /// short notice for the provider, and raw text for the gateway tract.
@@ -1112,7 +1130,7 @@ impl PithFailure {
         } else {
             flat
         };
-        format!("[Pith unavailable: {} — {why}]", self.what)
+        format!("{PITH_NOTICE_PREFIX}{} — {why}]", self.what)
     }
 
     /// Raw failure text for the substrate (LAW 7): no category, severity,
@@ -1503,6 +1521,55 @@ async fn rewrite_request_body(
     }
 }
 
+/// Which way a rewrite went: fresh Pith context, the failure envelope, the
+/// compaction exemption, or a body that could not be enveloped.
+fn request_path_class(rewrite: &PithRewrite) -> &'static str {
+    match (&rewrite.body, &rewrite.failure) {
+        (Some(_), None) => "pith",
+        (Some(_), Some(_)) => "failure",
+        (None, None) => "compaction",
+        (None, Some(_)) => "unparsable",
+    }
+}
+
+fn is_pith_notice(msg: &Value) -> bool {
+    msg["role"].as_str() == Some("user")
+        && msg["content"]
+            .as_str()
+            .is_some_and(|text| text.starts_with(PITH_NOTICE_PREFIX))
+}
+
+/// One line per /v1/messages request, counted from the bytes that arrived and
+/// the bytes forwarded (Packet 173(4)): counts only, never message text,
+/// headers or session identity.  `notice` is read from the forwarded messages,
+/// not from the path class, and the notice is not counted as a human turn,
+/// so `human_turns_out` above 1 outside compaction means history was replayed.
+fn request_counts_line(path: &str, original: &[u8], forwarded: &[u8]) -> String {
+    let messages_of = |bytes: &[u8]| {
+        serde_json::from_slice::<Value>(bytes)
+            .ok()
+            .and_then(|mut body| match body["messages"].take() {
+                Value::Array(messages) => Some(messages),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    let msgs_in = messages_of(original).len();
+    let out = messages_of(forwarded);
+    let notice = out.first().is_some_and(is_pith_notice);
+    let human_turns_out = out
+        .iter()
+        .skip(usize::from(notice))
+        .filter(|msg| is_genuine_user_message(msg))
+        .count();
+    format!(
+        "miniTID request path={path} msgs_in={msgs_in} msgs_out={} bytes_in={} bytes_out={} notice={notice} human_turns_out={human_turns_out}",
+        out.len(),
+        original.len(),
+        forwarded.len(),
+    )
+}
+
 // ── Proxy handler ────────────────────────────────────────────────────────────
 
 async fn proxy(
@@ -1533,17 +1600,25 @@ async fn proxy(
     // Every /v1/messages request goes through Pith; there is no off switch.
     // Claude's native summary request is the one deliberate exemption: it
     // reaches the provider byte-for-byte and consumes no human-turn gate
-    // decision.  A Pith failure is deposited raw off the response path.
+    // decision.  A Pith failure is deposited raw off the response path, and
+    // the per-request counts line is built and written off it too.
     let body_bytes = if is_messages {
         let rewrite =
             rewrite_request_body(&body_bytes, &headers, &state.sessions, peninsula_sock_path())
                 .await;
+        let path = request_path_class(&rewrite);
         if let Some(failure) = rewrite.failure {
             tokio::spawn(async move {
                 deposit_pith_failure(&cc_gateway_tract_path(), &failure);
             });
         }
-        rewrite.body.map(Into::into).unwrap_or(body_bytes)
+        let original = body_bytes.clone();
+        let forwarded: axum::body::Bytes = rewrite.body.map(Into::into).unwrap_or(body_bytes);
+        let counted = forwarded.clone();
+        tokio::spawn(async move {
+            eprintln!("{}", request_counts_line(path, &original, &counted));
+        });
+        forwarded
     } else {
         body_bytes
     };
@@ -2808,6 +2883,82 @@ mod tests {
         expected.extend(current_turn_with_tool_pairs(3, false));
         assert_eq!(out, expected, "notice + live turn only, no ambiguous rail");
         assert_no_history(&out);
+    }
+
+    #[tokio::test]
+    async fn counts_line_reports_failure_envelope_counts_without_text() {
+        // Daemon absent: 13 messages with three human turns arrive; the notice
+        // plus the nine-message live turn leave.  The notice is not counted as
+        // a human turn, and no text, header or session identity is logged.
+        let request_body = body("counts-failure-session", history_then_live_turn(4));
+        let original = serde_json::to_vec(&request_body).unwrap();
+        let rewrite = rewrite_request_body(
+            &original,
+            &headers(Some("counts-agent")),
+            &test_sessions(),
+            missing_sock(),
+        )
+        .await;
+        let forwarded = rewrite.body.clone().expect("the envelope rewrites the body");
+        let line = request_counts_line(request_path_class(&rewrite), &original, &forwarded);
+        assert_eq!(
+            line,
+            format!(
+                "miniTID request path=failure msgs_in=13 msgs_out=10 bytes_in={} bytes_out={} notice=true human_turns_out=1",
+                original.len(),
+                forwarded.len()
+            )
+        );
+        for leaked in [
+            "obsolete",
+            "bounded source-and-runtime analyst",
+            "tool output",
+            "Pith unavailable",
+            "counts-failure-session",
+            "counts-agent",
+        ] {
+            assert!(!line.contains(leaked), "counts line leaked: {leaked}");
+        }
+    }
+
+    #[test]
+    fn counts_line_counts_one_human_turn_on_pith_context() {
+        // The fresh context message carries the surfaced marker, so only the
+        // live human turn counts; notice is false on the success path.
+        let messages = history_then_live_turn(4);
+        let out = compose_provider_messages(&messages, "fresh topology context", None)
+            .expect("usable context composes");
+        let original = serde_json::to_vec(&json!({"messages": messages})).unwrap();
+        let forwarded = serde_json::to_vec(&json!({"messages": out})).unwrap();
+        let line = request_counts_line("pith", &original, &forwarded);
+        assert!(line.contains(" msgs_in=13 msgs_out=10 "), "{line}");
+        assert!(line.ends_with(" notice=false human_turns_out=1"), "{line}");
+    }
+
+    #[test]
+    fn counts_line_shows_unchanged_bodies_as_they_are() {
+        // Compaction forwards the original bytes, so its replayed human turns
+        // are visible in the count; an unparsable body counts zero messages.
+        let original = serde_json::to_vec(&json!({"messages": history_then_live_turn(4)})).unwrap();
+        let line = request_counts_line("compaction", &original, &original);
+        assert!(line.contains("path=compaction msgs_in=13 msgs_out=13 "), "{line}");
+        assert!(line.ends_with(" notice=false human_turns_out=3"), "{line}");
+        assert_eq!(
+            request_counts_line("unparsable", b"not json", b"not json"),
+            "miniTID request path=unparsable msgs_in=0 msgs_out=0 bytes_in=8 bytes_out=8 notice=false human_turns_out=0"
+        );
+    }
+
+    #[test]
+    fn request_path_class_names_each_rewrite_outcome() {
+        let failure = || Some(PithFailure::new("request body", "no messages array"));
+        let class = |body: Option<Vec<u8>>, failure: Option<PithFailure>| {
+            request_path_class(&PithRewrite { body, failure })
+        };
+        assert_eq!(class(Some(Vec::new()), None), "pith");
+        assert_eq!(class(Some(Vec::new()), failure()), "failure");
+        assert_eq!(class(None, None), "compaction");
+        assert_eq!(class(None, failure()), "unparsable");
     }
 
     #[tokio::test]
