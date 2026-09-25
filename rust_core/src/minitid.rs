@@ -160,6 +160,52 @@
 //       resolves the real path via peninsula_sock_path() and a third test at
 //       that level would only re-test a one-line delegation. cargo test:
 //       57 passed, 0 failed (was 55).
+// [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — Pith failure
+//   envelope; peninsula-off passthrough removed (build item (a), chief-ruled)
+// What: removed the MINITID_PITH_PENINSULA read and rewrite_request_body()'s
+//       peninsula_enabled branch, so Pith runs on every /v1/messages request.
+//       Every failure that used to return the original history now returns
+//       the failure envelope: failure_envelope() builds the notice
+//       "[Pith unavailable: <what> — <why>]", then the Quest rail (only if the
+//       inbound request carried one), then the current instruction and current
+//       tool episode. If that tail cannot be built, it sends the notice and the
+//       exact current human text; with no human turn at all, the notice alone.
+//       Covered failures: daemon errors (daemon_provider_context now returns
+//       Result<String, String> naming the cause), unusable provider context,
+//       failed composition, ambiguous Quest rails, missing session identity,
+//       no genuine human turn, and a poisoned cadence lock (gate_for_body()
+//       returns a GateRefusal naming which). current_episode_tail() is lifted
+//       unchanged out of compose_provider_messages() so success and failure
+//       keep the identical live tail. deposit_pith_failure() writes each
+//       failure as one raw cc_gateway experience frame (LAW 7) on the gateway
+//       tract, spawned off the response path like deposit_turn().
+//       Two cases still forward the original bytes. (1) Claude's native
+//       compaction request is a deliberate exemption, not a Pith failure: CC's
+//       own summarization call carries full history by design, and enveloping
+//       it would break compaction; no deposit. (2) A body that is not JSON or
+//       has no messages array has nothing to envelope, so its bytes go
+//       upstream unchanged (never a 4xx) and the failure is deposited raw.
+// Why:  Pith PRD §12.1 failure envelope; Executive P153 north star ("zero from
+//       session history replaying"); P170(4): a path that still resends
+//       transcript has not met the spec. Chief rulings on build item (a):
+//       remove the passthrough branch now, activate at the 068(1) live swap;
+//       (i) compaction exempt byte-for-byte; (ii) identity/decision failures
+//       are envelope failures; (iii) unparseable bodies forward + deposit raw.
+// How:  rewrite_request_body() takes the socket path and returns a PithRewrite
+//       {body, failure}; proxy() resolves peninsula_sock_path() and deposits
+//       the failure. gate_decision_for_body() is kept as a #[cfg(test)] view of
+//       gate_for_body(), so the existing cadence tests are unchanged. The tests
+//       that asserted fail-open equality now assert the envelope exactly and
+//       that no earlier turn survives. Retired: peninsula_off_passes_messages_
+//       through_byte_identical, warmup_passes_through_untouched, and the unused
+//       sample_messages() helper. Renamed: peninsula_on_with_daemon_absent_
+//       fails_open_byte_identical → peninsula_daemon_absent_returns_failure_
+//       envelope_without_history. New tests cover gate preconditions, bodies
+//       that cannot be enveloped, the compaction exemption, notice bounding,
+//       and a raw deposit round-trip on an injected tract path.
+//       The live drop-in's Environment=MINITID_PITH_PENINSULA line becomes
+//       dead config; removing it is a 068(1) swap step, not part of this change.
+//       cargo test: 61 passed, 0 failed (was 57).
 // -------------------
 //
 // Cadence behaviour:
@@ -167,17 +213,17 @@
 //   (decision_for_request: turn_count vs kiss_warmup_turns(), since_full vs
 //   kiss_force_full_every() — both env-overridable, LAW 5) but nothing
 //   currently acts on the result — it is passed to apply_provider_result()
-//   and discarded there. Separately, gate_decision_for_body() gates whether
-//   the peninsula rewrite path runs at
-//   all (session identity + a compaction-request bypass); that gating is
-//   live and does matter. The proxy either forwards the request bytes
-//   unchanged (peninsula off) or, when the peninsula is enabled and
-//   available, rewrites the body via the daemon. It never truncates message
+//   and discarded there. Separately, gate_for_body() decides whether a
+//   request takes a gate decision at all (session identity + a genuine human
+//   turn + the compaction exemption). Every /v1/messages request is rewritten
+//   by Pith: fresh daemon context on success, the failure envelope on any
+//   failure. Only Claude's native compaction request and a body with no
+//   message array are forwarded unchanged. It never truncates message
 //   content itself.
 //
 // Session identity: SHA-256 of metadata.user_id.session_id, optionally
 // partitioned by a bounded x-claude-code-agent-id. Missing or malformed
-// identity fails open without touching shared cadence state.
+// identity yields the failure envelope without touching shared cadence state.
 //
 // env vars:
 //   MINITID_PORT      — listen port (default: 9090)
@@ -220,7 +266,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 // Blocking Unix-socket client to the CC daemon's read-only provider_context
 // handler, run on the blocking pool so the async runtime is never stalled.
-// Gated off by default (MINITID_PITH_PENINSULA).
 use std::env;
 use std::io::{Read as _PenRead, Write as _PenWrite};
 use std::net::SocketAddr;
@@ -529,27 +574,55 @@ fn decision_for_request(
     Some(session.decision)
 }
 
+/// Why a request cannot take a gate decision. `Compaction` is the one
+/// deliberate exemption; every other refusal is a Pith failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateRefusal {
+    Compaction,
+    NoMessages,
+    NoSessionIdentity,
+    NoHumanTurn,
+    SessionLockPoisoned,
+}
+
+fn gate_for_body(
+    body: &Value,
+    headers: &HeaderMap,
+    sessions: &Mutex<SessionStore>,
+) -> Result<GateDecision, GateRefusal> {
+    if headers.contains_key("x-cc-compaction-request") {
+        return Err(GateRefusal::Compaction);
+    }
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return Err(GateRefusal::NoMessages);
+    };
+    if latest_user_role_is_compaction_request(messages) {
+        return Err(GateRefusal::Compaction);
+    }
+    let key = session_key(body, headers).ok_or(GateRefusal::NoSessionIdentity)?;
+    if human_turn_marker(messages).is_none() {
+        return Err(GateRefusal::NoHumanTurn);
+    }
+    // With a human marker present, decision_for_request is None only when
+    // the cadence lock is poisoned.
+    decision_for_request(key, messages, sessions).ok_or(GateRefusal::SessionLockPoisoned)
+}
+
+#[cfg(test)]
 fn gate_decision_for_body(
     body: &Value,
     headers: &HeaderMap,
     sessions: &Mutex<SessionStore>,
 ) -> Option<GateDecision> {
-    if headers.contains_key("x-cc-compaction-request") {
-        return None;
-    }
-    let messages = body.get("messages")?.as_array()?;
-    if latest_user_role_is_compaction_request(messages) {
-        return None;
-    }
-    let key = session_key(body, headers)?;
-    decision_for_request(key, messages, sessions)
+    gate_for_body(body, headers, sessions).ok()
 }
 
 // ============================================================================
 // Substrate peninsula — fresh provider context from CC's living NeuroGraph.
-// Gated off by default (MINITID_PITH_PENINSULA unset).  Obsolete history is
-// evicted only after the daemon returns a valid fresh context.  Any failure
-// leaves the original request untouched.
+// Always on: there is no off switch.  Obsolete history is evicted on every
+// request.  When Pith cannot build the fresh context, the request carries the
+// failure envelope instead (notice + current instruction + current tool
+// episode), never the original history (Pith PRD §12.1).
 // ============================================================================
 
 /// Read MINITID_PENINSULA_SOCK (LAW 5), falling back to the default daemon
@@ -569,43 +642,58 @@ fn peninsula_sock_path() -> String {
 /// Call the CC daemon's read-only `provider_context` handler.  The request
 /// carries only attention cues already present in this request; it never sends
 /// transcript history.  Accept only the producer's closed fresh states.
+/// `Err` says why, for the failure envelope's notice and raw deposit.
 async fn daemon_provider_context(
     current_instruction: String,
     quest_focus: String,
     sock: String,
-) -> Option<String> {
-    let fut = tokio::task::spawn_blocking(move || -> Option<String> {
-        let mut stream = UnixStream::connect(&sock).ok()?;
+) -> Result<String, String> {
+    let fut = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let mut stream = UnixStream::connect(&sock)
+            .map_err(|e| format!("daemon socket unavailable: {e}"))?;
         let t = std::time::Duration::from_millis(1500);
-        stream.set_read_timeout(Some(t)).ok()?;
-        stream.set_write_timeout(Some(t)).ok()?;
+        stream
+            .set_read_timeout(Some(t))
+            .map_err(|e| format!("daemon socket setup failed: {e}"))?;
+        stream
+            .set_write_timeout(Some(t))
+            .map_err(|e| format!("daemon socket setup failed: {e}"))?;
         let req = provider_context_request(&current_instruction, &quest_focus);
-        let mut line = serde_json::to_vec(&req).ok()?;
+        let mut line = serde_json::to_vec(&req)
+            .map_err(|e| format!("provider_context request encode failed: {e}"))?;
         line.push(b'\n');
-        stream.write_all(&line).ok()?;
+        stream
+            .write_all(&line)
+            .map_err(|e| format!("daemon write failed: {e}"))?;
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {
-            let nread = stream.read(&mut chunk).ok()?;
+            let nread = stream
+                .read(&mut chunk)
+                .map_err(|e| format!("daemon read failed: {e}"))?;
             if nread == 0 {
                 break;
             }
             buf.extend_from_slice(&chunk[..nread]);
             if buf.len() > MAX_PROVIDER_RESPONSE_BYTES {
-                return None;
+                return Err(format!(
+                    "daemon response exceeded {MAX_PROVIDER_RESPONSE_BYTES} bytes"
+                ));
             }
             if buf.last() == Some(&b'\n') {
                 break;
             }
         }
         if buf.last() != Some(&b'\n') {
-            return None;
+            return Err("daemon closed without a complete response line".to_string());
         }
         parse_provider_response(&buf)
+            .ok_or_else(|| "daemon response was not a fresh provider_context envelope".to_string())
     });
     match tokio::time::timeout(std::time::Duration::from_millis(2000), fut).await {
-        Ok(Ok(v)) => v,
-        _ => None,
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(format!("daemon worker failed: {e}")),
+        Err(_) => Err("daemon did not answer within 2000 ms".to_string()),
     }
 }
 
@@ -911,21 +999,11 @@ fn bounded_current_episode(cleaned: &[Value], tool_tail_bytes: usize) -> Option<
     Some(out)
 }
 
-/// Compose a bounded L1 only from the fresh topology response and the live
-/// request tail. Retained messages stay exact unless an independently
-/// identified NG text block is removed; every neighboring block stays exact.
-fn compose_provider_messages(
-    messages: &[Value],
-    provider_context: &str,
-    quest_focus: Option<&str>,
-) -> Option<Vec<Value>> {
-    if provider_context.trim().is_empty()
-        || provider_context.chars().count() > MAX_PROVIDER_CONTEXT_CHARS
-        || provider_context.contains(NEUROGRAPH_SURFACED_MARKER)
-        || provider_context.contains(QUEST_TRACKER_BANNER)
-    {
-        return None;
-    }
+/// The live request tail Pith keeps, on success and in the failure envelope
+/// alike: the latest genuine human message plus a bounded, pair-complete
+/// current tool episode. isMeta/compact-summary clutter is dropped and NG
+/// surfaces are stripped. None when any of those boundary checks fails.
+fn current_episode_tail(messages: &[Value]) -> Option<Vec<Value>> {
     let current = last_genuine_user_message_index(messages)?;
     let mut cleaned_messages = Vec::new();
     for msg in &messages[current..] {
@@ -939,7 +1017,28 @@ fn compose_provider_messages(
             cleaned_messages.push(cleaned);
         }
     }
-    let tail = bounded_current_episode(&cleaned_messages, pith_tool_tail_bytes())?;
+    bounded_current_episode(&cleaned_messages, pith_tool_tail_bytes())
+}
+
+fn provider_context_is_usable(provider_context: &str) -> bool {
+    !(provider_context.trim().is_empty()
+        || provider_context.chars().count() > MAX_PROVIDER_CONTEXT_CHARS
+        || provider_context.contains(NEUROGRAPH_SURFACED_MARKER)
+        || provider_context.contains(QUEST_TRACKER_BANNER))
+}
+
+/// Compose a bounded L1 only from the fresh topology response and the live
+/// request tail. Retained messages stay exact unless an independently
+/// identified NG text block is removed; every neighboring block stays exact.
+fn compose_provider_messages(
+    messages: &[Value],
+    provider_context: &str,
+    quest_focus: Option<&str>,
+) -> Option<Vec<Value>> {
+    if !provider_context_is_usable(provider_context) {
+        return None;
+    }
+    let tail = current_episode_tail(messages)?;
 
     let quest_rails_in_tail = verified_quest_rails(&tail).ok()?;
     if quest_rails_in_tail.len() > 1 {
@@ -976,30 +1075,148 @@ fn compose_provider_messages(
     Some(out)
 }
 
-/// Build fresh context on every Pith-enabled provider request.  Warmup and GOP
-/// cadence never restore raw history.  The old request survives byte-for-byte
-/// whenever the daemon or composition boundary is unavailable.
+const PITH_NOTICE_WHY_MAX: usize = 200;
+
+/// What Pith could not do for this request and why.  Rendered two ways: a
+/// short notice for the provider, and raw text for the gateway tract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PithFailure {
+    what: &'static str,
+    why: String,
+}
+
+impl PithFailure {
+    fn new(what: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            what,
+            why: why.into(),
+        }
+    }
+
+    /// One short line: whitespace flattened, `why` bounded.
+    fn notice(&self) -> String {
+        let flat = self.why.split_whitespace().collect::<Vec<_>>().join(" ");
+        let why = if flat.chars().count() > PITH_NOTICE_WHY_MAX {
+            format!("{}...", flat.chars().take(PITH_NOTICE_WHY_MAX).collect::<String>())
+        } else {
+            flat
+        };
+        format!("[Pith unavailable: {} — {why}]", self.what)
+    }
+
+    /// Raw failure text for the substrate (LAW 7): no category, severity,
+    /// or tag.
+    fn deposit_text(&self) -> String {
+        format!("miniTID Pith peninsula failed: {}: {}", self.what, self.why)
+    }
+}
+
+impl GateRefusal {
+    /// The Pith failure a refusal stands for.  None for the compaction
+    /// exemption, which is not a failure.
+    fn pith_failure(self) -> Option<PithFailure> {
+        let (what, why) = match self {
+            GateRefusal::Compaction => return None,
+            GateRefusal::NoMessages => ("request body", "no messages array"),
+            GateRefusal::NoSessionIdentity => (
+                "session identity",
+                "no usable metadata.user_id session_id or x-claude-code-agent-id",
+            ),
+            GateRefusal::NoHumanTurn => ("gate decision", "request carries no genuine human turn"),
+            GateRefusal::SessionLockPoisoned => ("gate decision", "session cadence lock poisoned"),
+        };
+        Some(PithFailure::new(what, why))
+    }
+}
+
+/// The provider-bound result of one Pith pass.  `failure` is Some exactly
+/// when `messages` is the failure envelope.
+#[derive(Debug, PartialEq)]
+struct PithOutcome {
+    messages: Vec<Value>,
+    failure: Option<PithFailure>,
+}
+
+/// Pith PRD §12.1 failure envelope: the explicit notice, the Quest rail only
+/// when the inbound request carried one, then the current instruction and
+/// current tool episode.  If the tail cannot be built, the notice plus the
+/// exact current human text.  Never the earlier history, never blank.
+fn failure_envelope(
+    messages: &[Value],
+    failure: &PithFailure,
+    quest_focus: Option<&str>,
+) -> Vec<Value> {
+    let mut out = vec![serde_json::json!({"role": "user", "content": failure.notice()})];
+    if let Some(tail) = current_episode_tail(messages) {
+        let tail_has_rail = verified_quest_rails(&tail)
+            .map(|rails| !rails.is_empty())
+            .unwrap_or(true);
+        if !tail_has_rail {
+            if let Some(quest) = quest_focus.filter(|text| !text.is_empty()) {
+                out.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
+                    ),
+                }));
+            }
+        }
+        out.extend(tail);
+    } else if let Some(instruction) = messages.iter().rev().find_map(genuine_user_text) {
+        out.push(serde_json::json!({"role": "user", "content": instruction}));
+    }
+    out
+}
+
+fn pith_failure_outcome(
+    messages: &[Value],
+    failure: PithFailure,
+    quest_focus: Option<&str>,
+) -> PithOutcome {
+    PithOutcome {
+        messages: failure_envelope(messages, &failure, quest_focus),
+        failure: Some(failure),
+    }
+}
+
+/// Build fresh context on every provider request.  Warmup and GOP cadence
+/// never restore raw history, and neither does failure: when the daemon or
+/// composition boundary is unavailable the result is the failure envelope.
 async fn apply_pith_peninsula(
     messages: &[Value],
     decision: GateDecision,
     sock: String,
-) -> Vec<Value> {
+) -> PithOutcome {
     let Some(current_instruction) = messages.iter().rev().find_map(genuine_user_text) else {
-        return messages.to_vec();
+        return pith_failure_outcome(
+            messages,
+            PithFailure::new("current instruction", "request carries no genuine human turn"),
+            None,
+        );
     };
     let Ok(quest_focus) = extract_quest_focus(messages) else {
-        return messages.to_vec();
+        return pith_failure_outcome(
+            messages,
+            PithFailure::new("Quest focus", "request carries ambiguous Quest rails"),
+            None,
+        );
     };
-    let Some(context) = daemon_provider_context(
+    match daemon_provider_context(
         current_instruction,
         quest_focus.clone().unwrap_or_default(),
         sock,
     )
     .await
-    else {
-        return messages.to_vec();
-    };
-    apply_provider_result(messages, decision, Some(&context), quest_focus.as_deref())
+    {
+        Ok(context) => {
+            apply_provider_result(messages, decision, Some(&context), quest_focus.as_deref())
+        }
+        Err(why) => pith_failure_outcome(
+            messages,
+            PithFailure::new("daemon provider_context", why),
+            quest_focus.as_deref(),
+        ),
+    }
 }
 
 fn apply_provider_result(
@@ -1007,10 +1224,35 @@ fn apply_provider_result(
     _decision: GateDecision,
     provider_context: Option<&str>,
     quest_focus: Option<&str>,
-) -> Vec<Value> {
-    provider_context
-        .and_then(|context| compose_provider_messages(messages, context, quest_focus))
-        .unwrap_or_else(|| messages.to_vec())
+) -> PithOutcome {
+    let Some(context) = provider_context else {
+        return pith_failure_outcome(
+            messages,
+            PithFailure::new("daemon provider_context", "no provider context returned"),
+            quest_focus,
+        );
+    };
+    if !provider_context_is_usable(context) {
+        return pith_failure_outcome(
+            messages,
+            PithFailure::new(
+                "provider context",
+                "empty, oversized, or carrying a live rail marker",
+            ),
+            quest_focus,
+        );
+    }
+    match compose_provider_messages(messages, context, quest_focus) {
+        Some(out) => PithOutcome {
+            messages: out,
+            failure: None,
+        },
+        None => pith_failure_outcome(
+            messages,
+            PithFailure::new("composition", "live tail or rail verification failed"),
+            quest_focus,
+        ),
+    }
 }
 
 /// Extract the genuine user message from the original request bytes before any
@@ -1141,6 +1383,16 @@ fn deposit_turn(user_message: Option<String>, assistant_text: String) {
     deposit_experience_entry(&path, "cc_gateway", assistant_text);
 }
 
+/// Deposit one Pith failure as raw experience (LAW 7) on the gateway tract,
+/// the same unlabeled `cc_gateway` frame deposit_turn writes.  The path is a
+/// parameter so tests need not mutate process env.  Fails soft.
+fn deposit_pith_failure(path: &str, failure: &PithFailure) {
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    deposit_experience_entry(path, "cc_gateway", failure.deposit_text());
+}
+
 /// Reconstruct the assistant's full generated text from accumulated SSE
 /// bytes by concatenating every `content_block_delta` event whose
 /// `delta.type` is `text_delta`. Malformed/non-text events are skipped,
@@ -1169,28 +1421,74 @@ fn reconstruct_assistant_text(sse_bytes: &[u8]) -> String {
     out
 }
 
-/// Rewrite a `/v1/messages` request body when the Pith peninsula is enabled.
-/// Returns `Some(rewritten_bytes)` when the peninsula composes a new context,
-/// or `None` when the peninsula is off or any precondition fails.  `None`
-/// means the caller must forward the original bytes byte-for-byte.
+/// What the proxy forwards for one `/v1/messages` request.  `body: None`
+/// means forward the original bytes; `failure` is the Pith failure the caller
+/// deposits raw, if any.
+#[derive(Debug, PartialEq)]
+struct PithRewrite {
+    body: Option<Vec<u8>>,
+    failure: Option<PithFailure>,
+}
+
+/// Run every `/v1/messages` request body through Pith.  The result is either
+/// the fresh context or the failure envelope; history is never forwarded.
+/// Two cases forward the original bytes:
+///   - Claude's native compaction request, a deliberate exemption and not a
+///     Pith failure.  It is CC's own summarization call and carries the full
+///     history by design; enveloping it would break compaction.  No deposit.
+///   - A body that is not JSON or has no messages array.  Nothing in it can be
+///     enveloped (there is no message array to replay), so the bytes go
+///     upstream unchanged and the failure is deposited raw.  Never a 4xx.
 async fn rewrite_request_body(
     body_bytes: &[u8],
     headers: &HeaderMap,
     sessions: &Mutex<SessionStore>,
-    peninsula_enabled: bool,
-) -> Option<Vec<u8>> {
-    let mut body = serde_json::from_slice::<Value>(body_bytes).ok()?;
-    let arr = body["messages"].as_array().cloned()?;
-    let decision = gate_decision_for_body(&body, headers, sessions)?;
-    if peninsula_enabled {
-        body["messages"] =
-            Value::Array(apply_pith_peninsula(&arr, decision, peninsula_sock_path()).await);
-        serde_json::to_vec(&body).ok()
-    } else {
-        // Honest passthrough: when the peninsula is off or unavailable the
-        // request goes upstream byte-for-byte rather than applying the faux
-        // KISS truncation.
-        None
+    sock: String,
+) -> PithRewrite {
+    let mut body = match serde_json::from_slice::<Value>(body_bytes) {
+        Ok(body) => body,
+        Err(err) => {
+            return PithRewrite {
+                body: None,
+                failure: Some(PithFailure::new(
+                    "request body",
+                    format!("not valid JSON: {err}"),
+                )),
+            }
+        }
+    };
+    let outcome = match gate_for_body(&body, headers, sessions) {
+        Ok(decision) => {
+            // A decision implies gate_for_body found the messages array.
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            apply_pith_peninsula(&messages, decision, sock).await
+        }
+        Err(refusal) => {
+            let Some(failure) = refusal.pith_failure() else {
+                // The compaction exemption: forward unchanged, deposit nothing.
+                return PithRewrite {
+                    body: None,
+                    failure: None,
+                };
+            };
+            let Some(messages) = body["messages"].as_array().cloned() else {
+                // No message array to envelope: forward unchanged, deposit raw.
+                return PithRewrite {
+                    body: None,
+                    failure: Some(failure),
+                };
+            };
+            let quest_focus = extract_quest_focus(&messages).ok().flatten();
+            pith_failure_outcome(&messages, failure, quest_focus.as_deref())
+        }
+    };
+    body["messages"] = Value::Array(outcome.messages);
+    // Serializing a serde_json::Value cannot fail: every map key is a string.
+    // Falling back to the original bytes here would replay history.
+    let bytes = serde_json::to_vec(&body).expect("a serde_json::Value always serializes");
+    PithRewrite {
+        body: Some(bytes),
+        failure: outcome.failure,
     }
 }
 
@@ -1221,18 +1519,20 @@ async fn proxy(
         None
     };
 
-    // Claude's native summary request must reach the provider byte-for-byte and
-    // cannot consume a human-turn gate decision.
-    // Rewrite messages only when Claude supplied stable request identity and a
-    // genuine human marker. Every other case fails open without shared state.
-    let peninsula_enabled = std::env::var("MINITID_PITH_PENINSULA")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    // Every /v1/messages request goes through Pith; there is no off switch.
+    // Claude's native summary request is the one deliberate exemption: it
+    // reaches the provider byte-for-byte and consumes no human-turn gate
+    // decision.  A Pith failure is deposited raw off the response path.
     let body_bytes = if is_messages {
-        rewrite_request_body(&body_bytes, &headers, &state.sessions, peninsula_enabled)
-            .await
-            .map(Into::into)
-            .unwrap_or(body_bytes)
+        let rewrite =
+            rewrite_request_body(&body_bytes, &headers, &state.sessions, peninsula_sock_path())
+                .await;
+        if let Some(failure) = rewrite.failure {
+            tokio::spawn(async move {
+                deposit_pith_failure(&cc_gateway_tract_path(), &failure);
+            });
+        }
+        rewrite.body.map(Into::into).unwrap_or(body_bytes)
     } else {
         body_bytes
     };
@@ -1343,8 +1643,8 @@ async fn main() {
 // Run: cargo test --features minitid --bin minitid
 //
 // These exercise the proxy's request handling and the Pith peninsula directly
-// — no network. Faux KISS truncation has been removed; the honest failure mode
-// is byte-for-byte passthrough when the peninsula is off or unavailable.
+// — no network. Faux KISS truncation has been removed; the failure mode is the
+// Pith PRD §12.1 failure envelope, never the original history.
 
 #[cfg(test)]
 mod tests {
@@ -1407,34 +1707,6 @@ mod tests {
             .unwrap();
         }
         decision
-    }
-
-    // 12 messages: indices 0,1 fall in the compress range (12 - 10), the rest
-    // are the recent window. Index 0 carries a tool_result, index 1 a tool_use.
-    fn sample_messages() -> Vec<Value> {
-        let mut v = vec![
-            json!({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": LONG},
-                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "important tool output"}
-                ]
-            }),
-            json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": LONG},
-                    {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "ls -la"}}
-                ]
-            }),
-        ];
-        for i in 0..10 {
-            v.push(json!({
-                "role": if i % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("recent message {}", i)
-            }));
-        }
-        v
     }
 
     const INCIDENT_TASK: &str = "You are the bounded source-and-runtime analyst for the current Claude Code NeuroGraph surfacing mission. Trace the exact path, preserve all restrictions, write the requested PLAN.md, and do not edit repositories or runtime state. This text intentionally exceeds the Pith keyframe budget.";
@@ -2158,17 +2430,24 @@ mod tests {
         assert!(!is_standalone_neurograph_surface_text(&quote));
         let messages = vec![
             json!({"role": "user", "content": INCIDENT_TASK}),
-            json!({"role": "user", "content": quote}),
+            json!({"role": "user", "content": quote.clone()}),
         ];
+        let outcome = apply_provider_result(
+            &messages,
+            GateDecision::Compress,
+            Some("## Who I Am\n- identity"),
+            None,
+        );
+        // An inseparable marker quote cannot be stripped, so the tail fails and
+        // the envelope carries the notice plus the exact current human text.
+        let failure = outcome.failure.expect("composition failure is reported");
+        assert_eq!(failure.what, "composition");
         assert_eq!(
-            apply_provider_result(
-                &messages,
-                GateDecision::Compress,
-                Some("## Who I Am\n- identity"),
-                None,
-            ),
-            messages,
-            "an inseparable marker quote must fail open"
+            outcome.messages,
+            vec![
+                json!({"role": "user", "content": failure.notice()}),
+                json!({"role": "user", "content": quote}),
+            ]
         );
     }
 
@@ -2198,14 +2477,20 @@ mod tests {
             "content": [{"type": "tool_result", "tool_use_id": "live", "content": "result"}]
         });
         let original = vec![human, suspicious];
+        let outcome = apply_provider_result(
+            &original,
+            GateDecision::Compress,
+            Some("## Who I Am\n- identity"),
+            None,
+        );
+        let failure = outcome.failure.expect("tool metadata on isMeta is a failure");
         assert_eq!(
-            apply_provider_result(
-                &original,
-                GateDecision::Compress,
-                Some("## Who I Am\n- identity"),
-                None,
-            ),
-            original
+            outcome.messages,
+            vec![
+                json!({"role": "user", "content": failure.notice()}),
+                json!({"role": "user", "content": INCIDENT_TASK}),
+            ],
+            "tool traffic hidden in isMeta yields notice + instruction, never the original"
         );
     }
 
@@ -2338,24 +2623,45 @@ mod tests {
         assert_eq!(parse_provider_response(b"not json"), None);
     }
 
-    #[test]
-    fn every_provider_failure_preserves_original_without_faux_keyframes() {
-        let original = current_turn_with_tool_pairs(8, false);
-        for failed in [
-            None,
-            Some(""),
-            Some(NEUROGRAPH_SURFACED_MARKER),
-            Some(QUEST_TRACKER_BANNER),
+    /// Earlier turns, then the live turn with its tool episode.
+    fn history_then_live_turn(pair_count: usize) -> Vec<Value> {
+        let mut messages = conversation(&["obsolete human turn one", "obsolete human turn two"]);
+        messages.push(json!({"role": "assistant", "content": "obsolete assistant reply"}));
+        messages.extend(current_turn_with_tool_pairs(pair_count, false));
+        messages
+    }
+
+    fn assert_no_history(out: &[Value]) {
+        let rendered = serde_json::to_string(out).unwrap();
+        for earlier in [
+            "obsolete human turn one",
+            "obsolete human turn two",
+            "obsolete assistant reply",
         ] {
-            assert_eq!(
-                apply_provider_result(&original, GateDecision::Compress, failed, None),
-                original,
-            );
+            assert!(!rendered.contains(earlier), "history replayed: {earlier}");
         }
-        assert!(serde_json::to_string(&original)
-            .unwrap()
-            .contains(INCIDENT_TASK));
-        assert!(!serde_json::to_string(&original).unwrap().contains('…'));
+    }
+
+    #[test]
+    fn every_provider_failure_returns_envelope_without_history_or_faux_keyframes() {
+        // Four pairs fit KISS_RECENT_WINDOW, so the whole live turn is kept.
+        let original = history_then_live_turn(4);
+        let live_turn = current_turn_with_tool_pairs(4, false);
+        for (failed, what) in [
+            (None, "daemon provider_context"),
+            (Some(""), "provider context"),
+            (Some(NEUROGRAPH_SURFACED_MARKER), "provider context"),
+            (Some(QUEST_TRACKER_BANNER), "provider context"),
+        ] {
+            let outcome = apply_provider_result(&original, GateDecision::Compress, failed, None);
+            let failure = outcome.failure.expect("every provider failure is reported");
+            assert_eq!(failure.what, what);
+            let mut expected = vec![json!({"role": "user", "content": failure.notice()})];
+            expected.extend(live_turn.clone());
+            assert_eq!(outcome.messages, expected);
+            assert_no_history(&outcome.messages);
+            assert!(!serde_json::to_string(&outcome.messages).unwrap().contains('…'));
+        }
     }
 
     #[test]
@@ -2365,12 +2671,14 @@ mod tests {
             original.push(json!({"role": "assistant", "content": format!("obsolete history {i}")}));
         }
         for legacy_decision in [GateDecision::FullPass, GateDecision::Compress] {
-            let out = apply_provider_result(
+            let outcome = apply_provider_result(
                 &original,
                 legacy_decision,
                 Some("## Who I Am\n- identity\n\n## Learned Situation\n- fresh"),
                 None,
             );
+            assert_eq!(outcome.failure, None);
+            let out = outcome.messages;
             assert_eq!(out[1]["content"], INCIDENT_TASK);
             assert!(!serde_json::to_string(&out)
                 .unwrap()
@@ -2407,91 +2715,284 @@ mod tests {
             .contains("old reply"));
     }
 
-    #[tokio::test]
-    async fn peninsula_off_passes_messages_through_byte_identical() {
-        // When the Pith peninsula is OFF, the proxy must forward the exact
-        // request bytes unchanged. Computing the gate decision still advances
-        // session cadence, but no rewriting happens.
-        let original = sample_messages();
-        let request_body = body("peninsula-off-session", original.clone());
-        let body_bytes = serde_json::to_vec(&request_body).unwrap();
-        let sessions = test_sessions();
+    fn missing_sock() -> String {
+        format!("/tmp/minitid-test-no-daemon-{}.sock", std::process::id())
+    }
 
-        let rewritten = rewrite_request_body(&body_bytes, &headers(None), &sessions, false).await;
-        assert_eq!(
-            rewritten, None,
-            "peninsula-off must leave the original request bytes untouched"
-        );
-
-        // Gate side effects still happened: first human turn is a FullPass.
-        assert_eq!(
-            gate_decision_for_body(&request_body, &headers(None), &sessions),
-            Some(GateDecision::FullPass)
-        );
+    fn rewritten_messages(rewrite: &PithRewrite) -> Vec<Value> {
+        let bytes = rewrite.body.as_ref().expect("Pith rewrites the body");
+        serde_json::from_slice::<Value>(bytes).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
     }
 
     #[tokio::test]
-    async fn peninsula_on_with_daemon_absent_fails_open_byte_identical() {
-        // Live-current-state regression guard (requirements-trace-001.md
-        // PITH-16): MINITID_PITH_PENINSULA=1 with daemon.sock absent is the
-        // exact condition observed on the running instance today. The whole
-        // request must reach the proxy's caller unchanged -- never block,
-        // panic, or silently drop content -- and this must hold without
-        // mutating process-global env state, so the socket path is injected
-        // directly rather than read from MINITID_PENINSULA_SOCK.
-        let original = sample_messages();
-        let request_body = body("peninsula-on-daemon-absent-session", original.clone());
+    async fn peninsula_daemon_absent_returns_failure_envelope_without_history() {
+        // Live-condition regression guard (requirements-trace-001.md
+        // PITH-16): daemon.sock absent.  This used to fail open to the whole
+        // original history; the Pith PRD §12.1 envelope replaces that.  The
+        // socket path is injected rather than read from MINITID_PENINSULA_SOCK
+        // so no process-global env state is mutated.
+        let quest = format!(
+            "{QUEST_TRACKER_BANNER} This is what you were working on and why.\n\nCurrent: envelope"
+        );
+        let rail = json!({
+            "role": "user",
+            "content": format!(
+                "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
+            )
+        });
+        let mut messages = vec![rail.clone()];
+        messages.extend(history_then_live_turn(3));
+        let request_body = body("daemon-absent-session", messages);
         let sessions = test_sessions();
-        let missing_sock = format!("/tmp/minitid-test-no-daemon-{}.sock", std::process::id());
 
-        let decision = gate_decision_for_body(&request_body, &headers(None), &sessions)
-            .expect("first human turn yields a decision");
-        let rewritten = apply_pith_peninsula(
-            request_body["messages"].as_array().unwrap(),
-            decision,
-            missing_sock,
+        let rewrite = rewrite_request_body(
+            &serde_json::to_vec(&request_body).unwrap(),
+            &headers(None),
+            &sessions,
+            missing_sock(),
         )
         .await;
-        assert_eq!(
-            rewritten, original,
-            "daemon-absent must fail open to the exact original messages"
-        );
+        let failure = rewrite.failure.clone().expect("daemon absence is reported");
+        assert_eq!(failure.what, "daemon provider_context");
+        assert!(failure.why.starts_with("daemon socket unavailable: "), "{}", failure.why);
+        let out = rewritten_messages(&rewrite);
+        let mut expected = vec![json!({"role": "user", "content": failure.notice()}), rail];
+        expected.extend(current_turn_with_tool_pairs(3, false));
+        assert_eq!(out, expected, "notice + inbound Quest rail + live turn only");
+        assert_no_history(&out);
     }
 
     #[tokio::test]
-    async fn daemon_provider_context_returns_none_when_socket_absent() {
+    async fn daemon_provider_context_reports_why_when_socket_absent() {
         // Isolates the socket layer itself: connect() failure must surface as
-        // None within the function's own bounded timeout, not hang or error
-        // out to the caller.
-        let missing_sock = format!("/tmp/minitid-test-no-daemon-{}.sock", std::process::id());
+        // an Err naming the cause within the function's own bounded timeout,
+        // not hang or panic.
         let out = daemon_provider_context(
             "some current instruction".to_string(),
             String::new(),
-            missing_sock,
+            missing_sock(),
         )
         .await;
-        assert_eq!(out, None);
+        let why = out.expect_err("an absent socket is an error");
+        assert!(why.starts_with("daemon socket unavailable: "), "{why}");
     }
 
     #[tokio::test]
-    async fn warmup_passes_through_untouched() {
-        // During warmup the gate returns FullPass, but the peninsula-off path
-        // must still leave the original request byte-for-byte. Passthrough is
-        // now the universal honest failure mode, not a faux-KISS special case.
-        let original = sample_messages();
-        let request_body = body("warmup-session", original.clone());
-        let body_bytes = serde_json::to_vec(&request_body).unwrap();
+    async fn warmup_never_replays_history_when_daemon_absent() {
+        // Warmup (FullPass) used to mean passthrough.  It now gets the same
+        // envelope as any other turn: the cadence decision never restores
+        // raw history.
+        let request_body = body("warmup-session", history_then_live_turn(2));
         let sessions = test_sessions();
 
-        let rewritten = rewrite_request_body(&body_bytes, &headers(None), &sessions, false).await;
-        assert_eq!(
-            rewritten, None,
-            "warmup turn must pass through the proxy untouched"
-        );
+        let rewrite = rewrite_request_body(
+            &serde_json::to_vec(&request_body).unwrap(),
+            &headers(None),
+            &sessions,
+            missing_sock(),
+        )
+        .await;
+        assert!(rewrite.failure.is_some());
+        assert_no_history(&rewritten_messages(&rewrite));
         assert_eq!(
             gate_decision_for_body(&request_body, &headers(None), &sessions),
             Some(GateDecision::FullPass)
         );
+    }
+
+    #[tokio::test]
+    async fn gate_precondition_failures_return_envelope_not_history() {
+        let live_turn = current_turn_with_tool_pairs(2, false);
+
+        // No request identity: metadata absent.  Shared state stays untouched.
+        let sessions = test_sessions();
+        let no_identity = json!({"messages": history_then_live_turn(2)});
+        let rewrite = rewrite_request_body(
+            &serde_json::to_vec(&no_identity).unwrap(),
+            &headers(None),
+            &sessions,
+            missing_sock(),
+        )
+        .await;
+        let failure = rewrite.failure.clone().expect("missing identity is reported");
+        assert_eq!(failure.what, "session identity");
+        let mut expected = vec![json!({"role": "user", "content": failure.notice()})];
+        expected.extend(live_turn.clone());
+        assert_eq!(rewritten_messages(&rewrite), expected);
+        assert!(sessions.lock().unwrap().entries.is_empty());
+
+        // Poisoned cadence lock.
+        let poisoned = test_sessions();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison cadence state for regression coverage");
+        });
+        let rewrite = rewrite_request_body(
+            &serde_json::to_vec(&body("poisoned-session", history_then_live_turn(2))).unwrap(),
+            &headers(None),
+            &poisoned,
+            missing_sock(),
+        )
+        .await;
+        let failure = rewrite.failure.clone().expect("poisoned lock is reported");
+        assert_eq!(
+            failure,
+            PithFailure::new("gate decision", "session cadence lock poisoned")
+        );
+        let mut expected = vec![json!({"role": "user", "content": failure.notice()})];
+        expected.extend(live_turn);
+        assert_eq!(rewritten_messages(&rewrite), expected);
+
+        // No genuine human turn at all: the notice alone, never blank.
+        let harness_only = body(
+            "harness-only-session",
+            vec![json!({"role": "user", "content": "<system-reminder>\nharness only\n</system-reminder>"})],
+        );
+        let rewrite = rewrite_request_body(
+            &serde_json::to_vec(&harness_only).unwrap(),
+            &headers(None),
+            &test_sessions(),
+            missing_sock(),
+        )
+        .await;
+        let failure = rewrite.failure.clone().expect("no human turn is reported");
+        assert_eq!(
+            failure,
+            PithFailure::new("gate decision", "request carries no genuine human turn")
+        );
+        assert_eq!(
+            rewritten_messages(&rewrite),
+            vec![json!({"role": "user", "content": failure.notice()})]
+        );
+    }
+
+    #[tokio::test]
+    async fn unenvelopable_bodies_forward_bytes_and_report_failure() {
+        // Nothing here can be enveloped (no message array to replay): the
+        // bytes go upstream unchanged, never a 4xx, and the failure is
+        // reported for a raw deposit.
+        let sessions = test_sessions();
+        let rewrite =
+            rewrite_request_body(b"not json", &headers(None), &sessions, missing_sock()).await;
+        assert_eq!(rewrite.body, None);
+        let failure = rewrite.failure.expect("parse failure is reported");
+        assert_eq!(failure.what, "request body");
+        assert!(failure.why.starts_with("not valid JSON: "), "{}", failure.why);
+
+        let no_messages = json!({"model": "m", "metadata": {"user_id": "{}"}});
+        let rewrite = rewrite_request_body(
+            &serde_json::to_vec(&no_messages).unwrap(),
+            &headers(None),
+            &sessions,
+            missing_sock(),
+        )
+        .await;
+        assert_eq!(
+            rewrite,
+            PithRewrite {
+                body: None,
+                failure: Some(PithFailure::new("request body", "no messages array")),
+            }
+        );
+        assert!(sessions.lock().unwrap().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compaction_request_is_exempt_forwarded_unchanged_without_deposit() {
+        // Claude's native summarization call carries full history by design.
+        // It is not a Pith failure: forward unchanged, deposit nothing.
+        let sessions = test_sessions();
+        let request_body = body("compaction-session", history_then_live_turn(2));
+        let mut compaction_headers = headers(None);
+        compaction_headers.insert("x-cc-compaction-request", "1".parse().unwrap());
+        let rewrite = rewrite_request_body(
+            &serde_json::to_vec(&request_body).unwrap(),
+            &compaction_headers,
+            &sessions,
+            missing_sock(),
+        )
+        .await;
+        assert_eq!(
+            rewrite,
+            PithRewrite {
+                body: None,
+                failure: None,
+            }
+        );
+
+        let mut messages = history_then_live_turn(2);
+        messages.push(json!({"role": "assistant", "content": "working"}));
+        messages.push(json!({
+            "role": "user",
+            "content": format!("{CLAUDE_COMPACTION_PROMPT_PREFIX} summarize the conversation")
+        }));
+        let rewrite = rewrite_request_body(
+            &serde_json::to_vec(&body("compaction-session", messages)).unwrap(),
+            &headers(None),
+            &sessions,
+            missing_sock(),
+        )
+        .await;
+        assert_eq!(
+            rewrite,
+            PithRewrite {
+                body: None,
+                failure: None,
+            }
+        );
+        assert!(sessions.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn failure_notice_is_one_bounded_line_and_deposit_text_is_raw() {
+        let why = format!("line one\nline two {}", "x".repeat(500));
+        let failure = PithFailure::new("daemon provider_context", why.clone());
+        let notice = failure.notice();
+        assert!(
+            notice.starts_with("[Pith unavailable: daemon provider_context — line one line two "),
+            "{notice}"
+        );
+        assert!(!notice.contains('\n'));
+        assert!(notice.ends_with("...]"));
+        assert!(notice.chars().count() <= PITH_NOTICE_WHY_MAX + 60);
+        assert_eq!(
+            failure.deposit_text(),
+            format!("miniTID Pith peninsula failed: daemon provider_context: {why}")
+        );
+    }
+
+    #[test]
+    fn pith_failure_deposit_writes_one_raw_cc_gateway_experience() {
+        use ng_tract::read::{ReadResult, TractReader};
+        use ng_tract::TractEntry;
+
+        // The path is injected: no CC_GATEWAY_TRACT_PATH env mutation.
+        let dir = std::env::temp_dir().join(format!("minitid_pith_failure_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tract = dir.join("cc_gateway").join("turns.tract");
+        let failure = PithFailure::new("daemon provider_context", "daemon socket unavailable: gone");
+
+        deposit_pith_failure(tract.to_str().unwrap(), &failure);
+
+        let data = std::fs::read(&tract).expect("tract file should exist");
+        let mut reader = TractReader::new(&data);
+        let mut experiences = Vec::new();
+        while let Some(result) = reader.next_entry() {
+            if let Ok(ReadResult::Entry(TractEntry::Experience(exp))) = result {
+                experiences.push(exp);
+            }
+        }
+        assert_eq!(experiences.len(), 1);
+        assert_eq!(experiences[0].source, "cc_gateway");
+        assert_eq!(experiences[0].content_type, "text");
+        assert_eq!(
+            String::from_utf8_lossy(&experiences[0].content),
+            failure.deposit_text()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
