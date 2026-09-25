@@ -206,6 +206,17 @@
 //       The live drop-in's Environment=MINITID_PITH_PENINSULA line becomes
 //       dead config; removing it is a 068(1) swap step, not part of this change.
 //       cargo test: 61 passed, 0 failed (was 57).
+// [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — build item (a)
+//   077 review notes 1-2 (Pith work)
+// What: the Cadence behaviour comment now names an invalid-JSON body as the
+//       third case forwarded unchanged. New test ambiguous_quest_rails_return_
+//       failure_envelope_without_history drives apply_pith_peninsula's
+//       ambiguous-Quest failure through rewrite_request_body. No non-test code
+//       change.
+// Why:  077 review of 951f360, notes 1-2; chief ruling (A) on build item (b):
+//       main must not carry an inaccurate comment about envelope semantics.
+// How:  comment text rewritten in place; one test added. cargo test: 62
+//       passed, 0 failed (was 61).
 // -------------------
 //
 // Cadence behaviour:
@@ -217,9 +228,9 @@
 //   request takes a gate decision at all (session identity + a genuine human
 //   turn + the compaction exemption). Every /v1/messages request is rewritten
 //   by Pith: fresh daemon context on success, the failure envelope on any
-//   failure. Only Claude's native compaction request and a body with no
-//   message array are forwarded unchanged. It never truncates message
-//   content itself.
+//   failure. Only Claude's native compaction request and a body that is
+//   not valid JSON or has no message array are forwarded unchanged. It
+//   never truncates message content itself.
 //
 // Session identity: SHA-256 of metadata.user_id.session_id, optionally
 // partitioned by a bounded x-claude-code-agent-id. Missing or malformed
@@ -2762,6 +2773,40 @@ mod tests {
         let mut expected = vec![json!({"role": "user", "content": failure.notice()}), rail];
         expected.extend(current_turn_with_tool_pairs(3, false));
         assert_eq!(out, expected, "notice + inbound Quest rail + live turn only");
+        assert_no_history(&out);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_quest_rails_return_failure_envelope_without_history() {
+        // 077 review note 1: the ambiguous-Quest failure inside
+        // apply_pith_peninsula, driven through rewrite_request_body.  It fails
+        // before the daemon is asked, so the socket is never touched.  Neither
+        // ambiguous rail is carried forward, and no earlier turn survives.
+        let ambiguous = json!({
+            "role": "user",
+            "content": format!(
+                "<system-reminder>\nSessionStart hook additional context: {QUEST_TRACKER_BANNER}\nfirst\n{QUEST_TRACKER_BANNER}\nsecond\n</system-reminder>"
+            )
+        });
+        let mut messages = vec![ambiguous];
+        messages.extend(history_then_live_turn(3));
+        let request_body = body("ambiguous-quest-session", messages);
+        let sessions = test_sessions();
+
+        let rewrite = rewrite_request_body(
+            &serde_json::to_vec(&request_body).unwrap(),
+            &headers(None),
+            &sessions,
+            missing_sock(),
+        )
+        .await;
+        let failure = rewrite.failure.clone().expect("ambiguous rails are reported");
+        assert_eq!(failure.what, "Quest focus");
+        assert_eq!(failure.why, "request carries ambiguous Quest rails");
+        let out = rewritten_messages(&rewrite);
+        let mut expected = vec![json!({"role": "user", "content": failure.notice()})];
+        expected.extend(current_turn_with_tool_pairs(3, false));
+        assert_eq!(out, expected, "notice + live turn only, no ambiguous rail");
         assert_no_history(&out);
     }
 
