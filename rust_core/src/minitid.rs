@@ -211,11 +211,11 @@
 // What: the Cadence behaviour comment now names an invalid-JSON body as the
 //       third case forwarded unchanged. New test ambiguous_quest_rails_return_
 //       failure_envelope_without_history drives apply_pith_peninsula's
-//       ambiguous-Quest failure through rewrite_request_body. No non-test code
-//       change.
-// Why:  077 review of 951f360, notes 1-2; chief ruling (A) on build item (b):
+//       ambiguous-Quest failure through rewrite_request_body. The unreachable
+//       no-instruction label in apply_pith_peninsula now reads "gate decision".
+// Why:  077 review of 951f360, notes 1-2; chief rulings on (a) and (A) on (b):
 //       main must not carry an inaccurate comment about envelope semantics.
-// How:  comment text rewritten in place; one test added. cargo test: 62
+// How:  comment/label text changed in place; one test added. cargo test: 62
 //       passed, 0 failed (was 61).
 // -------------------
 //
@@ -1201,7 +1201,7 @@ async fn apply_pith_peninsula(
     let Some(current_instruction) = messages.iter().rev().find_map(genuine_user_text) else {
         return pith_failure_outcome(
             messages,
-            PithFailure::new("current instruction", "request carries no genuine human turn"),
+            PithFailure::new("gate decision", "request carries no genuine human turn"),
             None,
         );
     };
