@@ -233,6 +233,8 @@
 //       from rewrite_request_body(), which still only rewrites (LAW 4). The
 //       line is built and written in a spawned task, off the request path,
 //       like the raw deposits. cargo test: 66 passed, 0 failed (was 62).
+//       077 delta-look note 1: the failure-counts test also checks that the
+//       failure's own what/why never reach the line.
 // -------------------
 //
 // Cadence behaviour:
@@ -2900,6 +2902,7 @@ mod tests {
         )
         .await;
         let forwarded = rewrite.body.clone().expect("the envelope rewrites the body");
+        let failure = rewrite.failure.as_ref().expect("the daemon is absent");
         let line = request_counts_line(request_path_class(&rewrite), &original, &forwarded);
         assert_eq!(
             line,
@@ -2909,6 +2912,7 @@ mod tests {
                 forwarded.len()
             )
         );
+        assert!(failure.why.contains("daemon socket unavailable"));
         for leaked in [
             "obsolete",
             "bounded source-and-runtime analyst",
@@ -2916,6 +2920,9 @@ mod tests {
             "Pith unavailable",
             "counts-failure-session",
             "counts-agent",
+            failure.what,
+            failure.why.as_str(),
+            "daemon socket unavailable",
         ] {
             assert!(!line.contains(leaked), "counts line leaked: {leaked}");
         }
