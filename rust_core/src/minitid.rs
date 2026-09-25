@@ -237,7 +237,7 @@
 //       failure's own what/why never reach the line.
 // [2026-09-25] Z2 zone manager (Claude Opus 5.5, Claude Code) — surfaced
 //   assemblies are stripped from the received provider context (Pith work)
-// What: strip_surfaced_assemblies() removes each `### Connected assembly [`
+// What: strip_rail_marked_assemblies() removes each `### Connected assembly [`
 //       cache line whose text carries [NeuroGraph Surfaced Knowledge], whole,
 //       plus any learned `## ` section that leaves empty; apply_provider_result
 //       runs it before provider_context_is_usable. The marker in the
@@ -248,9 +248,12 @@
 //       in main.msgpack), so one surfaced line voided a whole turn's fresh
 //       context. The fix lands in miniTID; Rust is the source of truth.
 // How:  units split on the headings Pith renders (PITH_HOST_CONTRACT
-//       "Model-facing Markdown"); kept units are byte-exact. The Quest
-//       banner rejection is unchanged. cargo test: 71 passed, 0 failed
-//       (was 66).
+//       "Model-facing Markdown"); kept units are byte-exact. cargo test: 71
+//       passed, 0 failed (was 66).
+//       Packet 178 (executive, applying 177(2)): the exact Quest banner gets
+//       the same rule through the same function, renamed
+//       strip_rail_marked_assemblies (PROVIDER_RAIL_MARKERS). Extraction side
+//       only; nothing is stripped from the substrate (LAW 7).
 // -------------------
 //
 // Cadence behaviour:
@@ -1074,18 +1077,22 @@ fn provider_context_is_usable(provider_context: &str) -> bool {
 }
 
 const PITH_ASSEMBLY_HEADING: &str = "### Connected assembly [";
+/// Live rail text a learned assembly can echo from substrate node text.
+const PROVIDER_RAIL_MARKERS: [&str; 2] = [NEUROGRAPH_SURFACED_MARKER, QUEST_TRACKER_BANNER];
 
-/// Remove every learned assembly whose text carries the surfaced marker from
-/// the provider context miniTID received (Packet 177), instead of voiding the
-/// whole context.  Units follow the headings Pith renders (PITH_HOST_CONTRACT
+/// Remove every learned assembly whose text carries a live rail marker (the
+/// surfaced marker, Packet 177, or the exact Quest banner, Packet 178) from
+/// the provider context miniTID received, instead of voiding the whole
+/// context.  Units follow the headings Pith renders (PITH_HOST_CONTRACT
 /// "Model-facing Markdown"): `## ` sections and `### Connected assembly [`
 /// cache lines.  A marked assembly goes whole, never a partial line, and a
 /// learned section it leaves empty disappears.  The marker anywhere else --
 /// the constitutional core, a section's own text, text before any heading --
 /// is inseparable, so the context is declined.  Returns the kept context and
 /// how many assemblies were removed.
-fn strip_surfaced_assemblies(provider_context: &str) -> Option<(String, usize)> {
-    if !provider_context.contains(NEUROGRAPH_SURFACED_MARKER) {
+fn strip_rail_marked_assemblies(provider_context: &str) -> Option<(String, usize)> {
+    let has_rail = |text: &str| PROVIDER_RAIL_MARKERS.iter().any(|marker| text.contains(marker));
+    if !has_rail(provider_context) {
         return Some((provider_context.to_string(), 0));
     }
     let mut units: Vec<String> = Vec::new();
@@ -1120,7 +1127,7 @@ fn strip_surfaced_assemblies(provider_context: &str) -> Option<(String, usize)> 
         }
     };
     for unit in &units {
-        let marked = unit.contains(NEUROGRAPH_SURFACED_MARKER);
+        let marked = has_rail(unit);
         if unit.starts_with(PITH_ASSEMBLY_HEADING) {
             if marked {
                 removed += 1;
@@ -1355,12 +1362,12 @@ fn apply_provider_result(
             quest_focus,
         );
     };
-    let Some((context, _removed)) = strip_surfaced_assemblies(context) else {
+    let Some((context, _removed)) = strip_rail_marked_assemblies(context) else {
         return pith_failure_outcome(
             messages,
             PithFailure::new(
                 "provider context",
-                "surfaced marker outside a learned assembly",
+                "live rail marker outside a learned assembly",
             ),
             quest_focus,
         );
@@ -2857,13 +2864,15 @@ mod tests {
     // Pith-rendered context whose substrate node text echoes a surfaced hook
     // block, the shape found in the CC checkpoint (Packet 177).
     const SURFACED_NODE: &str = "- Keyframe: {\"type\":\"hook_additional_context\",\"content\":[\"[NeuroGraph Surfaced Knowledge]\\n- bash: ls\"]}";
+    // ... and one echoing the exact Quest banner (Packet 178).
+    const BANNER_NODE: &str = "- Keyframe: ACTIVE QUEST TRAIL for this session (injected by the Quest Tracker).\nCURRENT TASK";
 
     fn assembly(keyframe: &str) -> String {
         format!("### Connected assembly [learned from substrate; coherence: 0.8]\n{keyframe}\n- Sources: transcript")
     }
 
     #[test]
-    fn surfaced_assemblies_are_removed_whole_and_empty_sections_disappear() {
+    fn rail_marked_assemblies_are_removed_whole_and_empty_sections_disappear() {
         let context = [
             "## Who I Am\n- identity".to_string(),
             format!(
@@ -2871,11 +2880,11 @@ mod tests {
                 assembly("- Keyframe: kept situation"),
                 assembly(SURFACED_NODE)
             ),
-            format!("## Learned Corrections and Failures\n{}", assembly(SURFACED_NODE)),
+            format!("## Learned Corrections and Failures\n{}", assembly(BANNER_NODE)),
             format!("## Uncertainty and Conflicts\n{}", assembly("- Keyframe: kept conflict")),
         ]
         .join("\n\n");
-        let (kept, removed) = strip_surfaced_assemblies(&context).unwrap();
+        let (kept, removed) = strip_rail_marked_assemblies(&context).unwrap();
         assert_eq!(removed, 2);
         assert_eq!(
             kept,
@@ -2887,53 +2896,64 @@ mod tests {
             .join("\n\n")
         );
         assert!(!kept.contains(NEUROGRAPH_SURFACED_MARKER));
+        assert!(!kept.contains(QUEST_TRACKER_BANNER));
     }
 
     #[test]
     fn unmarked_context_passes_the_strip_byte_identical() {
         let context = format!("## Who I Am\n- identity\n\n## Learned Situation\n{}\n", assembly("- Keyframe: x"));
-        assert_eq!(strip_surfaced_assemblies(&context), Some((context.clone(), 0)));
+        assert_eq!(strip_rail_marked_assemblies(&context), Some((context.clone(), 0)));
     }
 
     #[test]
-    fn surfaced_marker_outside_an_assembly_declines_the_context() {
-        for context in [
-            format!("## Who I Am\n- identity {NEUROGRAPH_SURFACED_MARKER}"),
-            format!("{NEUROGRAPH_SURFACED_MARKER}\n\n## Who I Am\n- identity"),
-            format!(
-                "## Who I Am\n- identity\n\n## Learned Situation {NEUROGRAPH_SURFACED_MARKER}\n{}",
-                assembly("- Keyframe: x")
-            ),
-        ] {
-            assert_eq!(strip_surfaced_assemblies(&context), None, "{context}");
+    fn rail_marker_outside_an_assembly_declines_the_context() {
+        for marker in PROVIDER_RAIL_MARKERS {
+            for context in [
+                format!("## Who I Am\n- identity {marker}"),
+                format!("{marker}\n\n## Who I Am\n- identity"),
+                format!(
+                    "## Who I Am\n- identity\n\n## Learned Situation {marker}\n{}",
+                    assembly("- Keyframe: x")
+                ),
+            ] {
+                assert_eq!(strip_rail_marked_assemblies(&context), None, "{context}");
+            }
         }
     }
 
     #[test]
-    fn provider_context_with_surfaced_assembly_composes_one_marker() {
+    fn provider_context_with_rail_marked_assembly_composes_one_marker() {
         let original = history_then_live_turn(4);
-        let context = format!(
-            "## Who I Am\n- identity\n\n## Learned Situation\n{}\n\n{}",
-            assembly("- Keyframe: kept situation"),
-            assembly(SURFACED_NODE)
-        );
-        let outcome = apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
-        assert_eq!(outcome.failure, None);
-        assert_eq!(
-            outcome.messages[0]["content"],
-            format!(
-                "{NEUROGRAPH_SURFACED_MARKER}\n\n## Who I Am\n- identity\n\n## Learned Situation\n{}",
-                assembly("- Keyframe: kept situation")
-            )
-        );
-        assert_eq!(count_marker(&outcome.messages, NEUROGRAPH_SURFACED_MARKER), 1);
-        assert_no_history(&outcome.messages);
+        for node in [SURFACED_NODE, BANNER_NODE] {
+            let context = format!(
+                "## Who I Am\n- identity\n\n## Learned Situation\n{}\n\n{}",
+                assembly("- Keyframe: kept situation"),
+                assembly(node)
+            );
+            let outcome =
+                apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
+            assert_eq!(outcome.failure, None, "{node}");
+            assert_eq!(
+                outcome.messages[0]["content"],
+                format!(
+                    "{NEUROGRAPH_SURFACED_MARKER}\n\n## Who I Am\n- identity\n\n## Learned Situation\n{}",
+                    assembly("- Keyframe: kept situation")
+                )
+            );
+            assert_eq!(count_marker(&outcome.messages, NEUROGRAPH_SURFACED_MARKER), 1);
+            assert_eq!(count_marker(&outcome.messages, QUEST_TRACKER_BANNER), 0);
+            assert_no_history(&outcome.messages);
+        }
     }
 
     #[test]
     fn provider_context_left_empty_by_the_strip_returns_failure_envelope() {
         let original = history_then_live_turn(4);
-        let context = format!("## Learned Situation\n{}", assembly(SURFACED_NODE));
+        let context = format!(
+            "## Learned Situation\n{}\n\n{}",
+            assembly(SURFACED_NODE),
+            assembly(BANNER_NODE)
+        );
         let outcome = apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
         let failure = outcome.failure.expect("an emptied context is a failure");
         assert_eq!(failure.what, "provider context");
