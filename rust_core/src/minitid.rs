@@ -254,6 +254,11 @@
 //       the same rule through the same function, renamed
 //       strip_rail_marked_assemblies (PROVIDER_RAIL_MARKERS). Extraction side
 //       only; nothing is stripped from the substrate (LAW 7).
+//       077 notes 1-3: only the four contract `## ` headings open a section,
+//       so heading-shaped raw node text stays inside its assembly; tests
+//       cover raw newlines, relation/sources-only markers and both whys,
+//       and the alert section fixture is bullets as Pith renders it.
+//       cargo test: 73 passed, 0 failed.
 // -------------------
 //
 // Cadence behaviour:
@@ -1077,6 +1082,13 @@ fn provider_context_is_usable(provider_context: &str) -> bool {
 }
 
 const PITH_ASSEMBLY_HEADING: &str = "### Connected assembly [";
+/// The `## ` sections Pith renders (PITH_HOST_CONTRACT "Model-facing Markdown").
+const PITH_SECTION_HEADINGS: [&str; 4] = [
+    "## Who I Am",
+    "## Learned Situation",
+    "## Learned Corrections and Failures",
+    "## Uncertainty and Conflicts",
+];
 /// Live rail text a learned assembly can echo from substrate node text.
 const PROVIDER_RAIL_MARKERS: [&str; 2] = [NEUROGRAPH_SURFACED_MARKER, QUEST_TRACKER_BANNER];
 
@@ -1084,8 +1096,11 @@ const PROVIDER_RAIL_MARKERS: [&str; 2] = [NEUROGRAPH_SURFACED_MARKER, QUEST_TRAC
 /// surfaced marker, Packet 177, or the exact Quest banner, Packet 178) from
 /// the provider context miniTID received, instead of voiding the whole
 /// context.  Units follow the headings Pith renders (PITH_HOST_CONTRACT
-/// "Model-facing Markdown"): `## ` sections and `### Connected assembly [`
-/// cache lines.  A marked assembly goes whole, never a partial line, and a
+/// "Model-facing Markdown"): the four `## ` sections and `### Connected
+/// assembly [` cache lines.  Node text is raw and may carry newlines, so any
+/// other heading-shaped line is continuation text of the unit it sits in;
+/// only node text that reproduces one of those exact headings could split an
+/// assembly.  A marked assembly goes whole, never a partial line, and a
 /// learned section it leaves empty disappears.  The marker anywhere else --
 /// the constitutional core, a section's own text, text before any heading --
 /// is inseparable, so the context is declined.  Returns the kept context and
@@ -1097,8 +1112,9 @@ fn strip_rail_marked_assemblies(provider_context: &str) -> Option<(String, usize
     }
     let mut units: Vec<String> = Vec::new();
     for line in provider_context.split_inclusive('\n') {
+        let heading = line.trim_end_matches(['\n', '\r']);
         if units.is_empty()
-            || line.starts_with("## ")
+            || PITH_SECTION_HEADINGS.contains(&heading)
             || line.starts_with(PITH_ASSEMBLY_HEADING)
         {
             units.push(String::new());
@@ -1140,7 +1156,10 @@ fn strip_rail_marked_assemblies(provider_context: &str) -> Option<(String, usize
             return None;
         } else {
             settle(&mut kept, section, section_removed, section_survivors);
-            section = unit.starts_with("## ").then_some(kept.len());
+            section = PITH_SECTION_HEADINGS
+                .iter()
+                .any(|heading| unit.starts_with(heading))
+                .then_some(kept.len());
             section_removed = false;
             section_survivors = false;
             kept.push((unit, true));
@@ -2867,6 +2886,9 @@ mod tests {
     // ... and one echoing the exact Quest banner (Packet 178).
     const BANNER_NODE: &str = "- Keyframe: ACTIVE QUEST TRAIL for this session (injected by the Quest Tracker).\nCURRENT TASK";
 
+    // Pith's alert section carries bullets, not assemblies.
+    const UNCERTAINTY: &str = "## Uncertainty and Conflicts\n- A connected learned assembly is marked conflict; treat it as unresolved until live evidence confirms it.";
+
     fn assembly(keyframe: &str) -> String {
         format!("### Connected assembly [learned from substrate; coherence: 0.8]\n{keyframe}\n- Sources: transcript")
     }
@@ -2881,7 +2903,7 @@ mod tests {
                 assembly(SURFACED_NODE)
             ),
             format!("## Learned Corrections and Failures\n{}", assembly(BANNER_NODE)),
-            format!("## Uncertainty and Conflicts\n{}", assembly("- Keyframe: kept conflict")),
+            UNCERTAINTY.to_string(),
         ]
         .join("\n\n");
         let (kept, removed) = strip_rail_marked_assemblies(&context).unwrap();
@@ -2891,12 +2913,42 @@ mod tests {
             [
                 "## Who I Am\n- identity".to_string(),
                 format!("## Learned Situation\n{}", assembly("- Keyframe: kept situation")),
-                format!("## Uncertainty and Conflicts\n{}", assembly("- Keyframe: kept conflict")),
+                UNCERTAINTY.to_string(),
             ]
             .join("\n\n")
         );
         assert!(!kept.contains(NEUROGRAPH_SURFACED_MARKER));
         assert!(!kept.contains(QUEST_TRACKER_BANNER));
+    }
+
+    #[test]
+    fn marked_assembly_goes_whole_across_raw_newlines_and_every_line_kind() {
+        let marker = NEUROGRAPH_SURFACED_MARKER;
+        for body in [
+            // A real newline in node text; the marker sits on the continuation.
+            format!("- Keyframe: first line\nsecond line {marker}"),
+            // Heading-shaped node text after the marker must not survive.
+            format!("- Keyframe: {marker}\n## Setup from an ingested doc\n### Step one\ntail"),
+            // The marker only on a relation or sources line.
+            format!("- Keyframe: plain\n- causes: {marker}"),
+            format!("- Keyframe: plain\n- Sources: {marker}"),
+        ] {
+            let context = format!(
+                "## Who I Am\n- identity\n\n## Learned Situation\n{}\n\n{}",
+                assembly("- Keyframe: kept situation"),
+                assembly(&body)
+            );
+            let (kept, removed) = strip_rail_marked_assemblies(&context).unwrap();
+            assert_eq!(removed, 1, "{body}");
+            assert_eq!(
+                kept,
+                format!(
+                    "## Who I Am\n- identity\n\n## Learned Situation\n{}",
+                    assembly("- Keyframe: kept situation")
+                ),
+                "{body}"
+            );
+        }
     }
 
     #[test]
@@ -2957,7 +3009,22 @@ mod tests {
         let outcome = apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
         let failure = outcome.failure.expect("an emptied context is a failure");
         assert_eq!(failure.what, "provider context");
+        assert_eq!(failure.why, "empty, oversized, or carrying a live rail marker");
         assert_no_history(&outcome.messages);
+    }
+
+    #[test]
+    fn rail_marker_in_identity_returns_failure_envelope_naming_why() {
+        let original = history_then_live_turn(4);
+        for marker in PROVIDER_RAIL_MARKERS {
+            let context = format!("## Who I Am\n- identity {marker}");
+            let outcome =
+                apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
+            let failure = outcome.failure.expect("identity is never silently cut");
+            assert_eq!(failure.what, "provider context");
+            assert_eq!(failure.why, "live rail marker outside a learned assembly");
+            assert_no_history(&outcome.messages);
+        }
     }
 
     #[test]
