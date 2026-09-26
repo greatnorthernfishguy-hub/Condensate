@@ -5,3 +5,9 @@ __pycache__/
 rust_core/target/
 .venv/
 *.so
+
+# Runtime observer log (grows continuously, ~79 MB)
+laptop_observer.log
+
+# Claude Code nested worktrees (full checkouts — never track)
+.claude/worktrees/
