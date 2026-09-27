@@ -1,4 +1,31 @@
 // ---- Changelog ----
+// [2026-09-26] Z2 worker (OpenCode, deepseek-v4.1-flash) — restore Pith-failure
+//   pass-through (Exec P309(1), LAW 3; envelope superseded)
+// What: every Pith failure forwards the original inbound request bytes upstream
+//       byte-for-byte, the pre-951f360 behavior.  failure_envelope(),
+//       PITH_NOTICE_PREFIX, PithFailure::notice() and the notice/human-turn
+//       detection the counts line carried are gone; no notice is injected and
+//       no history is dropped on failure.  Gate refusals (no genuine human
+//       turn, missing session identity, poisoned lock), ambiguous Quest rails,
+//       daemon/socket/timeout errors, unusable or empty provider context, and
+//       composition/tail failure all forward the original bytes.  Compaction
+//       exemption, the non-JSON/no-messages forward, the success path,
+//       PithFailure's what/why/deposit_text and deposit_pith_failure() are
+//       unchanged.
+// Why:  Josh's ruling, 2026-09-26: "When Pith fails, there HAS to be
+//       pass-through, in order for any model to remain useful to fix anything
+//       else. No massive history CAN build up, anyway, between KISS and Pith."
+//       Executive Packet 309(1); LAW 3 restore of pre-951f360 behavior; the
+//       failure envelope is superseded (P155(3), P158(3), P161(1), the P167
+//       Pith PRD §12.1 edit, and the P174(2) amnesia rationale).
+// How:  pith_failure_outcome() returns the original message array;
+//       rewrite_request_body() returns body: None (so proxy forwards body_bytes
+//       unchanged) whenever the outcome reports a failure.  request_path_class()
+//       keeps the failure/unparsable split via PithFailure::what ("request
+//       body" is the unenvelopable body).  request_counts_line() drops the dead
+//       notice field and counts genuine human turns directly.  Tests that
+//       asserted the envelope are replaced by per-failure-class byte-identity
+//       tests.  cargo test: 76 passed, 0 failed (was 74).
 // [2026-06-22] Claude (Sonnet 4.6) — Initial build
 // What: CC-native KISS proxy for the Anthropic API.
 // Why:  KISS runs inside the NG sidecar (gateway-side, neurograph_rpc.py).
@@ -285,7 +312,7 @@
 //   and discarded there. Separately, gate_for_body() decides whether a
 //   request takes a gate decision at all (session identity + a genuine human
 //   turn + the compaction exemption). Every /v1/messages request is rewritten
-//   by Pith: fresh daemon context on success, the failure envelope on any
+//   by Pith: fresh daemon context on success, the original request bytes on any
 //   failure. Only Claude's native compaction request and a body that is
 //   not valid JSON or has no message array are forwarded unchanged. It
 //   never truncates message content itself. Each /v1/messages request also
@@ -293,7 +320,7 @@
 //
 // Session identity: SHA-256 of metadata.user_id.session_id, optionally
 // partitioned by a bounded x-claude-code-agent-id. Missing or malformed
-// identity yields the failure envelope without touching shared cadence state.
+// identity forwards the original bytes without touching shared cadence state.
 //
 // env vars:
 //   MINITID_PORT      — listen port (default: 9090)
@@ -690,9 +717,9 @@ fn gate_decision_for_body(
 // ============================================================================
 // Substrate peninsula — fresh provider context from CC's living NeuroGraph.
 // Always on: there is no off switch.  Obsolete history is evicted on every
-// request.  When Pith cannot build the fresh context, the request carries the
-// failure envelope instead (notice + current instruction + current tool
-// episode), never the original history (Pith PRD §12.1).
+// request.  When Pith cannot build the fresh context, the original request
+// bytes are forwarded unchanged (Exec P309(1) restore of pre-951f360
+// pass-through; the failure envelope is superseded).
 // ============================================================================
 
 /// Read MINITID_PENINSULA_SOCK (LAW 5), falling back to the default daemon
@@ -712,7 +739,7 @@ fn peninsula_sock_path() -> String {
 /// Call the CC daemon's read-only `provider_context` handler.  The request
 /// carries only attention cues already present in this request; it never sends
 /// transcript history.  Accept only the producer's closed fresh states.
-/// `Err` says why, for the failure envelope's notice and raw deposit.
+/// `Err` says why, for the raw failure deposit.
 async fn daemon_provider_context(
     current_instruction: String,
     quest_focus: String,
@@ -1069,10 +1096,10 @@ fn bounded_current_episode(cleaned: &[Value], tool_tail_bytes: usize) -> Option<
     Some(out)
 }
 
-/// The live request tail Pith keeps, on success and in the failure envelope
-/// alike: the latest genuine human message plus a bounded, pair-complete
-/// current tool episode. isMeta/compact-summary clutter is dropped and NG
-/// surfaces are stripped. None when any of those boundary checks fails.
+/// The live request tail Pith keeps on the success path: the latest genuine
+/// human message plus a bounded, pair-complete current tool episode.
+/// isMeta/compact-summary clutter is dropped and NG surfaces are stripped.
+/// None when any of those boundary checks fails.
 fn current_episode_tail(messages: &[Value]) -> Option<Vec<Value>> {
     let current = last_genuine_user_message_index(messages)?;
     let mut cleaned_messages = Vec::new();
@@ -1239,11 +1266,8 @@ fn compose_provider_messages(
     Some(out)
 }
 
-const PITH_NOTICE_WHY_MAX: usize = 200;
-const PITH_NOTICE_PREFIX: &str = "[Pith unavailable: ";
-
-/// What Pith could not do for this request and why.  Rendered two ways: a
-/// short notice for the provider, and raw text for the gateway tract.
+/// What Pith could not do for this request and why, carried for the raw
+/// gateway-tract deposit and the per-request counts line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PithFailure {
     what: &'static str,
@@ -1256,17 +1280,6 @@ impl PithFailure {
             what,
             why: why.into(),
         }
-    }
-
-    /// One short line: whitespace flattened, `why` bounded.
-    fn notice(&self) -> String {
-        let flat = self.why.split_whitespace().collect::<Vec<_>>().join(" ");
-        let why = if flat.chars().count() > PITH_NOTICE_WHY_MAX {
-            format!("{}...", flat.chars().take(PITH_NOTICE_WHY_MAX).collect::<String>())
-        } else {
-            flat
-        };
-        format!("{PITH_NOTICE_PREFIX}{} — {why}]", self.what)
     }
 
     /// Raw failure text for the substrate (LAW 7): no category, severity,
@@ -1294,10 +1307,11 @@ impl GateRefusal {
     }
 }
 
-/// The provider-bound result of one Pith pass.  `failure` is Some exactly
-/// when `messages` is the failure envelope.  `stripped` counts the learned
-/// assemblies removed from the received provider context for a live rail
-/// marker (either reason), whether or not the pass then succeeded.
+/// The provider-bound result of one Pith pass.  On a failure `messages` is the
+/// original inbound array unchanged and `failure` names why; the caller
+/// forwards the original bytes rather than this array.  `stripped` counts the
+/// learned assemblies removed from the received provider context for a live
+/// rail marker (either reason), whether or not the pass then succeeded.
 #[derive(Debug, PartialEq)]
 struct PithOutcome {
     messages: Vec<Value>,
@@ -1305,52 +1319,23 @@ struct PithOutcome {
     stripped: usize,
 }
 
-/// Pith PRD §12.1 failure envelope: the explicit notice, the Quest rail only
-/// when the inbound request carried one, then the current instruction and
-/// current tool episode.  If the tail cannot be built, the notice plus the
-/// exact current human text.  Never the earlier history, never blank.
-fn failure_envelope(
-    messages: &[Value],
-    failure: &PithFailure,
-    quest_focus: Option<&str>,
-) -> Vec<Value> {
-    let mut out = vec![serde_json::json!({"role": "user", "content": failure.notice()})];
-    if let Some(tail) = current_episode_tail(messages) {
-        let tail_has_rail = verified_quest_rails(&tail)
-            .map(|rails| !rails.is_empty())
-            .unwrap_or(true);
-        if !tail_has_rail {
-            if let Some(quest) = quest_focus.filter(|text| !text.is_empty()) {
-                out.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!(
-                        "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
-                    ),
-                }));
-            }
-        }
-        out.extend(tail);
-    } else if let Some(instruction) = messages.iter().rev().find_map(genuine_user_text) {
-        out.push(serde_json::json!({"role": "user", "content": instruction}));
-    }
-    out
-}
-
+/// A Pith failure forwards the original inbound messages unchanged (LAW 3
+/// restore of pre-951f360 behavior; the failure envelope is superseded).
 fn pith_failure_outcome(
     messages: &[Value],
     failure: PithFailure,
-    quest_focus: Option<&str>,
 ) -> PithOutcome {
     PithOutcome {
-        messages: failure_envelope(messages, &failure, quest_focus),
+        messages: messages.to_vec(),
         failure: Some(failure),
         stripped: 0,
     }
 }
 
 /// Build fresh context on every provider request.  Warmup and GOP cadence
-/// never restore raw history, and neither does failure: when the daemon or
-/// composition boundary is unavailable the result is the failure envelope.
+/// never restore raw history on success; on failure the original request bytes
+/// are forwarded unchanged (the pre-951f360 pass-through, restored by Exec
+/// Packet 309(1)).
 async fn apply_pith_peninsula(
     messages: &[Value],
     decision: GateDecision,
@@ -1360,14 +1345,12 @@ async fn apply_pith_peninsula(
         return pith_failure_outcome(
             messages,
             PithFailure::new("gate decision", "request carries no genuine human turn"),
-            None,
         );
     };
     let Ok(quest_focus) = extract_quest_focus(messages) else {
         return pith_failure_outcome(
             messages,
             PithFailure::new("Quest focus", "request carries ambiguous Quest rails"),
-            None,
         );
     };
     match daemon_provider_context(
@@ -1383,7 +1366,6 @@ async fn apply_pith_peninsula(
         Err(why) => pith_failure_outcome(
             messages,
             PithFailure::new("daemon provider_context", why),
-            quest_focus.as_deref(),
         ),
     }
 }
@@ -1398,7 +1380,6 @@ fn apply_provider_result(
         return pith_failure_outcome(
             messages,
             PithFailure::new("daemon provider_context", "no provider context returned"),
-            quest_focus,
         );
     };
     let Some((context, stripped)) = strip_rail_marked_assemblies(context) else {
@@ -1408,7 +1389,6 @@ fn apply_provider_result(
                 "provider context",
                 "live rail marker outside a learned assembly",
             ),
-            quest_focus,
         );
     };
     if !provider_context_is_usable(&context) {
@@ -1420,7 +1400,6 @@ fn apply_provider_result(
                     "provider context",
                     "empty, oversized, or carrying a live rail marker",
                 ),
-                quest_focus,
             )
         };
     }
@@ -1435,7 +1414,6 @@ fn apply_provider_result(
             ..pith_failure_outcome(
                 messages,
                 PithFailure::new("composition", "live tail or rail verification failed"),
-                quest_focus,
             )
         },
     }
@@ -1617,15 +1595,17 @@ struct PithRewrite {
     stripped: usize,
 }
 
-/// Run every `/v1/messages` request body through Pith.  The result is either
-/// the fresh context or the failure envelope; history is never forwarded.
-/// Two cases forward the original bytes:
+/// Run every `/v1/messages` request body through Pith.  On success the result
+/// is the fresh context; on any Pith failure the original request bytes are
+/// forwarded byte-for-byte (LAW 3 restore of pre-951f360 behavior; the failure
+/// envelope is superseded).  Two cases forward the original bytes without a
+/// Pith failure:
 ///   - Claude's native compaction request, a deliberate exemption and not a
 ///     Pith failure.  It is CC's own summarization call and carries the full
-///     history by design; enveloping it would break compaction.  No deposit.
+///     history by design; rewriting it would break compaction.  No deposit.
 ///   - A body that is not JSON or has no messages array.  Nothing in it can be
-///     enveloped (there is no message array to replay), so the bytes go
-///     upstream unchanged and the failure is deposited raw.  Never a 4xx.
+///     rewritten (there is no message array), so the bytes go upstream
+///     unchanged and the failure is deposited raw.  Never a 4xx.
 async fn rewrite_request_body(
     body_bytes: &[u8],
     headers: &HeaderMap,
@@ -1661,20 +1641,26 @@ async fn rewrite_request_body(
                 };
             };
             let Some(messages) = body["messages"].as_array().cloned() else {
-                // No message array to envelope: forward unchanged, deposit raw.
+                // No message array to rewrite: forward unchanged, deposit raw.
                 return PithRewrite {
                     body: None,
                     failure: Some(failure),
                     stripped: 0,
                 };
             };
-            let quest_focus = extract_quest_focus(&messages).ok().flatten();
-            pith_failure_outcome(&messages, failure, quest_focus.as_deref())
+            pith_failure_outcome(&messages, failure)
         }
     };
+    if outcome.failure.is_some() {
+        // Pith failed: forward the original request bytes byte-for-byte.
+        return PithRewrite {
+            body: None,
+            failure: outcome.failure,
+            stripped: outcome.stripped,
+        };
+    }
     body["messages"] = Value::Array(outcome.messages);
     // Serializing a serde_json::Value cannot fail: every map key is a string.
-    // Falling back to the original bytes here would replay history.
     let bytes = serde_json::to_vec(&body).expect("a serde_json::Value always serializes");
     PithRewrite {
         body: Some(bytes),
@@ -1683,32 +1669,26 @@ async fn rewrite_request_body(
     }
 }
 
-/// Which way a rewrite went: fresh Pith context, the failure envelope, the
-/// compaction exemption, or a body that could not be enveloped.
+/// Which way a rewrite went: fresh Pith context, a Pith failure (original
+/// bytes forwarded), the compaction exemption, or a body that could not be
+/// parsed into messages.
 fn request_path_class(rewrite: &PithRewrite) -> &'static str {
     match (&rewrite.body, &rewrite.failure) {
         (Some(_), None) => "pith",
         (Some(_), Some(_)) => "failure",
         (None, None) => "compaction",
-        (None, Some(_)) => "unparsable",
+        (None, Some(failure)) if failure.what == "request body" => "unparsable",
+        (None, Some(_)) => "failure",
     }
-}
-
-fn is_pith_notice(msg: &Value) -> bool {
-    msg["role"].as_str() == Some("user")
-        && msg["content"]
-            .as_str()
-            .is_some_and(|text| text.starts_with(PITH_NOTICE_PREFIX))
 }
 
 /// One line per /v1/messages request, counted from the bytes that arrived and
 /// the bytes forwarded (Packet 173(4)): counts only, never message text,
-/// headers or session identity.  `notice` is read from the forwarded messages,
-/// not from the path class, and the notice is not counted as a human turn,
-/// so `human_turns_out` above 1 outside compaction means history was replayed.
-/// `stripped` is the count of learned assemblies miniTID removed from the
-/// received provider context (Packet 177/178); the daemon's own assembly
-/// count overstates what reached the model by exactly that much.
+/// headers or session identity.  `human_turns_out` above 1 outside compaction
+/// means history was replayed.  `stripped` is the count of learned assemblies
+/// miniTID removed from the received provider context (Packet 177/178); the
+/// daemon's own assembly count overstates what reached the model by exactly
+/// that much.
 fn request_counts_line(path: &str, stripped: usize, original: &[u8], forwarded: &[u8]) -> String {
     let messages_of = |bytes: &[u8]| {
         serde_json::from_slice::<Value>(bytes)
@@ -1721,14 +1701,12 @@ fn request_counts_line(path: &str, stripped: usize, original: &[u8], forwarded: 
     };
     let msgs_in = messages_of(original).len();
     let out = messages_of(forwarded);
-    let notice = out.first().is_some_and(is_pith_notice);
     let human_turns_out = out
         .iter()
-        .skip(usize::from(notice))
         .filter(|msg| is_genuine_user_message(msg))
         .count();
     format!(
-        "miniTID request path={path} msgs_in={msgs_in} msgs_out={} bytes_in={} bytes_out={} notice={notice} human_turns_out={human_turns_out} stripped={stripped}",
+        "miniTID request path={path} msgs_in={msgs_in} msgs_out={} bytes_in={} bytes_out={} human_turns_out={human_turns_out} stripped={stripped}",
         out.len(),
         original.len(),
         forwarded.len(),
@@ -2690,17 +2668,11 @@ mod tests {
             Some("## Who I Am\n- identity"),
             None,
         );
-        // An inseparable marker quote cannot be stripped, so the tail fails and
-        // the envelope carries the notice plus the exact current human text.
+        // An inseparable marker quote cannot be stripped, so composition fails
+        // and the original messages are carried for pass-through.
         let failure = outcome.failure.expect("composition failure is reported");
         assert_eq!(failure.what, "composition");
-        assert_eq!(
-            outcome.messages,
-            vec![
-                json!({"role": "user", "content": failure.notice()}),
-                json!({"role": "user", "content": quote}),
-            ]
-        );
+        assert_eq!(outcome.messages, messages);
     }
 
     #[test]
@@ -2737,12 +2709,8 @@ mod tests {
         );
         let failure = outcome.failure.expect("tool metadata on isMeta is a failure");
         assert_eq!(
-            outcome.messages,
-            vec![
-                json!({"role": "user", "content": failure.notice()}),
-                json!({"role": "user", "content": INCIDENT_TASK}),
-            ],
-            "tool traffic hidden in isMeta yields notice + instruction, never the original"
+            outcome.messages, original,
+            "tool traffic hidden in isMeta yields the original messages for pass-through"
         );
     }
 
@@ -2895,10 +2863,10 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_failure_returns_envelope_without_history_or_faux_keyframes() {
-        // Four pairs fit KISS_RECENT_WINDOW, so the whole live turn is kept.
+    fn every_provider_failure_passes_the_original_messages_through() {
+        // Four pairs fit KISS_RECENT_WINDOW, so the whole live turn is present;
+        // every failure class still carries the original array unchanged.
         let original = history_then_live_turn(4);
-        let live_turn = current_turn_with_tool_pairs(4, false);
         for (failed, what) in [
             (None, "daemon provider_context"),
             (Some(""), "provider context"),
@@ -2908,10 +2876,7 @@ mod tests {
             let outcome = apply_provider_result(&original, GateDecision::Compress, failed, None);
             let failure = outcome.failure.expect("every provider failure is reported");
             assert_eq!(failure.what, what);
-            let mut expected = vec![json!({"role": "user", "content": failure.notice()})];
-            expected.extend(live_turn.clone());
-            assert_eq!(outcome.messages, expected);
-            assert_no_history(&outcome.messages);
+            assert_eq!(outcome.messages, original, "{what}");
             assert!(!serde_json::to_string(&outcome.messages).unwrap().contains('…'));
         }
     }
@@ -3035,7 +3000,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_context_left_empty_by_the_strip_returns_failure_envelope() {
+    fn provider_context_left_empty_by_the_strip_passes_the_original_through() {
         let original = history_then_live_turn(4);
         let context = format!(
             "## Learned Situation\n{}\n\n{}",
@@ -3046,11 +3011,12 @@ mod tests {
         let failure = outcome.failure.expect("an emptied context is a failure");
         assert_eq!(failure.what, "provider context");
         assert_eq!(failure.why, "empty, oversized, or carrying a live rail marker");
-        assert_no_history(&outcome.messages);
+        assert_eq!(outcome.messages, original);
+        assert_eq!(outcome.stripped, 2);
     }
 
     #[test]
-    fn rail_marker_in_identity_returns_failure_envelope_naming_why() {
+    fn rail_marker_in_identity_passes_the_original_through_naming_why() {
         let original = history_then_live_turn(4);
         for marker in PROVIDER_RAIL_MARKERS {
             let context = format!("## Who I Am\n- identity {marker}");
@@ -3059,7 +3025,7 @@ mod tests {
             let failure = outcome.failure.expect("identity is never silently cut");
             assert_eq!(failure.what, "provider context");
             assert_eq!(failure.why, "live rail marker outside a learned assembly");
-            assert_no_history(&outcome.messages);
+            assert_eq!(outcome.messages, original);
         }
     }
 
@@ -3118,23 +3084,56 @@ mod tests {
         format!("/tmp/minitid-test-no-daemon-{}.sock", std::process::id())
     }
 
-    fn rewritten_messages(rewrite: &PithRewrite) -> Vec<Value> {
-        let bytes = rewrite.body.as_ref().expect("Pith rewrites the body");
-        serde_json::from_slice::<Value>(bytes).unwrap()["messages"]
-            .as_array()
-            .unwrap()
-            .clone()
+    /// The bytes the proxy would forward, mirroring proxy()'s own choice:
+    /// `body` when Pith rewrote it, otherwise the original inbound bytes.
+    fn forwarded_bytes(rewrite: PithRewrite, original: &[u8]) -> Vec<u8> {
+        rewrite.body.unwrap_or_else(|| original.to_vec())
+    }
+
+    /// Spawn a one-shot fake daemon on `sock` that answers one request with
+    /// `response`.  The path is injected; no process env is mutated.
+    fn spawn_fake_daemon(sock: String, response: Value) -> std::thread::JoinHandle<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind fake daemon socket");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let clone = stream.try_clone().expect("clone fake daemon stream");
+                let mut reader = BufReader::new(clone);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let mut body = serde_json::to_vec(&response).expect("encode fake response");
+                body.push(b'\n');
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+            let _ = std::fs::remove_file(&sock);
+        })
+    }
+
+    fn daemon_response(context: &str, assemblies: u64) -> Value {
+        json!({
+            "ok": true,
+            "state": if assemblies > 0 { "ok" } else { "empty" },
+            "context": context,
+            "source": "cc_neurograph_topology",
+            "coherence": if assemblies > 0 { "shared" } else { "empty" },
+            "anchors": [],
+            "warnings": [],
+            "assemblies": assemblies,
+        })
     }
 
     #[tokio::test]
-    async fn peninsula_daemon_absent_returns_failure_envelope_without_history() {
+    async fn peninsula_daemon_absent_forwards_original_bytes_byte_identical() {
         // Live-condition regression guard (requirements-trace-001.md
-        // PITH-16): daemon.sock absent.  This used to fail open to the whole
-        // original history; the Pith PRD §12.1 envelope replaces that.  The
-        // socket path is injected rather than read from MINITID_PENINSULA_SOCK
-        // so no process-global env state is mutated.
+        // PITH-16): daemon.sock absent.  Exec P309(1) restored pass-through:
+        // the original request bytes go upstream byte-for-byte, history and
+        // all.  The socket path is injected rather than read from
+        // MINITID_PENINSULA_SOCK so no process-global env state is mutated.
         let quest = format!(
-            "{QUEST_TRACKER_BANNER} This is what you were working on and why.\n\nCurrent: envelope"
+            "{QUEST_TRACKER_BANNER} This is what you were working on and why.\n\nCurrent: passthrough"
         );
         let rail = json!({
             "role": "user",
@@ -3142,13 +3141,14 @@ mod tests {
                 "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
             )
         });
-        let mut messages = vec![rail.clone()];
+        let mut messages = vec![rail];
         messages.extend(history_then_live_turn(3));
         let request_body = body("daemon-absent-session", messages);
         let sessions = test_sessions();
+        let inbound = serde_json::to_vec(&request_body).unwrap();
 
         let rewrite = rewrite_request_body(
-            &serde_json::to_vec(&request_body).unwrap(),
+            &inbound,
             &headers(None),
             &sessions,
             missing_sock(),
@@ -3157,19 +3157,66 @@ mod tests {
         let failure = rewrite.failure.clone().expect("daemon absence is reported");
         assert_eq!(failure.what, "daemon provider_context");
         assert!(failure.why.starts_with("daemon socket unavailable: "), "{}", failure.why);
-        let out = rewritten_messages(&rewrite);
-        let mut expected = vec![json!({"role": "user", "content": failure.notice()}), rail];
-        expected.extend(current_turn_with_tool_pairs(3, false));
-        assert_eq!(out, expected, "notice + inbound Quest rail + live turn only");
-        assert_no_history(&out);
+        assert_eq!(rewrite.body, None, "a Pith failure forwards the original bytes");
+        assert_eq!(forwarded_bytes(rewrite, &inbound), inbound);
     }
 
     #[tokio::test]
-    async fn ambiguous_quest_rails_return_failure_envelope_without_history() {
+    async fn unusable_provider_context_forwards_original_bytes_byte_identical() {
+        // A valid daemon response whose only assembly carries the surfaced
+        // marker: the strip empties the context, so it is unusable.
+        let sock = format!(
+            "/tmp/minitid-test-unusable-context-{}.sock",
+            std::process::id()
+        );
+        let context = format!(
+            "## Learned Situation\n### Connected assembly [learned from substrate; coherence: 0.8]\n{NEUROGRAPH_SURFACED_MARKER}\n- Sources: transcript"
+        );
+        let daemon = spawn_fake_daemon(sock.clone(), daemon_response(&context, 1));
+
+        let request_body = body("unusable-context-session", history_then_live_turn(3));
+        let sessions = test_sessions();
+        let inbound = serde_json::to_vec(&request_body).unwrap();
+        let rewrite = rewrite_request_body(&inbound, &headers(None), &sessions, sock).await;
+        let failure = rewrite.failure.clone().expect("an emptied context is a failure");
+        assert_eq!(failure.what, "provider context");
+        assert_eq!(rewrite.body, None, "a Pith failure forwards the original bytes");
+        assert_eq!(forwarded_bytes(rewrite, &inbound), inbound);
+        let _ = daemon.join();
+    }
+
+    #[tokio::test]
+    async fn composition_failure_forwards_original_bytes_byte_identical() {
+        // A usable provider context, but the live tail carries an inseparable
+        // surfaced marker, so composition fails.
+        let sock = format!(
+            "/tmp/minitid-test-compose-fail-{}.sock",
+            std::process::id()
+        );
+        let daemon = spawn_fake_daemon(sock.clone(), daemon_response("## Who I Am\n- identity", 1));
+
+        let mut messages = history_then_live_turn(3);
+        messages.push(json!({
+            "role": "user",
+            "content": format!("Human quotation before {NEUROGRAPH_SURFACED_MARKER} must remain")
+        }));
+        let request_body = body("compose-failure-session", messages);
+        let sessions = test_sessions();
+        let inbound = serde_json::to_vec(&request_body).unwrap();
+        let rewrite = rewrite_request_body(&inbound, &headers(None), &sessions, sock).await;
+        let failure = rewrite.failure.clone().expect("composition failure is reported");
+        assert_eq!(failure.what, "composition");
+        assert_eq!(rewrite.body, None, "a Pith failure forwards the original bytes");
+        assert_eq!(forwarded_bytes(rewrite, &inbound), inbound);
+        let _ = daemon.join();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_quest_rails_forward_original_bytes_byte_identical() {
         // 077 review note 1: the ambiguous-Quest failure inside
         // apply_pith_peninsula, driven through rewrite_request_body.  It fails
-        // before the daemon is asked, so the socket is never touched.  Neither
-        // ambiguous rail is carried forward, and no earlier turn survives.
+        // before the daemon is asked, so the socket is never touched.  Exec
+        // P309(1): the original request bytes are forwarded unchanged.
         let ambiguous = json!({
             "role": "user",
             "content": format!(
@@ -3180,9 +3227,10 @@ mod tests {
         messages.extend(history_then_live_turn(3));
         let request_body = body("ambiguous-quest-session", messages);
         let sessions = test_sessions();
+        let inbound = serde_json::to_vec(&request_body).unwrap();
 
         let rewrite = rewrite_request_body(
-            &serde_json::to_vec(&request_body).unwrap(),
+            &inbound,
             &headers(None),
             &sessions,
             missing_sock(),
@@ -3191,18 +3239,15 @@ mod tests {
         let failure = rewrite.failure.clone().expect("ambiguous rails are reported");
         assert_eq!(failure.what, "Quest focus");
         assert_eq!(failure.why, "request carries ambiguous Quest rails");
-        let out = rewritten_messages(&rewrite);
-        let mut expected = vec![json!({"role": "user", "content": failure.notice()})];
-        expected.extend(current_turn_with_tool_pairs(3, false));
-        assert_eq!(out, expected, "notice + live turn only, no ambiguous rail");
-        assert_no_history(&out);
+        assert_eq!(rewrite.body, None, "a Pith failure forwards the original bytes");
+        assert_eq!(forwarded_bytes(rewrite, &inbound), inbound);
     }
 
     #[tokio::test]
-    async fn counts_line_reports_failure_envelope_counts_without_text() {
-        // Daemon absent: 13 messages with three human turns arrive; the notice
-        // plus the nine-message live turn leave.  The notice is not counted as
-        // a human turn, and no text, header or session identity is logged.
+    async fn counts_line_reports_failure_counts_without_text() {
+        // Daemon absent: 13 messages with three human turns arrive and, under
+        // Exec P309(1) pass-through, the same bytes leave.  No text, header or
+        // session identity is logged.
         let request_body = body("counts-failure-session", history_then_live_turn(4));
         let original = serde_json::to_vec(&request_body).unwrap();
         let rewrite = rewrite_request_body(
@@ -3212,7 +3257,8 @@ mod tests {
             missing_sock(),
         )
         .await;
-        let forwarded = rewrite.body.clone().expect("the envelope rewrites the body");
+        assert_eq!(rewrite.body, None, "a Pith failure forwards the original bytes");
+        let forwarded = original.clone();
         let failure = rewrite.failure.as_ref().expect("the daemon is absent");
         let line = request_counts_line(
             request_path_class(&rewrite),
@@ -3223,7 +3269,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "miniTID request path=failure msgs_in=13 msgs_out=10 bytes_in={} bytes_out={} notice=true human_turns_out=1 stripped=0",
+                "miniTID request path=failure msgs_in=13 msgs_out=13 bytes_in={} bytes_out={} human_turns_out=3 stripped=0",
                 original.len(),
                 forwarded.len()
             )
@@ -3247,7 +3293,7 @@ mod tests {
     #[test]
     fn counts_line_counts_one_human_turn_on_pith_context() {
         // The fresh context message carries the surfaced marker, so only the
-        // live human turn counts; notice is false on the success path.
+        // live human turn counts.
         let messages = history_then_live_turn(4);
         let out = compose_provider_messages(&messages, "fresh topology context", None)
             .expect("usable context composes");
@@ -3255,7 +3301,7 @@ mod tests {
         let forwarded = serde_json::to_vec(&json!({"messages": out})).unwrap();
         let line = request_counts_line("pith", 0, &original, &forwarded);
         assert!(line.contains(" msgs_in=13 msgs_out=10 "), "{line}");
-        assert!(line.ends_with(" notice=false human_turns_out=1 stripped=0"), "{line}");
+        assert!(line.ends_with(" human_turns_out=1 stripped=0"), "{line}");
     }
 
     #[test]
@@ -3272,7 +3318,7 @@ mod tests {
         assert_eq!((outcome.failure.as_ref(), outcome.stripped), (None, 2));
         let forwarded = serde_json::to_vec(&json!({"messages": outcome.messages})).unwrap();
         let line = request_counts_line("pith", outcome.stripped, &original, &forwarded);
-        assert!(line.ends_with(" notice=false human_turns_out=1 stripped=2"), "{line}");
+        assert!(line.ends_with(" human_turns_out=1 stripped=2"), "{line}");
         assert!(!line.contains("Keyframe") && !line.contains("Quest"), "{line}");
 
         // A context the strip empties is a failure that still reports the count.
@@ -3289,10 +3335,10 @@ mod tests {
         let original = serde_json::to_vec(&json!({"messages": history_then_live_turn(4)})).unwrap();
         let line = request_counts_line("compaction", 0, &original, &original);
         assert!(line.contains("path=compaction msgs_in=13 msgs_out=13 "), "{line}");
-        assert!(line.ends_with(" notice=false human_turns_out=3 stripped=0"), "{line}");
+        assert!(line.ends_with(" human_turns_out=3 stripped=0"), "{line}");
         assert_eq!(
             request_counts_line("unparsable", 0, b"not json", b"not json"),
-            "miniTID request path=unparsable msgs_in=0 msgs_out=0 bytes_in=8 bytes_out=8 notice=false human_turns_out=0 stripped=0"
+            "miniTID request path=unparsable msgs_in=0 msgs_out=0 bytes_in=8 bytes_out=8 human_turns_out=0 stripped=0"
         );
     }
 
@@ -3328,22 +3374,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warmup_never_replays_history_when_daemon_absent() {
-        // Warmup (FullPass) used to mean passthrough.  It now gets the same
-        // envelope as any other turn: the cadence decision never restores
-        // raw history.
+    async fn warmup_forwards_original_bytes_when_daemon_absent() {
+        // Warmup (FullPass) is a cadence decision, not a passthrough exception:
+        // when the daemon is absent the original request bytes are forwarded
+        // unchanged under Exec P309(1) pass-through.
         let request_body = body("warmup-session", history_then_live_turn(2));
         let sessions = test_sessions();
+        let inbound = serde_json::to_vec(&request_body).unwrap();
 
         let rewrite = rewrite_request_body(
-            &serde_json::to_vec(&request_body).unwrap(),
+            &inbound,
             &headers(None),
             &sessions,
             missing_sock(),
         )
         .await;
         assert!(rewrite.failure.is_some());
-        assert_no_history(&rewritten_messages(&rewrite));
+        assert_eq!(rewrite.body, None);
+        assert_eq!(forwarded_bytes(rewrite, &inbound), inbound);
         assert_eq!(
             gate_decision_for_body(&request_body, &headers(None), &sessions),
             Some(GateDecision::FullPass)
@@ -3351,14 +3399,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_precondition_failures_return_envelope_not_history() {
-        let live_turn = current_turn_with_tool_pairs(2, false);
-
+    async fn gate_precondition_failures_forward_original_bytes_not_history() {
         // No request identity: metadata absent.  Shared state stays untouched.
         let sessions = test_sessions();
         let no_identity = json!({"messages": history_then_live_turn(2)});
+        let inbound = serde_json::to_vec(&no_identity).unwrap();
         let rewrite = rewrite_request_body(
-            &serde_json::to_vec(&no_identity).unwrap(),
+            &inbound,
             &headers(None),
             &sessions,
             missing_sock(),
@@ -3366,9 +3413,8 @@ mod tests {
         .await;
         let failure = rewrite.failure.clone().expect("missing identity is reported");
         assert_eq!(failure.what, "session identity");
-        let mut expected = vec![json!({"role": "user", "content": failure.notice()})];
-        expected.extend(live_turn.clone());
-        assert_eq!(rewritten_messages(&rewrite), expected);
+        assert_eq!(rewrite.body, None);
+        assert_eq!(forwarded_bytes(rewrite, &inbound), inbound);
         assert!(sessions.lock().unwrap().entries.is_empty());
 
         // Poisoned cadence lock.
@@ -3377,8 +3423,10 @@ mod tests {
             let _guard = poisoned.lock().unwrap();
             panic!("poison cadence state for regression coverage");
         });
+        let inbound =
+            serde_json::to_vec(&body("poisoned-session", history_then_live_turn(2))).unwrap();
         let rewrite = rewrite_request_body(
-            &serde_json::to_vec(&body("poisoned-session", history_then_live_turn(2))).unwrap(),
+            &inbound,
             &headers(None),
             &poisoned,
             missing_sock(),
@@ -3389,17 +3437,17 @@ mod tests {
             failure,
             PithFailure::new("gate decision", "session cadence lock poisoned")
         );
-        let mut expected = vec![json!({"role": "user", "content": failure.notice()})];
-        expected.extend(live_turn);
-        assert_eq!(rewritten_messages(&rewrite), expected);
+        assert_eq!(rewrite.body, None);
+        assert_eq!(forwarded_bytes(rewrite, &inbound), inbound);
 
-        // No genuine human turn at all: the notice alone, never blank.
+        // No genuine human turn at all: the original bytes still go upstream.
         let harness_only = body(
             "harness-only-session",
             vec![json!({"role": "user", "content": "<system-reminder>\nharness only\n</system-reminder>"})],
         );
+        let inbound = serde_json::to_vec(&harness_only).unwrap();
         let rewrite = rewrite_request_body(
-            &serde_json::to_vec(&harness_only).unwrap(),
+            &inbound,
             &headers(None),
             &test_sessions(),
             missing_sock(),
@@ -3410,10 +3458,8 @@ mod tests {
             failure,
             PithFailure::new("gate decision", "request carries no genuine human turn")
         );
-        assert_eq!(
-            rewritten_messages(&rewrite),
-            vec![json!({"role": "user", "content": failure.notice()})]
-        );
+        assert_eq!(rewrite.body, None);
+        assert_eq!(forwarded_bytes(rewrite, &inbound), inbound);
     }
 
     #[tokio::test]
@@ -3497,17 +3543,11 @@ mod tests {
     }
 
     #[test]
-    fn failure_notice_is_one_bounded_line_and_deposit_text_is_raw() {
+    fn failure_deposit_text_is_raw_and_unbounded() {
+        // The notice renderer is gone with the envelope; the raw deposit text
+        // keeps the full why, newlines and all (LAW 7).
         let why = format!("line one\nline two {}", "x".repeat(500));
         let failure = PithFailure::new("daemon provider_context", why.clone());
-        let notice = failure.notice();
-        assert!(
-            notice.starts_with("[Pith unavailable: daemon provider_context — line one line two "),
-            "{notice}"
-        );
-        assert!(!notice.contains('\n'));
-        assert!(notice.ends_with("...]"));
-        assert!(notice.chars().count() <= PITH_NOTICE_WHY_MAX + 60);
         assert_eq!(
             failure.deposit_text(),
             format!("miniTID Pith peninsula failed: daemon provider_context: {why}")
