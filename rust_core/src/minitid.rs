@@ -10,12 +10,16 @@
 //       proves the needle is found in the input.  The Card 7 entry's
 //       "byte-for-byte" is qualified for isMeta/compact-summary clutter.
 //       deposit_turn takes its tract path as a parameter; a new test counts
-//       an unwritable turn deposit once on TURN_DEPOSITS_LOST.  Test
+//       an unwritable turn deposit once through count_lost_deposit, as the
+//       proxy does on TURN_DEPOSITS_LOST (the static itself stays untested:
+//       it would race across parallel tests).  Test
 //       provider_socket_request_contains_cues_and_no_history is renamed
 //       ..._contains_the_cue_and_no_history.
 // Why:  Card 7 LE check findings 3, 4, 6 and 7 (return
 //       zr-card7-minitid-quest-removal-review-001-le.md); the loss paths in
-//       findings 1-2 are #717, a separate follow-up.
+//       findings 1-2 are #717, a separate follow-up.  Re-check (LE,
+//       review-002) found the TURN_DEPOSITS_LOST test claim false and the
+//       statics' "visible" doc an overclaim; both reworded.
 // How:  Path injection follows deposit_pith_failure, so the existing turn
 //       test no longer sets CC_GATEWAY_TRACT_PATH (process-global) either.
 //       No behavior change.  cargo test --features minitid --bin minitid:
@@ -1473,7 +1477,8 @@ fn cc_gateway_tract_path() -> String {
 
 /// Deposits lost since start, one counter per path-class (#714, under
 /// #560's ruling: counted and named, no per-occurrence alarm, no abort, no
-/// reroute).  Every counts line reports both, so a lost deposit is visible.
+/// reroute).  Every counts line reports both cumulative totals; see
+/// request_counts_line for when a loss is named.
 static FAILURE_DEPOSITS_LOST: AtomicU64 = AtomicU64::new(0);
 static TURN_DEPOSITS_LOST: AtomicU64 = AtomicU64::new(0);
 
