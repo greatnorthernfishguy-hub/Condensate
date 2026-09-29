@@ -1,13 +1,16 @@
 // ---- Changelog ----
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 2
 //   stale-comment fix-up for the pass-through restore
-// What: the Cadence behaviour header and the test-module banner now describe
-//       pass-through on failure. Comments only; no code change.
-// Why:  e303896 review notes (grok XF #8962, LE #9002): both comments still
-//       described the superseded envelope ("rewritten ... on any failure";
+// What: the Cadence behaviour header, the test-module banner and the
+//       unparsable-body test's comment now describe pass-through on failure;
+//       that test is renamed unenvelopable_... -> unparsable_bodies_forward_
+//       bytes_and_report_failure (matching its path class). No behavior change.
+// Why:  e303896 review notes (grok XF #8962, LE #9002) and the Card 2 LE
+//       check of fab6ed2 (#9231): the comments still described the superseded
+//       envelope ("rewritten ... on any failure";
 //       "the failure mode is the §12.1 failure envelope"). Chief ruling:
 //       main must not carry an inaccurate comment about envelope semantics.
-// How:  comment text changed in place.
+// How:  comment text and one test name changed in place. cargo test: 76 passed.
 // [2026-09-26] Z2 worker (OpenCode, deepseek-v4.1-flash) — restore Pith-failure
 //   pass-through (Exec P309(1), LAW 3; envelope superseded)
 // What: every Pith failure forwards the original inbound request bytes upstream
@@ -3475,10 +3478,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unenvelopable_bodies_forward_bytes_and_report_failure() {
-        // Nothing here can be enveloped (no message array to replay): the
-        // bytes go upstream unchanged, never a 4xx, and the failure is
-        // reported for a raw deposit.
+    async fn unparsable_bodies_forward_bytes_and_report_failure() {
+        // Nothing here can be rewritten (no message array): the bytes go
+        // upstream unchanged, never a 4xx, and the failure is reported for a
+        // raw deposit.
         let sessions = test_sessions();
         let rewrite =
             rewrite_request_body(b"not json", &headers(None), &sessions, missing_sock()).await;
