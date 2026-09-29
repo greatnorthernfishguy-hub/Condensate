@@ -1,4 +1,25 @@
 // ---- Changelog ----
+// [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7
+//   check fix-up (Chief ruling, option b)
+// What: request_counts_line's doc now states the real #714 guarantee
+//       (process-wide cumulative counters; a loss is named on a later
+//       counts line; the last loss before idle/restart is not named; a
+//       restart zeroes both) instead of "never traceless", and drops the
+//       stale Packet 178 cite.  The eviction test's reminder check matches
+//       the JSON-escaped needle (it could never fail before) and first
+//       proves the needle is found in the input.  The Card 7 entry's
+//       "byte-for-byte" is qualified for isMeta/compact-summary clutter.
+//       deposit_turn takes its tract path as a parameter; a new test counts
+//       an unwritable turn deposit once on TURN_DEPOSITS_LOST.  Test
+//       provider_socket_request_contains_cues_and_no_history is renamed
+//       ..._contains_the_cue_and_no_history.
+// Why:  Card 7 LE check findings 3, 4, 6 and 7 (return
+//       zr-card7-minitid-quest-removal-review-001-le.md); the loss paths in
+//       findings 1-2 are #717, a separate follow-up.
+// How:  Path injection follows deposit_pith_failure, so the existing turn
+//       test no longer sets CC_GATEWAY_TRACT_PATH (process-global) either.
+//       No behavior change.  cargo test --features minitid --bin minitid:
+//       75 passed.
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7:
 //   Quest removed; lost deposits counted and named; dead path-class arm
 // What: (1) miniTID no longer knows what Quest is.  Its banner constant,
@@ -6,7 +27,9 @@
 //       re-injection and rail-count check, the rail marker, the usability
 //       check and the "ambiguous rails" failure class are gone.  Client text
 //       of that kind is ordinary content: in the live tail it passes through
-//       byte-for-byte; in history it is evicted like any history.
+//       byte-for-byte, except that an isMeta or compact-summary message
+//       there is dropped as clutter like any such message; in history it
+//       is evicted like any history.
 //       (2) #714: deposit_experience_entry, deposit_turn and
 //       deposit_pith_failure return their io::Result instead of discarding
 //       it (`let _ =`); count_lost_deposit bumps FAILURE_DEPOSITS_LOST or
@@ -1486,16 +1509,20 @@ fn deposit_experience_entry(path: &str, source: &str, content: String) -> std::i
 /// record -- the daemon's own dual-pass chains consecutive conversational
 /// deposits via a delayed synapse regardless of physical turn boundaries.
 /// Fails soft: this must never affect the proxied response to the client.
-/// `Err` when either entry could not be written; the caller counts it.
-fn deposit_turn(user_message: Option<String>, assistant_text: String) -> std::io::Result<()> {
-    let path = cc_gateway_tract_path();
-    if let Some(dir) = std::path::Path::new(&path).parent() {
+/// `Err` when either entry could not be written; the caller counts it.  The
+/// path is a parameter so tests need not mutate process env.
+fn deposit_turn(
+    path: &str,
+    user_message: Option<String>,
+    assistant_text: String,
+) -> std::io::Result<()> {
+    if let Some(dir) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(dir)?;
     }
     let user = user_message.map_or(Ok(()), |user_text| {
-        deposit_experience_entry(&path, "cc_gateway", user_text)
+        deposit_experience_entry(path, "cc_gateway", user_text)
     });
-    let assistant = deposit_experience_entry(&path, "cc_gateway", assistant_text);
+    let assistant = deposit_experience_entry(path, "cc_gateway", assistant_text);
     user.and(assistant)
 }
 
@@ -1642,11 +1669,13 @@ fn request_path_class(rewrite: &PithRewrite) -> &'static str {
 /// the bytes forwarded (Packet 173(4)): counts only, never message text,
 /// headers or session identity.  `human_turns_out` above 1 outside compaction
 /// means history was replayed.  `stripped` is the count of learned assemblies
-/// miniTID removed from the received provider context (Packet 177/178); the
+/// miniTID removed from the received provider context (Packet 177); the
 /// daemon's own assembly count overstates what reached the model by exactly
-/// that much.  `deposits_lost` is (Pith-failure, turn) deposits lost since
-/// start, read from the two #714 counters, so a lost deposit is never
-/// traceless.
+/// that much.  `deposits_lost` is (Pith-failure, turn) deposits lost, read
+/// from the two #714 counters.  They are process-wide and cumulative: a loss
+/// is named on a later counts line (a turn loss always is, since it happens
+/// after the response), the last loss before idle or restart is not named,
+/// and a restart zeroes both.
 fn request_counts_line(
     path: &str,
     stripped: usize,
@@ -1807,7 +1836,7 @@ async fn proxy(
         };
         let assistant_text = reconstruct_assistant_text(&accumulated);
         count_lost_deposit(
-            deposit_turn(last_user_message, assistant_text),
+            deposit_turn(&cc_gateway_tract_path(), last_user_message, assistant_text),
             &TURN_DEPOSITS_LOST,
         );
     });
@@ -1977,7 +2006,10 @@ mod tests {
         assert_eq!(out[1], current);
         assert_eq!(count_marker(&out, NEUROGRAPH_SURFACED_MARKER), 1);
         assert_eq!(genuine_user_text(&out[0]), None);
-        assert!(!serde_json::to_string(&out).unwrap().contains(reminder));
+        let escaped = serde_json::to_string(reminder).unwrap();
+        let escaped = &escaped[1..escaped.len() - 1];
+        assert!(serde_json::to_string(&messages).unwrap().contains(escaped));
+        assert!(!serde_json::to_string(&out).unwrap().contains(escaped));
         assert!(!serde_json::to_string(&out).unwrap().contains(LONG));
         assert!(!serde_json::to_string(&out).unwrap().contains('…'));
         assert_eq!(
@@ -2690,7 +2722,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_socket_request_contains_cues_and_no_history() {
+    fn provider_socket_request_contains_the_cue_and_no_history() {
         let request = provider_context_request(INCIDENT_TASK);
         assert_eq!(request["event"], "provider_context");
         assert_eq!(request["data"]["current_instruction"], INCIDENT_TASK);
@@ -3496,6 +3528,39 @@ mod tests {
     }
 
     #[test]
+    fn unwritable_turn_deposit_is_counted_once_and_named() {
+        // #714: the turn path's own counter.  A turn is one loss however many
+        // of its two entries failed, and an empty turn writes nothing.
+        let dir = std::env::temp_dir().join(format!("minitid_lost_turn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not_a_dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        let no_dir = blocker.join("cc_gateway").join("turns.tract");
+        let tract_is_dir = dir.join("turns.tract");
+        std::fs::create_dir_all(&tract_is_dir).unwrap();
+
+        let lost = AtomicU64::new(0);
+        for path in [&no_dir, &tract_is_dir] {
+            let result = deposit_turn(
+                path.to_str().unwrap(),
+                Some("a human turn".to_string()),
+                "an assistant reply".to_string(),
+            );
+            assert!(result.is_err(), "{}", path.display());
+            count_lost_deposit(result, &lost);
+        }
+        assert_eq!(lost.load(Ordering::Relaxed), 2);
+        let line = request_counts_line("pith", 0, b"not json", b"not json", (0, 2));
+        assert!(line.ends_with(" failure_deposits_lost=0 turn_deposits_lost=2"), "{line}");
+
+        let empty = deposit_turn(tract_is_dir.to_str().unwrap(), None, "  ".to_string());
+        count_lost_deposit(empty, &lost);
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "nothing to write is not a loss");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn pith_failure_deposit_writes_one_raw_cc_gateway_experience() {
         use ng_tract::read::{ReadResult, TractReader};
         use ng_tract::TractEntry;
@@ -3685,10 +3750,10 @@ mod tests {
 
         let tmp =
             std::env::temp_dir().join(format!("minitid_test_tract_{}.tract", std::process::id()));
-        std::env::set_var("CC_GATEWAY_TRACT_PATH", tmp.to_str().unwrap());
         let _ = std::fs::remove_file(&tmp);
 
         deposit_turn(
+            tmp.to_str().unwrap(),
             Some("what is the numpy issue".to_string()),
             "it's a stray .pth file".to_string(),
         )
