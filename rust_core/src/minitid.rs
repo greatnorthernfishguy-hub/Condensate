@@ -1,4 +1,26 @@
 // ---- Changelog ----
+// [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7b:
+//   the two uncounted turn-deposit loss paths are counted and named (#717)
+// What: (1) A panicked or cancelled response accumulator used to return
+//       without counting; on a /v1/messages request it now counts one lost
+//       turn on TURN_DEPOSITS_LOST (deposit_turn_when_accumulated, which
+//       proxy() now spawns).  (2) A failed upstream send used to return 502
+//       through `?` before any deposit, uncounted; it now counts the human
+//       turn it never deposited on TURN_DEPOSITS_LOST (count_unsent_turn),
+//       then returns the same 502.  request_counts_line's doc now says a
+//       failed-send loss may land on its own request's line.
+// Why:  Executive Packet 338, Card 7b; LE finding 1 of the Card 7 check.
+//       Same #560 ruling as #714: count and name, no alarm, no abort, no
+//       reroute.
+// How:  Each loss decision lives in a helper that takes the counter, so
+//       the two new tests drive the exact code proxy() calls (a real
+//       panicking task, a real aborted task, real deposit paths) on a local
+//       counter; only the proxy passing &TURN_DEPOSITS_LOST is by reading
+//       (the static would race across parallel tests).  The tract path is
+//       now resolved when the deposit task starts rather than after the
+//       accumulator finishes.  The earlier req_method `?` (400) is not a
+//       turn loss path this card names.  cargo test --features minitid
+//       --bin minitid: 77 passed.
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7
 //   check fix-up (Chief ruling, option b)
 // What: request_counts_line's doc now states the real #714 guarantee
@@ -1531,6 +1553,42 @@ fn deposit_turn(
     user.and(assistant)
 }
 
+/// Await the response accumulator, then deposit the turn, counting a lost
+/// deposit on `lost`.  A panicked or cancelled accumulator leaves no
+/// response to reconstruct, so nothing of the turn is deposited; on a
+/// /v1/messages request that is one lost turn and is counted (#717).  Other
+/// requests carry no turn, so theirs is not.  The proxied response is never
+/// affected.
+async fn deposit_turn_when_accumulated(
+    accumulator: tokio::task::JoinHandle<Vec<u8>>,
+    path: &str,
+    is_messages: bool,
+    user_message: Option<String>,
+    lost: &AtomicU64,
+) {
+    let accumulated = match accumulator.await {
+        Ok(bytes) => bytes,
+        Err(join_error) => {
+            if is_messages {
+                count_lost_deposit(Err(std::io::Error::other(join_error)), lost);
+            }
+            return;
+        }
+    };
+    let assistant_text = reconstruct_assistant_text(&accumulated);
+    count_lost_deposit(deposit_turn(path, user_message, assistant_text), lost);
+}
+
+/// Count the human turn of a request whose upstream send failed (#717).  The
+/// 502 returns before any response exists, so the turn is never deposited.
+/// A request with no human text (tool traffic, whitespace) would have
+/// deposited nothing, so it is not a loss.
+fn count_unsent_turn(user_message: Option<&str>, lost: &AtomicU64) {
+    if user_message.is_some_and(|text| !text.trim().is_empty()) {
+        lost.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Deposit one Pith failure as raw experience (LAW 7) on the gateway tract,
 /// the same unlabeled `cc_gateway` frame deposit_turn writes.  The path is a
 /// parameter so tests need not mutate process env.  Fails soft: `Err` when
@@ -1678,9 +1736,10 @@ fn request_path_class(rewrite: &PithRewrite) -> &'static str {
 /// daemon's own assembly count overstates what reached the model by exactly
 /// that much.  `deposits_lost` is (Pith-failure, turn) deposits lost, read
 /// from the two #714 counters.  They are process-wide and cumulative: a loss
-/// is named on a later counts line (a turn loss always is, since it happens
-/// after the response), the last loss before idle or restart is not named,
-/// and a restart zeroes both.
+/// is named on a later counts line (a turn loss after a response always is;
+/// one from a failed upstream send races this request's own line, so it is
+/// named on that line or a later one), the last loss before idle or restart
+/// is not named, and a restart zeroes both.
 fn request_counts_line(
     path: &str,
     stripped: usize,
@@ -1797,10 +1856,13 @@ async fn proxy(
     }
     rb = rb.body(body_bytes.to_vec());
 
-    let upstream_resp = rb
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let upstream_resp = match rb.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            count_unsent_turn(last_user_message.as_deref(), &TURN_DEPOSITS_LOST);
+            return Err((StatusCode::BAD_GATEWAY, e.to_string()));
+        }
+    };
 
     // Map status and headers, stream body back.
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())
@@ -1835,15 +1897,14 @@ async fn proxy(
     });
 
     tokio::spawn(async move {
-        let accumulated = match accumulator_task.await {
-            Ok(bytes) => bytes,
-            Err(_) => return, // task panicked -- nothing to deposit, never crash the proxy
-        };
-        let assistant_text = reconstruct_assistant_text(&accumulated);
-        count_lost_deposit(
-            deposit_turn(&cc_gateway_tract_path(), last_user_message, assistant_text),
+        deposit_turn_when_accumulated(
+            accumulator_task,
+            &cc_gateway_tract_path(),
+            is_messages,
+            last_user_message,
             &TURN_DEPOSITS_LOST,
-        );
+        )
+        .await;
     });
 
     let out_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -3563,6 +3624,52 @@ mod tests {
         count_lost_deposit(empty, &lost);
         assert_eq!(lost.load(Ordering::Relaxed), 2, "nothing to write is not a loss");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_accumulator_is_counted_as_one_lost_turn() {
+        // #717 path (1): a panicked or cancelled accumulator used to return
+        // uncounted.  Drives the helper proxy() spawns, with real JoinErrors.
+        let dir = std::env::temp_dir().join(format!("minitid_lost_accum_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tract = dir.join("cc_gateway").join("turns.tract");
+        let path = tract.to_str().unwrap();
+        let lost = AtomicU64::new(0);
+
+        let panicked = tokio::spawn(async { panic!("accumulator panicked") });
+        deposit_turn_when_accumulated(panicked, path, true, Some("hi".into()), &lost).await;
+        assert_eq!(lost.load(Ordering::Relaxed), 1, "panic");
+
+        let cancelled = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Vec::new()
+        });
+        cancelled.abort();
+        deposit_turn_when_accumulated(cancelled, path, true, None, &lost).await;
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "cancellation");
+
+        let not_a_turn = tokio::spawn(async { panic!("accumulator panicked") });
+        deposit_turn_when_accumulated(not_a_turn, path, false, None, &lost).await;
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "a non-/v1/messages request carries no turn");
+        assert!(!tract.exists(), "a failed accumulator deposits nothing");
+
+        let finished = tokio::spawn(async { Vec::new() });
+        deposit_turn_when_accumulated(finished, path, true, Some("hi".into()), &lost).await;
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "a written turn is not a loss");
+        assert!(tract.exists(), "the finished turn is deposited");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_upstream_send_counts_the_unsent_human_turn() {
+        // #717 path (2): a 502 on send used to return before any deposit,
+        // uncounted.  Only a turn that would have been written is a loss.
+        let lost = AtomicU64::new(0);
+        count_unsent_turn(Some("a human turn"), &lost);
+        assert_eq!(lost.load(Ordering::Relaxed), 1);
+        count_unsent_turn(None, &lost);
+        count_unsent_turn(Some("  \n"), &lost);
+        assert_eq!(lost.load(Ordering::Relaxed), 1, "no human text is not a loss");
     }
 
     #[test]
