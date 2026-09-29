@@ -1,4 +1,40 @@
 // ---- Changelog ----
+// [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7b:
+//   a turn miniTID read but could not deposit is counted and named
+//   (#717, #719)
+// What: (1) A panicked or cancelled response accumulator used to return
+//       without counting; on a /v1/messages request it now counts one lost
+//       turn on TURN_DEPOSITS_LOST (deposit_turn_when_accumulated, which
+//       proxy() now spawns).  (2) The extracted human turn is now held by
+//       an UndepositedTurn guard until proxy() hands it to that deposit.
+//       Any earlier end of proxy() drops the guard, which counts the turn
+//       on TURN_DEPOSITS_LOST: the failed upstream send (502, #717), the
+//       req_method `?` (400), and the handler future dropped mid-await on
+//       client disconnect (#719).  Responses are unchanged.  Not counted:
+//       any stop of the process (SIGTERM, SIGINT, SIGKILL) -- miniTID has
+//       no graceful shutdown, so no Drop runs, and the counters die with
+//       the process anyway.  request_counts_line's doc now says when those
+//       losses are named.  An unused test binding (tool metadata on isMeta)
+//       is dropped.
+// Why:  Executive Packet 338, Card 7b; LE finding 1 of the Card 7 check
+//       and of the Card 7b check (#719, folded in by chief-003).  Same #560
+//       ruling as #714: count and name, no alarm, no abort, no reroute.
+// How:  The loss decisions live in deposit_turn_when_accumulated and the
+//       guard, both of which take the counter, and the two new tests drive
+//       them on a local counter: a real panicking task, a real aborted
+//       task and real deposit paths; a guard dropped by an early return
+//       and by a future dropped while parked at an await; a handed-off
+//       turn.  By reading only: that proxy() passes &TURN_DEPOSITS_LOST
+//       (the static would race across parallel tests), creates the guard
+//       right after extraction, and hands it off only where it spawns the
+//       deposit, passing is_messages and the handed-off message; that the
+//       guard's blank-text rule matches deposit_turn's write rule; and that
+//       the 400 and 502 responses are unchanged.  Outside this repo and
+//       untested: that axum/hyper drops the handler future when the client
+//       disconnects (the parked-future test stands in for it).  The
+//       tract path is now resolved when the deposit task starts rather
+//       than after the accumulator finishes.  cargo test --features
+//       minitid --bin minitid: 77 passed.
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7
 //   check fix-up (Chief ruling, option b)
 // What: request_counts_line's doc now states the real #714 guarantee
@@ -1531,6 +1567,59 @@ fn deposit_turn(
     user.and(assistant)
 }
 
+/// Await the response accumulator, then deposit the turn, counting a lost
+/// deposit on `lost`.  A panicked or cancelled accumulator leaves no
+/// response to reconstruct, so nothing of the turn is deposited; on a
+/// /v1/messages request that is one lost turn and is counted (#717).  Other
+/// requests carry no turn, so theirs is not.  The proxied response is never
+/// affected.
+async fn deposit_turn_when_accumulated(
+    accumulator: tokio::task::JoinHandle<Vec<u8>>,
+    path: &str,
+    is_messages: bool,
+    user_message: Option<String>,
+    lost: &AtomicU64,
+) {
+    let accumulated = match accumulator.await {
+        Ok(bytes) => bytes,
+        Err(join_error) => {
+            if is_messages {
+                count_lost_deposit(Err(std::io::Error::other(join_error)), lost);
+            }
+            return;
+        }
+    };
+    let assistant_text = reconstruct_assistant_text(&accumulated);
+    count_lost_deposit(deposit_turn(path, user_message, assistant_text), lost);
+}
+
+/// A request's human turn, held from extraction until proxy() hands it to the
+/// turn deposit.  If proxy() ends first -- the upstream send fails (502), an
+/// earlier `?` returns, or the handler future is dropped mid-await because
+/// the client disconnected -- the turn is never deposited, and dropping the
+/// guard counts it on `lost` (#717, #719).  A stopped process runs no Drop
+/// (there is no graceful shutdown), so its in-flight turns are not counted.
+/// Text deposit_turn would not write (none, or whitespace) is not a loss.
+struct UndepositedTurn<'a> {
+    user_message: Option<String>,
+    lost: &'a AtomicU64,
+}
+
+impl UndepositedTurn<'_> {
+    /// Release the turn to the deposit, which counts its own loss from here.
+    fn hand_off(mut self) -> Option<String> {
+        self.user_message.take()
+    }
+}
+
+impl Drop for UndepositedTurn<'_> {
+    fn drop(&mut self) {
+        if self.user_message.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+            self.lost.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Deposit one Pith failure as raw experience (LAW 7) on the gateway tract,
 /// the same unlabeled `cc_gateway` frame deposit_turn writes.  The path is a
 /// parameter so tests need not mutate process env.  Fails soft: `Err` when
@@ -1678,9 +1767,13 @@ fn request_path_class(rewrite: &PithRewrite) -> &'static str {
 /// daemon's own assembly count overstates what reached the model by exactly
 /// that much.  `deposits_lost` is (Pith-failure, turn) deposits lost, read
 /// from the two #714 counters.  They are process-wide and cumulative: a loss
-/// is named on a later counts line (a turn loss always is, since it happens
-/// after the response), the last loss before idle or restart is not named,
-/// and a restart zeroes both.
+/// is named on a later counts line (a turn loss after a response always is;
+/// one from the req_method or send `?`, or a handler dropped awaiting the
+/// send, races this request's own line, so it is named on that line or a
+/// later one; a
+/// handler dropped awaiting Pith has no line of its own, so a later one
+/// names it), the last loss before idle or restart is not named, and a
+/// restart zeroes both.
 fn request_counts_line(
     path: &str,
     stripped: usize,
@@ -1734,10 +1827,14 @@ async fn proxy(
 
     // Extract the latest genuine user message from the original bytes, before any
     // rewrite. Trailing user-role entries may be tool results or injected harness context.
-    let last_user_message = if is_messages {
-        extract_last_user_message(&body_bytes)
-    } else {
-        None
+    // Until it is handed to the deposit, any exit from proxy() counts it lost.
+    let pending_turn = UndepositedTurn {
+        user_message: if is_messages {
+            extract_last_user_message(&body_bytes)
+        } else {
+            None
+        },
+        lost: &TURN_DEPOSITS_LOST,
     };
 
     // Every /v1/messages request goes through Pith; there is no off switch.
@@ -1834,16 +1931,16 @@ async fn proxy(
         accumulated
     });
 
+    let last_user_message = pending_turn.hand_off();
     tokio::spawn(async move {
-        let accumulated = match accumulator_task.await {
-            Ok(bytes) => bytes,
-            Err(_) => return, // task panicked -- nothing to deposit, never crash the proxy
-        };
-        let assistant_text = reconstruct_assistant_text(&accumulated);
-        count_lost_deposit(
-            deposit_turn(&cc_gateway_tract_path(), last_user_message, assistant_text),
+        deposit_turn_when_accumulated(
+            accumulator_task,
+            &cc_gateway_tract_path(),
+            is_messages,
+            last_user_message,
             &TURN_DEPOSITS_LOST,
-        );
+        )
+        .await;
     });
 
     let out_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -2649,7 +2746,7 @@ mod tests {
             GateDecision::Compress,
             Some("## Who I Am\n- identity"),
         );
-        let failure = outcome.failure.expect("tool metadata on isMeta is a failure");
+        outcome.failure.expect("tool metadata on isMeta is a failure");
         assert_eq!(
             outcome.messages, original,
             "tool traffic hidden in isMeta yields the original messages for pass-through"
@@ -3563,6 +3660,78 @@ mod tests {
         count_lost_deposit(empty, &lost);
         assert_eq!(lost.load(Ordering::Relaxed), 2, "nothing to write is not a loss");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_accumulator_is_counted_as_one_lost_turn() {
+        // #717 path (1): a panicked or cancelled accumulator used to return
+        // uncounted.  Drives the helper proxy() spawns, with real JoinErrors.
+        let dir = std::env::temp_dir().join(format!("minitid_lost_accum_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tract = dir.join("cc_gateway").join("turns.tract");
+        let path = tract.to_str().unwrap();
+        let lost = AtomicU64::new(0);
+
+        let panicked = tokio::spawn(async { panic!("accumulator panicked") });
+        deposit_turn_when_accumulated(panicked, path, true, Some("hi".into()), &lost).await;
+        assert_eq!(lost.load(Ordering::Relaxed), 1, "panic");
+
+        let cancelled = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Vec::new()
+        });
+        cancelled.abort();
+        deposit_turn_when_accumulated(cancelled, path, true, None, &lost).await;
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "cancellation");
+
+        let not_a_turn = tokio::spawn(async { panic!("accumulator panicked") });
+        deposit_turn_when_accumulated(not_a_turn, path, false, None, &lost).await;
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "a non-/v1/messages request carries no turn");
+        assert!(!tract.exists(), "a failed accumulator deposits nothing");
+
+        let finished = tokio::spawn(async { Vec::new() });
+        deposit_turn_when_accumulated(finished, path, true, Some("hi".into()), &lost).await;
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "a written turn is not a loss");
+        assert!(tract.exists(), "the finished turn is deposited");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_turn_that_never_reaches_the_deposit_is_counted_once() {
+        // #717 path (2) and #719: a failed send, an early `?`, or the handler
+        // future dropped mid-await each end proxy() before the hand-off,
+        // which used to lose the turn uncounted.  All of them drop the guard.
+        use futures_util::FutureExt;
+        let lost = AtomicU64::new(0);
+        let turn = |text: Option<&str>| UndepositedTurn {
+            user_message: text.map(str::to_string),
+            lost: &lost,
+        };
+
+        // An early return (the failed send, or `?`) just drops the guard.
+        let early_return = |pending: UndepositedTurn| -> Result<(), ()> {
+            let _pending = pending;
+            Err(())
+        };
+        assert!(early_return(turn(Some("a human turn"))).is_err());
+        assert_eq!(lost.load(Ordering::Relaxed), 1, "early return");
+
+        // A future parked at an await, then dropped: what hyper does to the
+        // handler on client disconnect (that part is not tested here).
+        let pending = turn(Some("a human turn"));
+        let mut parked = Box::pin(async move {
+            let _pending = pending;
+            std::future::pending::<()>().await;
+        });
+        assert!((&mut parked).now_or_never().is_none(), "parked at the await");
+        drop(parked);
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "future dropped mid-await");
+
+        // A handed-off turn is the deposit's to count, not the guard's.
+        assert_eq!(turn(Some("a human turn")).hand_off().as_deref(), Some("a human turn"));
+        drop(turn(None));
+        drop(turn(Some("  \n")));
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "handed off, or no human text");
     }
 
     #[test]
