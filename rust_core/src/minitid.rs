@@ -1,4 +1,28 @@
 // ---- Changelog ----
+// [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7:
+//   Quest removed; lost deposits counted and named; dead path-class arm
+// What: (1) miniTID no longer knows what Quest is.  Its banner constant,
+//       extraction, the quest_focus cue to provider_context, the composition
+//       re-injection and rail-count check, the rail marker, the usability
+//       check and the "ambiguous rails" failure class are gone.  Client text
+//       of that kind is ordinary content: in the live tail it passes through
+//       byte-for-byte; in history it is evicted like any history.
+//       (2) #714: deposit_experience_entry, deposit_turn and
+//       deposit_pith_failure return their io::Result instead of discarding
+//       it (`let _ =`); count_lost_deposit bumps FAILURE_DEPOSITS_LOST or
+//       TURN_DEPOSITS_LOST, and every counts line reports both as
+//       failure_deposits_lost= / turn_deposits_lost=.  (3) #715: the one
+//       success site builds `failure: None`; the dead (Some, Some) arm in
+//       request_path_class shares the failure arm.
+// Why:  Card 7 (Exec P320/P336/P337); Pith PRD §3.1/§12.1 (Card 1, docs
+//       fef33d2b): the instruction is the only cue and client content is
+//       never special-cased.  #714 under #560's ruling: counted and named,
+//       no per-occurrence alarm, no abort, no reroute.  #715 LAW 3.
+// How:  Rust checks match exhaustiveness by type, so the (Some, Some) arm
+//       cannot simply be deleted; folding it keeps the class conservative.
+//       The daemon reads the dropped cue with a '' default (laptop
+//       cc-ng-daemon.py:1667, VPS cc_ng_host.py:1027), so neither breaks.
+//       cargo test --features minitid --bin minitid: 74 passed.
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 2
 //   stale-comment fix-up for the pass-through restore
 // What: the Cadence behaviour header, the test-module banner and the
@@ -381,6 +405,7 @@ use std::env;
 use std::io::{Read as _PenRead, Write as _PenWrite};
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
@@ -544,8 +569,6 @@ fn configured_pith_tool_tail_bytes(value: Option<&str>) -> usize {
 const MAX_SESSION_ID_BYTES: usize = 512;
 const MAX_AGENT_ID_BYTES: usize = 128;
 const NEUROGRAPH_SURFACED_MARKER: &str = "[NeuroGraph Surfaced Knowledge]";
-const QUEST_TRACKER_BANNER: &str =
-    "ACTIVE QUEST TRAIL for this session (injected by the Quest Tracker).";
 const MAX_PROVIDER_CONTEXT_CHARS: usize = 40_000;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 256 * 1024;
 const DEFAULT_PITH_TOOL_TAIL_BYTES: usize = 64 * 1024;
@@ -751,12 +774,11 @@ fn peninsula_sock_path() -> String {
 }
 
 /// Call the CC daemon's read-only `provider_context` handler.  The request
-/// carries only attention cues already present in this request; it never sends
+/// carries the current instruction as its only cue; it never sends
 /// transcript history.  Accept only the producer's closed fresh states.
 /// `Err` says why, for the raw failure deposit.
 async fn daemon_provider_context(
     current_instruction: String,
-    quest_focus: String,
     sock: String,
 ) -> Result<String, String> {
     let fut = tokio::task::spawn_blocking(move || -> Result<String, String> {
@@ -769,7 +791,7 @@ async fn daemon_provider_context(
         stream
             .set_write_timeout(Some(t))
             .map_err(|e| format!("daemon socket setup failed: {e}"))?;
-        let req = provider_context_request(&current_instruction, &quest_focus);
+        let req = provider_context_request(&current_instruction);
         let mut line = serde_json::to_vec(&req)
             .map_err(|e| format!("provider_context request encode failed: {e}"))?;
         line.push(b'\n');
@@ -808,12 +830,11 @@ async fn daemon_provider_context(
     }
 }
 
-fn provider_context_request(current_instruction: &str, quest_focus: &str) -> Value {
+fn provider_context_request(current_instruction: &str) -> Value {
     serde_json::json!({
         "event": "provider_context",
         "data": {
             "current_instruction": current_instruction,
-            "quest_focus": quest_focus,
         }
     })
 }
@@ -855,59 +876,6 @@ fn content_texts(content: &Value) -> Vec<&str> {
             .collect(),
         _ => Vec::new(),
     }
-}
-
-/// Pull the latest bounded Quest orientation out of the rendered Claude
-/// request.  SessionStart wraps it in a system-reminder; Quest's banner is the
-/// stable owned boundary.  The extracted bytes begin at that banner and stop
-/// before Claude's wrapper close, so unrelated hook context is not promoted.
-fn verified_quest_text<'a>(msg: &Value, text: &'a str) -> Result<Option<&'a str>, ()> {
-    if msg["role"].as_str() != Some("user") {
-        return Ok(None);
-    }
-    let trimmed = text.trim_start();
-    let verified_envelope =
-        trimmed.starts_with("<system-reminder>\nSessionStart hook additional context: ");
-    if !verified_envelope && msg["isMeta"].as_bool() != Some(true) {
-        return Ok(None);
-    }
-    let mut starts = text
-        .match_indices(QUEST_TRACKER_BANNER)
-        .map(|(index, _)| index);
-    let Some(start) = starts.next() else {
-        return Ok(None);
-    };
-    if starts.next().is_some() {
-        return Err(());
-    }
-    let remainder = &text[start..];
-    let end = remainder
-        .find("\n</system-reminder>")
-        .unwrap_or(remainder.len());
-    Ok(Some(&remainder[..end]))
-}
-
-fn extract_quest_focus(messages: &[Value]) -> Result<Option<String>, ()> {
-    for msg in messages.iter().rev() {
-        for text in content_texts(&msg["content"]).into_iter().rev() {
-            if let Some(quest) = verified_quest_text(msg, text)? {
-                return Ok(Some(quest.to_string()));
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn verified_quest_rails(messages: &[Value]) -> Result<Vec<String>, ()> {
-    let mut rails = Vec::new();
-    for msg in messages {
-        for text in content_texts(&msg["content"]) {
-            if let Some(quest) = verified_quest_text(msg, text)? {
-                rails.push(quest.to_string());
-            }
-        }
-    }
-    Ok(rails)
 }
 
 fn is_standalone_neurograph_surface_text(text: &str) -> bool {
@@ -1134,8 +1102,7 @@ fn current_episode_tail(messages: &[Value]) -> Option<Vec<Value>> {
 fn provider_context_is_usable(provider_context: &str) -> bool {
     !(provider_context.trim().is_empty()
         || provider_context.chars().count() > MAX_PROVIDER_CONTEXT_CHARS
-        || provider_context.contains(NEUROGRAPH_SURFACED_MARKER)
-        || provider_context.contains(QUEST_TRACKER_BANNER))
+        || provider_context.contains(NEUROGRAPH_SURFACED_MARKER))
 }
 
 const PITH_ASSEMBLY_HEADING: &str = "### Connected assembly [";
@@ -1147,11 +1114,10 @@ const PITH_SECTION_HEADINGS: [&str; 4] = [
     "## Uncertainty and Conflicts",
 ];
 /// Live rail text a learned assembly can echo from substrate node text.
-const PROVIDER_RAIL_MARKERS: [&str; 2] = [NEUROGRAPH_SURFACED_MARKER, QUEST_TRACKER_BANNER];
+const PROVIDER_RAIL_MARKERS: [&str; 1] = [NEUROGRAPH_SURFACED_MARKER];
 
 /// Remove every learned assembly whose text carries a live rail marker (the
-/// surfaced marker, Packet 177, or the exact Quest banner, Packet 178) from
-/// the provider context miniTID received, instead of voiding the whole
+/// surfaced marker, Packet 177) from the provider context miniTID received, instead of voiding the whole
 /// context.  Units follow the headings Pith renders (PITH_HOST_CONTRACT
 /// "Model-facing Markdown"): the four `## ` sections and `### Connected
 /// assembly [` cache lines.  Node text is raw and may carry newlines, so any
@@ -1235,47 +1201,18 @@ fn strip_rail_marked_assemblies(provider_context: &str) -> Option<(String, usize
 /// Compose a bounded L1 only from the fresh topology response and the live
 /// request tail. Retained messages stay exact unless an independently
 /// identified NG text block is removed; every neighboring block stays exact.
-fn compose_provider_messages(
-    messages: &[Value],
-    provider_context: &str,
-    quest_focus: Option<&str>,
-) -> Option<Vec<Value>> {
+fn compose_provider_messages(messages: &[Value], provider_context: &str) -> Option<Vec<Value>> {
     if !provider_context_is_usable(provider_context) {
         return None;
     }
     let tail = current_episode_tail(messages)?;
-
-    let quest_rails_in_tail = verified_quest_rails(&tail).ok()?;
-    if quest_rails_in_tail.len() > 1 {
-        return None;
-    }
     let mut out = vec![serde_json::json!({
         "role": "user",
         "content": format!("{NEUROGRAPH_SURFACED_MARKER}\n\n{provider_context}"),
     })];
-    if quest_rails_in_tail.is_empty() {
-        if let Some(quest) = quest_focus.filter(|text| !text.is_empty()) {
-            out.push(serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
-                ),
-            }));
-        }
-    }
     out.extend(tail);
     if count_marker(&out, NEUROGRAPH_SURFACED_MARKER) != 1 {
         return None;
-    }
-    let expected_quest = usize::from(quest_focus.map(|text| !text.is_empty()).unwrap_or(false));
-    let verified_out = verified_quest_rails(&out).ok()?;
-    if verified_out.len() != expected_quest {
-        return None;
-    }
-    if let Some(expected) = quest_focus.filter(|text| !text.is_empty()) {
-        if verified_out.first().map(String::as_str) != Some(expected) {
-            return None;
-        }
     }
     Some(out)
 }
@@ -1325,7 +1262,7 @@ impl GateRefusal {
 /// original inbound array unchanged and `failure` names why; the caller
 /// forwards the original bytes rather than this array.  `stripped` counts the
 /// learned assemblies removed from the received provider context for a live
-/// rail marker (either reason), whether or not the pass then succeeded.
+/// rail marker, whether or not the pass then succeeded.
 #[derive(Debug, PartialEq)]
 struct PithOutcome {
     messages: Vec<Value>,
@@ -1361,22 +1298,8 @@ async fn apply_pith_peninsula(
             PithFailure::new("gate decision", "request carries no genuine human turn"),
         );
     };
-    let Ok(quest_focus) = extract_quest_focus(messages) else {
-        return pith_failure_outcome(
-            messages,
-            PithFailure::new("Quest focus", "request carries ambiguous Quest rails"),
-        );
-    };
-    match daemon_provider_context(
-        current_instruction,
-        quest_focus.clone().unwrap_or_default(),
-        sock,
-    )
-    .await
-    {
-        Ok(context) => {
-            apply_provider_result(messages, decision, Some(&context), quest_focus.as_deref())
-        }
+    match daemon_provider_context(current_instruction, sock).await {
+        Ok(context) => apply_provider_result(messages, decision, Some(&context)),
         Err(why) => pith_failure_outcome(
             messages,
             PithFailure::new("daemon provider_context", why),
@@ -1388,7 +1311,6 @@ fn apply_provider_result(
     messages: &[Value],
     _decision: GateDecision,
     provider_context: Option<&str>,
-    quest_focus: Option<&str>,
 ) -> PithOutcome {
     let Some(context) = provider_context else {
         return pith_failure_outcome(
@@ -1417,7 +1339,7 @@ fn apply_provider_result(
             )
         };
     }
-    match compose_provider_messages(messages, &context, quest_focus) {
+    match compose_provider_messages(messages, &context) {
         Some(out) => PithOutcome {
             messages: out,
             failure: None,
@@ -1526,9 +1448,23 @@ fn cc_gateway_tract_path() -> String {
     })
 }
 
-fn deposit_experience_entry(path: &str, source: &str, content: String) {
+/// Deposits lost since start, one counter per path-class (#714, under
+/// #560's ruling: counted and named, no per-occurrence alarm, no abort, no
+/// reroute).  Every counts line reports both, so a lost deposit is visible.
+static FAILURE_DEPOSITS_LOST: AtomicU64 = AtomicU64::new(0);
+static TURN_DEPOSITS_LOST: AtomicU64 = AtomicU64::new(0);
+
+/// Count one deposit that could not be written.  The error is dropped only
+/// after it has been counted; the proxied response is never affected.
+fn count_lost_deposit(result: std::io::Result<()>, lost: &AtomicU64) {
+    if result.is_err() {
+        lost.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn deposit_experience_entry(path: &str, source: &str, content: String) -> std::io::Result<()> {
     if content.trim().is_empty() {
-        return;
+        return Ok(());
     }
     let entry = ng_tract::ExperienceEntry {
         timestamp: std::time::SystemTime::now()
@@ -1540,7 +1476,7 @@ fn deposit_experience_entry(path: &str, source: &str, content: String) {
         content: content.into_bytes(),
     };
     let bytes = ng_tract::write::write_experience(&entry);
-    let _ = ng_tract::write::deposit_to_file(path, &bytes);
+    ng_tract::write::deposit_to_file(path, &bytes)
 }
 
 /// Deposit both sides of one turn as raw experience (LAW 7) -- no
@@ -1550,25 +1486,28 @@ fn deposit_experience_entry(path: &str, source: &str, content: String) {
 /// record -- the daemon's own dual-pass chains consecutive conversational
 /// deposits via a delayed synapse regardless of physical turn boundaries.
 /// Fails soft: this must never affect the proxied response to the client.
-fn deposit_turn(user_message: Option<String>, assistant_text: String) {
+/// `Err` when either entry could not be written; the caller counts it.
+fn deposit_turn(user_message: Option<String>, assistant_text: String) -> std::io::Result<()> {
     let path = cc_gateway_tract_path();
     if let Some(dir) = std::path::Path::new(&path).parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
-    if let Some(user_text) = user_message {
-        deposit_experience_entry(&path, "cc_gateway", user_text);
-    }
-    deposit_experience_entry(&path, "cc_gateway", assistant_text);
+    let user = user_message.map_or(Ok(()), |user_text| {
+        deposit_experience_entry(&path, "cc_gateway", user_text)
+    });
+    let assistant = deposit_experience_entry(&path, "cc_gateway", assistant_text);
+    user.and(assistant)
 }
 
 /// Deposit one Pith failure as raw experience (LAW 7) on the gateway tract,
 /// the same unlabeled `cc_gateway` frame deposit_turn writes.  The path is a
-/// parameter so tests need not mutate process env.  Fails soft.
-fn deposit_pith_failure(path: &str, failure: &PithFailure) {
+/// parameter so tests need not mutate process env.  Fails soft: `Err` when
+/// the deposit could not be written; the caller counts it.
+fn deposit_pith_failure(path: &str, failure: &PithFailure) -> std::io::Result<()> {
     if let Some(dir) = std::path::Path::new(path).parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
-    deposit_experience_entry(path, "cc_gateway", failure.deposit_text());
+    deposit_experience_entry(path, "cc_gateway", failure.deposit_text())
 }
 
 /// Reconstruct the assistant's full generated text from accumulated SSE
@@ -1678,21 +1617,24 @@ async fn rewrite_request_body(
     let bytes = serde_json::to_vec(&body).expect("a serde_json::Value always serializes");
     PithRewrite {
         body: Some(bytes),
-        failure: outcome.failure,
+        failure: None,
         stripped: outcome.stripped,
     }
 }
 
 /// Which way a rewrite went: fresh Pith context, a Pith failure (original
 /// bytes forwarded), the compaction exemption, or a body that could not be
-/// parsed into messages.
+/// parsed into messages.  A rewritten body never carries a failure: every
+/// failure site in rewrite_request_body returns `body: None`, and its one
+/// `Some` body is built with `failure: None`.  Rust checks exhaustiveness by
+/// type, not by that invariant, so the match needs a `(Some, Some)` case; it
+/// shares the failure arm rather than standing as a dead arm of its own.
 fn request_path_class(rewrite: &PithRewrite) -> &'static str {
     match (&rewrite.body, &rewrite.failure) {
         (Some(_), None) => "pith",
-        (Some(_), Some(_)) => "failure",
         (None, None) => "compaction",
         (None, Some(failure)) if failure.what == "request body" => "unparsable",
-        (None, Some(_)) => "failure",
+        (_, Some(_)) => "failure",
     }
 }
 
@@ -1702,8 +1644,16 @@ fn request_path_class(rewrite: &PithRewrite) -> &'static str {
 /// means history was replayed.  `stripped` is the count of learned assemblies
 /// miniTID removed from the received provider context (Packet 177/178); the
 /// daemon's own assembly count overstates what reached the model by exactly
-/// that much.
-fn request_counts_line(path: &str, stripped: usize, original: &[u8], forwarded: &[u8]) -> String {
+/// that much.  `deposits_lost` is (Pith-failure, turn) deposits lost since
+/// start, read from the two #714 counters, so a lost deposit is never
+/// traceless.
+fn request_counts_line(
+    path: &str,
+    stripped: usize,
+    original: &[u8],
+    forwarded: &[u8],
+    deposits_lost: (u64, u64),
+) -> String {
     let messages_of = |bytes: &[u8]| {
         serde_json::from_slice::<Value>(bytes)
             .ok()
@@ -1720,10 +1670,12 @@ fn request_counts_line(path: &str, stripped: usize, original: &[u8], forwarded: 
         .filter(|msg| is_genuine_user_message(msg))
         .count();
     format!(
-        "miniTID request path={path} msgs_in={msgs_in} msgs_out={} bytes_in={} bytes_out={} human_turns_out={human_turns_out} stripped={stripped}",
+        "miniTID request path={path} msgs_in={msgs_in} msgs_out={} bytes_in={} bytes_out={} human_turns_out={human_turns_out} stripped={stripped} failure_deposits_lost={} turn_deposits_lost={}",
         out.len(),
         original.len(),
         forwarded.len(),
+        deposits_lost.0,
+        deposits_lost.1,
     )
 }
 
@@ -1767,14 +1719,24 @@ async fn proxy(
         let stripped = rewrite.stripped;
         if let Some(failure) = rewrite.failure {
             tokio::spawn(async move {
-                deposit_pith_failure(&cc_gateway_tract_path(), &failure);
+                count_lost_deposit(
+                    deposit_pith_failure(&cc_gateway_tract_path(), &failure),
+                    &FAILURE_DEPOSITS_LOST,
+                );
             });
         }
         let original = body_bytes.clone();
         let forwarded: axum::body::Bytes = rewrite.body.map(Into::into).unwrap_or(body_bytes);
         let counted = forwarded.clone();
         tokio::spawn(async move {
-            eprintln!("{}", request_counts_line(path, stripped, &original, &counted));
+            let deposits_lost = (
+                FAILURE_DEPOSITS_LOST.load(Ordering::Relaxed),
+                TURN_DEPOSITS_LOST.load(Ordering::Relaxed),
+            );
+            eprintln!(
+                "{}",
+                request_counts_line(path, stripped, &original, &counted, deposits_lost)
+            );
         });
         forwarded
     } else {
@@ -1844,7 +1806,10 @@ async fn proxy(
             Err(_) => return, // task panicked -- nothing to deposit, never crash the proxy
         };
         let assistant_text = reconstruct_assistant_text(&accumulated);
-        deposit_turn(last_user_message, assistant_text);
+        count_lost_deposit(
+            deposit_turn(last_user_message, assistant_text),
+            &TURN_DEPOSITS_LOST,
+        );
     });
 
     let out_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -1992,45 +1957,27 @@ mod tests {
     }
 
     #[test]
-    fn provider_composition_evicts_old_history_and_keeps_live_rails_once() {
-        let quest = format!(
-            "{QUEST_TRACKER_BANNER} This is what you were working on and why.\n\nCurrent: Slice B"
-        );
-        let wrapped_quest = format!(
-            "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
-        );
+    fn provider_composition_evicts_old_history_and_keeps_the_instruction_once() {
+        let reminder = "<system-reminder>\nSessionStart hook additional context: earlier orientation\n</system-reminder>";
         let current = json!({
             "role": "user",
             "content": [{"type": "text", "text": INCIDENT_TASK}]
         });
         let messages = vec![
-            json!({"role": "user", "content": wrapped_quest}),
+            json!({"role": "user", "content": reminder}),
             json!({"role": "assistant", "content": LONG}),
             current.clone(),
         ];
-        let extracted = extract_quest_focus(&messages).unwrap().unwrap();
-        assert_eq!(extracted, quest);
         let out = compose_provider_messages(
             &messages,
             "## Who I Am\n- constitutional core\n\n## Learned Situation\n- learned topology",
-            Some(&extracted),
         )
         .unwrap();
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[2], current);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], current);
         assert_eq!(count_marker(&out, NEUROGRAPH_SURFACED_MARKER), 1);
-        assert_eq!(count_marker(&out, QUEST_TRACKER_BANNER), 1);
         assert_eq!(genuine_user_text(&out[0]), None);
-        assert_eq!(genuine_user_text(&out[1]), None);
-        assert_eq!(
-            out[1]["content"].as_str(),
-            Some(
-                format!(
-                    "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
-                )
-                .as_str()
-            )
-        );
+        assert!(!serde_json::to_string(&out).unwrap().contains(reminder));
         assert!(!serde_json::to_string(&out).unwrap().contains(LONG));
         assert!(!serde_json::to_string(&out).unwrap().contains('…'));
         assert_eq!(
@@ -2048,64 +1995,11 @@ mod tests {
         let out = compose_provider_messages(
             &[current.clone()],
             "## Who I Am\n- constitutional core\n\n## Learned Situation\n- active mission",
-            None,
         )
         .unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[1], current);
         assert_eq!(count_marker(&out, NEUROGRAPH_SURFACED_MARKER), 1);
-    }
-
-    #[test]
-    fn quoted_quest_banner_is_human_text_and_cannot_spoof_focus() {
-        let prefixed_quote = json!({
-            "role": "user",
-            "content": format!("Please explain this phrase: {QUEST_TRACKER_BANNER}")
-        });
-        let exact_leading_quote = json!({
-            "role": "user",
-            "content": format!("{QUEST_TRACKER_BANNER} I am quoting this banner, not injecting a Quest.")
-        });
-        assert!(is_genuine_user_message(&prefixed_quote));
-        assert!(is_genuine_user_message(&exact_leading_quote));
-        assert_eq!(extract_quest_focus(&[prefixed_quote]), Ok(None));
-        assert_eq!(extract_quest_focus(&[exact_leading_quote]), Ok(None));
-    }
-
-    #[test]
-    fn human_quest_quote_cannot_replace_verified_orientation_rail() {
-        let quest = format!("{QUEST_TRACKER_BANNER}\n\nCurrent: real Quest orientation");
-        let verified = json!({
-            "role": "user",
-            "content": format!(
-                "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
-            )
-        });
-        let quotation = json!({
-            "role": "user",
-            "content": format!(
-                "{QUEST_TRACKER_BANNER} I am discussing this literal text as the current human request."
-            )
-        });
-        let messages = vec![verified, quotation.clone()];
-        let extracted = extract_quest_focus(&messages).unwrap().unwrap();
-        assert_eq!(extracted, quest);
-        let out = compose_provider_messages(&messages, "## Who I Am\n- identity", Some(&extracted))
-            .unwrap();
-        assert_eq!(verified_quest_rails(&out).unwrap(), vec![quest]);
-        assert_eq!(count_marker(&out, QUEST_TRACKER_BANNER), 2);
-        assert_eq!(out.last(), Some(&quotation));
-    }
-
-    #[test]
-    fn multiple_banners_in_one_trusted_quest_envelope_are_ambiguous() {
-        let ambiguous = json!({
-            "role": "user",
-            "content": format!(
-                "<system-reminder>\nSessionStart hook additional context: {QUEST_TRACKER_BANNER}\nfirst\n{QUEST_TRACKER_BANNER}\nsecond\n</system-reminder>"
-            )
-        });
-        assert_eq!(extract_quest_focus(&[ambiguous]), Err(()));
     }
 
     #[test]
@@ -2631,7 +2525,7 @@ mod tests {
         let noise =
             json!({"type": "text", "text": format!("{NEUROGRAPH_SURFACED_MARKER}\nold noise")});
         let current = json!({"role": "user", "content": [human.clone(), noise]});
-        let out = compose_provider_messages(&[current], "## Who I Am\n- identity", None).unwrap();
+        let out = compose_provider_messages(&[current], "## Who I Am\n- identity").unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[1]["content"].as_array().unwrap(), &[human]);
         assert_eq!(count_marker(&out, NEUROGRAPH_SURFACED_MARKER), 1);
@@ -2655,7 +2549,6 @@ mod tests {
         let out = compose_provider_messages(
             &[human.clone(), use_message.clone(), delivery],
             "## Who I Am\n- identity",
-            None,
         )
         .unwrap();
         assert_eq!(out[1], human);
@@ -2681,7 +2574,6 @@ mod tests {
             &messages,
             GateDecision::Compress,
             Some("## Who I Am\n- identity"),
-            None,
         );
         // An inseparable marker quote cannot be stripped, so composition fails
         // and the original messages are carried for pass-through.
@@ -2699,7 +2591,6 @@ mod tests {
         let out = compose_provider_messages(
             &[human.clone(), meta, compact],
             "## Who I Am\n- identity",
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -2720,7 +2611,6 @@ mod tests {
             &original,
             GateDecision::Compress,
             Some("## Who I Am\n- identity"),
-            None,
         );
         let failure = outcome.failure.expect("tool metadata on isMeta is a failure");
         assert_eq!(
@@ -2735,7 +2625,6 @@ mod tests {
         let out = compose_provider_messages(
             &original,
             "## Who I Am\n- identity\n\n## Learned Situation\n- current",
-            None,
         )
         .unwrap();
         // Surface + exact human + five complete recent pairs.
@@ -2767,7 +2656,7 @@ mod tests {
                 "content": [{"type": "tool_result", "tool_use_id": format!("big-{i}"), "content": large_result.clone()}]
             }));
         }
-        let out = compose_provider_messages(&original, "## Who I Am\n- identity", None).unwrap();
+        let out = compose_provider_messages(&original, "## Who I Am\n- identity").unwrap();
         let exact_tail = &out[2..];
         assert!(serialized_messages_bytes(exact_tail) <= DEFAULT_PITH_TOOL_TAIL_BYTES);
         assert_eq!(exact_tail.len() % 2, 0);
@@ -2794,7 +2683,7 @@ mod tests {
                 "content": [{"type": "tool_result", "tool_use_id": format!("huge-{i}"), "content": oversized.clone()}]
             }));
         }
-        let out = compose_provider_messages(&original, "## Who I Am\n- identity", None).unwrap();
+        let out = compose_provider_messages(&original, "## Who I Am\n- identity").unwrap();
         assert_eq!(out.len(), 4, "surface + human + newest whole pair");
         assert_eq!(&out[2..], &original[original.len() - 2..]);
         assert!(serialized_messages_bytes(&out[2..]) > DEFAULT_PITH_TOOL_TAIL_BYTES);
@@ -2802,10 +2691,10 @@ mod tests {
 
     #[test]
     fn provider_socket_request_contains_cues_and_no_history() {
-        let request = provider_context_request(INCIDENT_TASK, "current Quest focus");
+        let request = provider_context_request(INCIDENT_TASK);
         assert_eq!(request["event"], "provider_context");
         assert_eq!(request["data"]["current_instruction"], INCIDENT_TASK);
-        assert_eq!(request["data"]["quest_focus"], "current Quest focus");
+        assert_eq!(request["data"].as_object().unwrap().len(), 1, "the instruction is the only cue");
         assert!(request.get("messages").is_none());
         assert!(request["data"].get("turns").is_none());
         assert!(request["data"].get("history").is_none());
@@ -2886,9 +2775,8 @@ mod tests {
             (None, "daemon provider_context"),
             (Some(""), "provider context"),
             (Some(NEUROGRAPH_SURFACED_MARKER), "provider context"),
-            (Some(QUEST_TRACKER_BANNER), "provider context"),
         ] {
-            let outcome = apply_provider_result(&original, GateDecision::Compress, failed, None);
+            let outcome = apply_provider_result(&original, GateDecision::Compress, failed);
             let failure = outcome.failure.expect("every provider failure is reported");
             assert_eq!(failure.what, what);
             assert_eq!(outcome.messages, original, "{what}");
@@ -2899,8 +2787,8 @@ mod tests {
     // Pith-rendered context whose substrate node text echoes a surfaced hook
     // block, the shape found in the CC checkpoint (Packet 177).
     const SURFACED_NODE: &str = "- Keyframe: {\"type\":\"hook_additional_context\",\"content\":[\"[NeuroGraph Surfaced Knowledge]\\n- bash: ls\"]}";
-    // ... and one echoing the exact Quest banner (Packet 178).
-    const BANNER_NODE: &str = "- Keyframe: ACTIVE QUEST TRAIL for this session (injected by the Quest Tracker).\nCURRENT TASK";
+    // ... and one echoing a bare surfaced block.
+    const SURFACED_BARE_NODE: &str = "- Keyframe: [NeuroGraph Surfaced Knowledge]\n- read: notes.md";
 
     // Pith's alert section carries bullets, not assemblies.
     const UNCERTAINTY: &str = "## Uncertainty and Conflicts\n- A connected learned assembly is marked conflict; treat it as unresolved until live evidence confirms it.";
@@ -2918,7 +2806,7 @@ mod tests {
                 assembly("- Keyframe: kept situation"),
                 assembly(SURFACED_NODE)
             ),
-            format!("## Learned Corrections and Failures\n{}", assembly(BANNER_NODE)),
+            format!("## Learned Corrections and Failures\n{}", assembly(SURFACED_BARE_NODE)),
             UNCERTAINTY.to_string(),
         ]
         .join("\n\n");
@@ -2934,7 +2822,6 @@ mod tests {
             .join("\n\n")
         );
         assert!(!kept.contains(NEUROGRAPH_SURFACED_MARKER));
-        assert!(!kept.contains(QUEST_TRACKER_BANNER));
     }
 
     #[test]
@@ -2992,14 +2879,13 @@ mod tests {
     #[test]
     fn provider_context_with_rail_marked_assembly_composes_one_marker() {
         let original = history_then_live_turn(4);
-        for node in [SURFACED_NODE, BANNER_NODE] {
+        for node in [SURFACED_NODE, SURFACED_BARE_NODE] {
             let context = format!(
                 "## Who I Am\n- identity\n\n## Learned Situation\n{}\n\n{}",
                 assembly("- Keyframe: kept situation"),
                 assembly(node)
             );
-            let outcome =
-                apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
+            let outcome = apply_provider_result(&original, GateDecision::Compress, Some(&context));
             assert_eq!(outcome.failure, None, "{node}");
             assert_eq!(
                 outcome.messages[0]["content"],
@@ -3009,7 +2895,6 @@ mod tests {
                 )
             );
             assert_eq!(count_marker(&outcome.messages, NEUROGRAPH_SURFACED_MARKER), 1);
-            assert_eq!(count_marker(&outcome.messages, QUEST_TRACKER_BANNER), 0);
             assert_no_history(&outcome.messages);
         }
     }
@@ -3020,9 +2905,9 @@ mod tests {
         let context = format!(
             "## Learned Situation\n{}\n\n{}",
             assembly(SURFACED_NODE),
-            assembly(BANNER_NODE)
+            assembly(SURFACED_BARE_NODE)
         );
-        let outcome = apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
+        let outcome = apply_provider_result(&original, GateDecision::Compress, Some(&context));
         let failure = outcome.failure.expect("an emptied context is a failure");
         assert_eq!(failure.what, "provider context");
         assert_eq!(failure.why, "empty, oversized, or carrying a live rail marker");
@@ -3036,7 +2921,7 @@ mod tests {
         for marker in PROVIDER_RAIL_MARKERS {
             let context = format!("## Who I Am\n- identity {marker}");
             let outcome =
-                apply_provider_result(&original, GateDecision::Compress, Some(&context), None);
+                apply_provider_result(&original, GateDecision::Compress, Some(&context));
             let failure = outcome.failure.expect("identity is never silently cut");
             assert_eq!(failure.what, "provider context");
             assert_eq!(failure.why, "live rail marker outside a learned assembly");
@@ -3055,7 +2940,6 @@ mod tests {
                 &original,
                 legacy_decision,
                 Some("## Who I Am\n- identity\n\n## Learned Situation\n- fresh"),
-                None,
             );
             assert_eq!(outcome.failure, None);
             let out = outcome.messages;
@@ -3083,7 +2967,6 @@ mod tests {
             compose_provider_messages(
                 original["messages"].as_array().unwrap(),
                 "## Who I Am\n- model-neutral identity",
-                None,
             )
             .unwrap(),
         );
@@ -3147,16 +3030,11 @@ mod tests {
         // the original request bytes go upstream byte-for-byte, history and
         // all.  The socket path is injected rather than read from
         // MINITID_PENINSULA_SOCK so no process-global env state is mutated.
-        let quest = format!(
-            "{QUEST_TRACKER_BANNER} This is what you were working on and why.\n\nCurrent: passthrough"
-        );
-        let rail = json!({
+        let reminder = json!({
             "role": "user",
-            "content": format!(
-                "<system-reminder>\nSessionStart hook additional context: {quest}\n</system-reminder>"
-            )
+            "content": "<system-reminder>\nSessionStart hook additional context: orientation\n</system-reminder>"
         });
-        let mut messages = vec![rail];
+        let mut messages = vec![reminder];
         messages.extend(history_then_live_turn(3));
         let request_body = body("daemon-absent-session", messages);
         let sessions = test_sessions();
@@ -3227,35 +3105,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_quest_rails_forward_original_bytes_byte_identical() {
-        // 077 review note 1: the ambiguous-Quest failure inside
-        // apply_pith_peninsula, driven through rewrite_request_body.  It fails
-        // before the daemon is asked, so the socket is never touched.  Exec
-        // P309(1): the original request bytes are forwarded unchanged.
-        let ambiguous = json!({
+    async fn client_quest_text_is_ordinary_content_passed_through_untouched() {
+        // Card 7 passthrough allowlist: miniTID does not know what Quest is.
+        // A Quest trail the client sent, even one that repeats its banner, is
+        // not extracted, verified, cued or re-injected.  In the live tail it
+        // goes upstream byte-for-byte; in history it is evicted like any
+        // other history.
+        let sock = format!(
+            "/tmp/minitid-test-quest-passthrough-{}.sock",
+            std::process::id()
+        );
+        let daemon = spawn_fake_daemon(sock.clone(), daemon_response("## Who I Am\n- identity", 1));
+        let trail = "ACTIVE QUEST TRAIL for this session (injected by the Quest Tracker).\nfirst\nACTIVE QUEST TRAIL for this session (injected by the Quest Tracker).\nsecond";
+        let reminder = format!(
+            "<system-reminder>\nSessionStart hook additional context: {trail}\n</system-reminder>"
+        );
+        let current = json!({
             "role": "user",
-            "content": format!(
-                "<system-reminder>\nSessionStart hook additional context: {QUEST_TRACKER_BANNER}\nfirst\n{QUEST_TRACKER_BANNER}\nsecond\n</system-reminder>"
-            )
+            "content": [
+                {"type": "text", "text": reminder},
+                {"type": "text", "text": "live human instruction"}
+            ]
         });
-        let mut messages = vec![ambiguous];
-        messages.extend(history_then_live_turn(3));
-        let request_body = body("ambiguous-quest-session", messages);
+        let mut messages = vec![json!({"role": "user", "content": reminder.clone()})];
+        messages.extend(history_then_live_turn(0));
+        messages.push(json!({"role": "assistant", "content": "working"}));
+        messages.push(current.clone());
+        let request_body = body("quest-passthrough-session", messages);
         let sessions = test_sessions();
         let inbound = serde_json::to_vec(&request_body).unwrap();
 
-        let rewrite = rewrite_request_body(
-            &inbound,
-            &headers(None),
-            &sessions,
-            missing_sock(),
-        )
-        .await;
-        let failure = rewrite.failure.clone().expect("ambiguous rails are reported");
-        assert_eq!(failure.what, "Quest focus");
-        assert_eq!(failure.why, "request carries ambiguous Quest rails");
-        assert_eq!(rewrite.body, None, "a Pith failure forwards the original bytes");
-        assert_eq!(forwarded_bytes(rewrite, &inbound), inbound);
+        let rewrite = rewrite_request_body(&inbound, &headers(None), &sessions, sock).await;
+        assert_eq!(rewrite.failure, None, "client Quest text is not a failure");
+        let forwarded: Value = serde_json::from_slice(&rewrite.body.expect("Pith rewrote")).unwrap();
+        let out = forwarded["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1], current, "the live tail carries the trail byte-for-byte");
+        // Once, not twice: the history copy is evicted, nothing is re-injected.
+        let escaped = serde_json::to_string(trail).unwrap();
+        let escaped = &escaped[1..escaped.len() - 1];
+        assert_eq!(serde_json::to_string(out).unwrap().matches(escaped).count(), 1);
+        assert_no_history(out);
+        let _ = daemon.join();
     }
 
     #[tokio::test]
@@ -3280,11 +3171,12 @@ mod tests {
             rewrite.stripped,
             &original,
             &forwarded,
+            (0, 0),
         );
         assert_eq!(
             line,
             format!(
-                "miniTID request path=failure msgs_in=13 msgs_out=13 bytes_in={} bytes_out={} human_turns_out=3 stripped=0",
+                "miniTID request path=failure msgs_in=13 msgs_out=13 bytes_in={} bytes_out={} human_turns_out=3 stripped=0 failure_deposits_lost=0 turn_deposits_lost=0",
                 original.len(),
                 forwarded.len()
             )
@@ -3310,35 +3202,35 @@ mod tests {
         // The fresh context message carries the surfaced marker, so only the
         // live human turn counts.
         let messages = history_then_live_turn(4);
-        let out = compose_provider_messages(&messages, "fresh topology context", None)
+        let out = compose_provider_messages(&messages, "fresh topology context")
             .expect("usable context composes");
         let original = serde_json::to_vec(&json!({"messages": messages})).unwrap();
         let forwarded = serde_json::to_vec(&json!({"messages": out})).unwrap();
-        let line = request_counts_line("pith", 0, &original, &forwarded);
+        let line = request_counts_line("pith", 0, &original, &forwarded, (0, 0));
         assert!(line.contains(" msgs_in=13 msgs_out=10 "), "{line}");
-        assert!(line.ends_with(" human_turns_out=1 stripped=0"), "{line}");
+        assert!(line.ends_with(" human_turns_out=1 stripped=0 failure_deposits_lost=0 turn_deposits_lost=0"), "{line}");
     }
 
     #[test]
-    fn counts_line_reports_assemblies_stripped_for_either_rail_marker() {
+    fn counts_line_reports_assemblies_stripped_for_the_rail_marker() {
         let messages = history_then_live_turn(4);
         let original = serde_json::to_vec(&json!({"messages": messages})).unwrap();
         let context = format!(
             "## Who I Am\n- identity\n\n## Learned Situation\n{}\n\n{}\n\n{}",
             assembly("- Keyframe: kept situation"),
             assembly(SURFACED_NODE),
-            assembly(BANNER_NODE)
+            assembly(SURFACED_BARE_NODE)
         );
-        let outcome = apply_provider_result(&messages, GateDecision::Compress, Some(&context), None);
+        let outcome = apply_provider_result(&messages, GateDecision::Compress, Some(&context));
         assert_eq!((outcome.failure.as_ref(), outcome.stripped), (None, 2));
         let forwarded = serde_json::to_vec(&json!({"messages": outcome.messages})).unwrap();
-        let line = request_counts_line("pith", outcome.stripped, &original, &forwarded);
-        assert!(line.ends_with(" human_turns_out=1 stripped=2"), "{line}");
-        assert!(!line.contains("Keyframe") && !line.contains("Quest"), "{line}");
+        let line = request_counts_line("pith", outcome.stripped, &original, &forwarded, (0, 0));
+        assert!(line.ends_with(" human_turns_out=1 stripped=2 failure_deposits_lost=0 turn_deposits_lost=0"), "{line}");
+        assert!(!line.contains("Keyframe") && !line.contains("read: notes.md"), "{line}");
 
         // A context the strip empties is a failure that still reports the count.
-        let emptied = format!("## Learned Situation\n{}", assembly(BANNER_NODE));
-        let outcome = apply_provider_result(&messages, GateDecision::Compress, Some(&emptied), None);
+        let emptied = format!("## Learned Situation\n{}", assembly(SURFACED_BARE_NODE));
+        let outcome = apply_provider_result(&messages, GateDecision::Compress, Some(&emptied));
         assert!(outcome.failure.is_some());
         assert_eq!(outcome.stripped, 1);
     }
@@ -3348,12 +3240,12 @@ mod tests {
         // Compaction forwards the original bytes, so its replayed human turns
         // are visible in the count; an unparsable body counts zero messages.
         let original = serde_json::to_vec(&json!({"messages": history_then_live_turn(4)})).unwrap();
-        let line = request_counts_line("compaction", 0, &original, &original);
+        let line = request_counts_line("compaction", 0, &original, &original, (0, 0));
         assert!(line.contains("path=compaction msgs_in=13 msgs_out=13 "), "{line}");
-        assert!(line.ends_with(" human_turns_out=3 stripped=0"), "{line}");
+        assert!(line.ends_with(" human_turns_out=3 stripped=0 failure_deposits_lost=0 turn_deposits_lost=0"), "{line}");
         assert_eq!(
-            request_counts_line("unparsable", 0, b"not json", b"not json"),
-            "miniTID request path=unparsable msgs_in=0 msgs_out=0 bytes_in=8 bytes_out=8 human_turns_out=0 stripped=0"
+            request_counts_line("unparsable", 0, b"not json", b"not json", (0, 0)),
+            "miniTID request path=unparsable msgs_in=0 msgs_out=0 bytes_in=8 bytes_out=8 human_turns_out=0 stripped=0 failure_deposits_lost=0 turn_deposits_lost=0"
         );
     }
 
@@ -3368,6 +3260,8 @@ mod tests {
             })
         };
         assert_eq!(class(Some(Vec::new()), None), "pith");
+        // rewrite_request_body never builds this (#715); if it ever did, the
+        // failure would still be named a failure, never a Pith success.
         assert_eq!(class(Some(Vec::new()), failure()), "failure");
         assert_eq!(class(None, None), "compaction");
         assert_eq!(class(None, failure()), "unparsable");
@@ -3380,7 +3274,6 @@ mod tests {
         // not hang or panic.
         let out = daemon_provider_context(
             "some current instruction".to_string(),
-            String::new(),
             missing_sock(),
         )
         .await;
@@ -3570,6 +3463,39 @@ mod tests {
     }
 
     #[test]
+    fn unwritable_pith_failure_deposit_is_counted_and_named() {
+        // #714 (Card 7 Test 3): neither discard site may lose a deposit
+        // silently.  The directory cannot be created when its parent is a
+        // file; the tract cannot be written when its path is a directory.
+        // Each loss is counted on its own path-class counter, which the
+        // counts line names; no abort, no reroute.
+        let dir = std::env::temp_dir().join(format!("minitid_lost_deposit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not_a_dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        let no_dir = blocker.join("cc_gateway").join("turns.tract");
+        let tract_is_dir = dir.join("turns.tract");
+        std::fs::create_dir_all(&tract_is_dir).unwrap();
+        let failure = PithFailure::new("daemon provider_context", "daemon socket unavailable: gone");
+
+        let lost = AtomicU64::new(0);
+        for path in [&no_dir, &tract_is_dir] {
+            let result = deposit_pith_failure(path.to_str().unwrap(), &failure);
+            assert!(result.is_err(), "{}", path.display());
+            count_lost_deposit(result, &lost);
+        }
+        assert_eq!(lost.load(Ordering::Relaxed), 2);
+        let line = request_counts_line("failure", 0, b"not json", b"not json", (2, 0));
+        assert!(line.ends_with(" failure_deposits_lost=2 turn_deposits_lost=0"), "{line}");
+
+        // A written deposit is not counted.
+        count_lost_deposit(Ok(()), &lost);
+        assert_eq!(lost.load(Ordering::Relaxed), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn pith_failure_deposit_writes_one_raw_cc_gateway_experience() {
         use ng_tract::read::{ReadResult, TractReader};
         use ng_tract::TractEntry;
@@ -3580,7 +3506,7 @@ mod tests {
         let tract = dir.join("cc_gateway").join("turns.tract");
         let failure = PithFailure::new("daemon provider_context", "daemon socket unavailable: gone");
 
-        deposit_pith_failure(tract.to_str().unwrap(), &failure);
+        deposit_pith_failure(tract.to_str().unwrap(), &failure).expect("the deposit is written");
 
         let data = std::fs::read(&tract).expect("tract file should exist");
         let mut reader = TractReader::new(&data);
@@ -3765,7 +3691,8 @@ mod tests {
         deposit_turn(
             Some("what is the numpy issue".to_string()),
             "it's a stray .pth file".to_string(),
-        );
+        )
+        .expect("both entries are written");
 
         let data = std::fs::read(&tmp).expect("tract file should exist");
         let mut reader = TractReader::new(&data);
