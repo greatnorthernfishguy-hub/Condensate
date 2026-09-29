@@ -10,9 +10,12 @@
 //       Any earlier end of proxy() drops the guard, which counts the turn
 //       on TURN_DEPOSITS_LOST: the failed upstream send (502, #717), the
 //       req_method `?` (400), and the handler future dropped mid-await on
-//       client disconnect or shutdown (#719).  Responses are unchanged.
-//       request_counts_line's doc now says when those losses are named.
-//       An unused test binding (tool metadata on isMeta) is dropped.
+//       client disconnect (#719).  Responses are unchanged.  Not counted:
+//       any stop of the process (SIGTERM, SIGINT, SIGKILL) -- miniTID has
+//       no graceful shutdown, so no Drop runs, and the counters die with
+//       the process anyway.  request_counts_line's doc now says when those
+//       losses are named.  An unused test binding (tool metadata on isMeta)
+//       is dropped.
 // Why:  Executive Packet 338, Card 7b; LE finding 1 of the Card 7 check
 //       and of the Card 7b check (#719, folded in by chief-003).  Same #560
 //       ruling as #714: count and name, no alarm, no abort, no reroute.
@@ -24,7 +27,11 @@
 //       turn.  By reading only: that proxy() passes &TURN_DEPOSITS_LOST
 //       (the static would race across parallel tests), creates the guard
 //       right after extraction, and hands it off only where it spawns the
-//       deposit, passing is_messages and the handed-off message.  The
+//       deposit, passing is_messages and the handed-off message; that the
+//       guard's blank-text rule matches deposit_turn's write rule; and that
+//       the 400 and 502 responses are unchanged.  Outside this repo and
+//       untested: that axum/hyper drops the handler future when the client
+//       disconnects (the parked-future test stands in for it).  The
 //       tract path is now resolved when the deposit task starts rather
 //       than after the accumulator finishes.  cargo test --features
 //       minitid --bin minitid: 77 passed.
@@ -1589,8 +1596,9 @@ async fn deposit_turn_when_accumulated(
 /// A request's human turn, held from extraction until proxy() hands it to the
 /// turn deposit.  If proxy() ends first -- the upstream send fails (502), an
 /// earlier `?` returns, or the handler future is dropped mid-await because
-/// the client disconnected or the process is shutting down -- the turn is
-/// never deposited, and dropping the guard counts it on `lost` (#717, #719).
+/// the client disconnected -- the turn is never deposited, and dropping the
+/// guard counts it on `lost` (#717, #719).  A stopped process runs no Drop
+/// (there is no graceful shutdown), so its in-flight turns are not counted.
 /// Text deposit_turn would not write (none, or whitespace) is not a loss.
 struct UndepositedTurn<'a> {
     user_message: Option<String>,
@@ -1760,8 +1768,9 @@ fn request_path_class(rewrite: &PithRewrite) -> &'static str {
 /// that much.  `deposits_lost` is (Pith-failure, turn) deposits lost, read
 /// from the two #714 counters.  They are process-wide and cumulative: a loss
 /// is named on a later counts line (a turn loss after a response always is;
-/// one from a failed upstream send, or a handler dropped awaiting it, races
-/// this request's own line, so it is named on that line or a later one; a
+/// one from the req_method or send `?`, or a handler dropped awaiting the
+/// send, races this request's own line, so it is named on that line or a
+/// later one; a
 /// handler dropped awaiting Pith has no line of its own, so a later one
 /// names it), the last loss before idle or restart is not named, and a
 /// restart zeroes both.
@@ -3707,7 +3716,8 @@ mod tests {
         assert!(early_return(turn(Some("a human turn"))).is_err());
         assert_eq!(lost.load(Ordering::Relaxed), 1, "early return");
 
-        // A future parked at an await, then dropped (client disconnect).
+        // A future parked at an await, then dropped: what hyper does to the
+        // handler on client disconnect (that part is not tested here).
         let pending = turn(Some("a human turn"));
         let mut parked = Box::pin(async move {
             let _pending = pending;
