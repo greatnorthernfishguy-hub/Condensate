@@ -1,4 +1,13 @@
 // ---- Changelog ----
+// [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 2
+//   stale-comment fix-up for the pass-through restore
+// What: the Cadence behaviour header and the test-module banner now describe
+//       pass-through on failure. Comments only; no code change.
+// Why:  e303896 review notes (grok XF #8962, LE #9002): both comments still
+//       described the superseded envelope ("rewritten ... on any failure";
+//       "the failure mode is the §12.1 failure envelope"). Chief ruling:
+//       main must not carry an inaccurate comment about envelope semantics.
+// How:  comment text changed in place.
 // [2026-09-26] Z2 worker (OpenCode, deepseek-v4.1-flash) — restore Pith-failure
 //   pass-through (Exec P309(1), LAW 3; envelope superseded)
 // What: every Pith failure forwards the original inbound request bytes upstream
@@ -311,11 +320,13 @@
 //   currently acts on the result — it is passed to apply_provider_result()
 //   and discarded there. Separately, gate_for_body() decides whether a
 //   request takes a gate decision at all (session identity + a genuine human
-//   turn + the compaction exemption). Every /v1/messages request is rewritten
-//   by Pith: fresh daemon context on success, the original request bytes on any
-//   failure. Only Claude's native compaction request and a body that is
-//   not valid JSON or has no message array are forwarded unchanged. It
-//   never truncates message content itself. Each /v1/messages request also
+//   turn + the compaction exemption). Every /v1/messages request goes
+//   through Pith, and only a success is rewritten (fresh daemon context).
+//   Everything else forwards the original request bytes unchanged: any Pith
+//   failure, including a gate refusal (deposited raw); a body that is not
+//   valid JSON or has no message array (deposited raw); and Claude's native
+//   compaction request (an exemption, no deposit). It never truncates message
+//   content itself. Each /v1/messages request also
 //   writes one counts-only line to stderr (see request_counts_line).
 //
 // Session identity: SHA-256 of metadata.user_id.session_id, optionally
@@ -1873,8 +1884,9 @@ async fn main() {
 // Run: cargo test --features minitid --bin minitid
 //
 // These exercise the proxy's request handling and the Pith peninsula directly
-// — no network. Faux KISS truncation has been removed; the failure mode is the
-// Pith PRD §12.1 failure envelope, never the original history.
+// — no network. Faux KISS truncation has been removed. On any Pith failure the
+// original request bytes are forwarded unchanged (pass-through restore, Exec
+// P309(1)); the Pith PRD §12.1 failure envelope is superseded.
 
 #[cfg(test)]
 mod tests {
