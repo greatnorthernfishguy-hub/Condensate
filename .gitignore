@@ -11,3 +11,7 @@ laptop_observer.log
 
 # Claude Code nested worktrees (full checkouts — never track)
 .claude/worktrees/
+
+# Claude Code subagent memory (machine-local Law Enforcer state — never track),
+# at any depth (rust_core/src/.claude/agent-memory/ exists too)
+**/.claude/agent-memory/
