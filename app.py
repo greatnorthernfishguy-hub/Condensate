@@ -22,6 +22,11 @@
 # Why: forward_count is identical for all layers in dense inference → 100% HOT.
 #      avg_activation discriminates by actual layer contribution to the residual stream.
 # How: One-line dict comprehension change; _access_count_for already handles float→int.
+# [2026-06-25] CC — Holographic boundary: SVD replaces lz4 in engine.py
+# What: _regions_from passes shape + weight_data (fp16 numpy) for COLD 2-D blocks.
+# Why: engine.py switched to truncated SVD; needs actual weight matrix, not byte slices.
+# How: Pre-classify tier per block; materialise weight_data only for COLD blocks with
+#      ndim>=2 to avoid memory pressure on HOT/WARM blocks. Remove _SAMPLE_ELEMS.
 # -------------------
 
 import os
@@ -57,9 +62,6 @@ from app_helpers import _access_count_for
 MODEL_NAME = os.environ.get("CONDENSATE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 _M = {"model": None, "tok": None, "sensor": None}
 
-# 4 MB cap for sample path: fp16 = 2 bytes/elem → 4 MB / 2 = 2 M elements.
-_SAMPLE_ELEMS = (4 << 20) // 2
-
 
 def _ensure_loaded():
     """Lazy CPU load (no CUDA at import — ZeroGPU rule). Cached on the bucket."""
@@ -74,13 +76,11 @@ def _ensure_loaded():
 
 
 def _regions_from(model, sensor, measurement):
-    """Map sensor access stats + weight sizes → engine region dicts.
+    """Map sensor access stats + weight tensors → engine region dicts.
 
-    Memory safety: sample_bytes is always bounded to ~4 MB of fp16 data
-    (slice before .tobytes(), never materialise the whole tensor).
-    full_bytes is only materialised for COLD regions when measurement=="full".
-    Full mode on a large model is memory-intensive — acceptable v1 trade-off;
-    streaming full_bytes is a future optimisation.
+    COLD blocks with ndim >= 2 receive their full fp16 weight_data so
+    engine.py can compute the SVD holographic boundary. HOT/WARM blocks
+    get weight_data=None — no unnecessary materialisation.
     """
     access = {a["name"]: a.get("avg_activation", a.get("forward_count", 0.0))
               for a in sensor.get_activation_map()}
@@ -96,30 +96,24 @@ def _regions_from(model, sensor, measurement):
         mod = name[: -len(".weight")]
         nbytes = p.numel() * p.element_size()
 
-        # Conservative: unobserved modules are treated as fully-hot so savings
-        # are never overstated.  Observed modules use their real access count.
         acc = _access_count_for(mod, access, max_access)
         if mod not in access:
             unobserved_count += 1
             unobserved_bytes += nbytes
 
-        # Bounded sample: slice first, then convert — never the whole tensor.
-        flat = p.detach().flatten()
-        sample = flat[:_SAMPLE_ELEMS].to(torch.float16).cpu().numpy().tobytes()
-
-        # Determine tier inline; only pay for full materialisation on COLD.
+        # Pre-classify to decide whether to materialise weight_data.
         tier = condensate_core.classify_tier(acc, int(max_access))
-        if measurement == "full" and tier == "COLD":
-            full = p.detach().to(torch.float16).cpu().numpy().tobytes()
+        if tier == "COLD" and p.ndim >= 2:
+            weight_data = p.detach().to(torch.float16).cpu().numpy()
         else:
-            full = None
+            weight_data = None
 
         regions.append({
             "name": mod,
             "size_bytes": nbytes,
             "access_count": acc,
-            "sample_bytes": sample,
-            "full_bytes": full,
+            "shape": tuple(p.shape),
+            "weight_data": weight_data,
         })
 
     total_weight_params = len(regions)
@@ -164,7 +158,7 @@ with gr.Blocks(title="Condensate — Do More With Less", theme=gr.themes.Soft())
     with gr.Row():
         max_tokens = gr.Slider(10, 100, value=40, step=5, label="Max tokens")
         measurement = gr.Radio(["sampled", "full"], value="sampled",
-                               label="Savings measurement")
+                               label="Boundary quality (sampled=fast/lower-rank, full=precise/higher-rank)")
     headline = gr.HTML()
     with gr.Row():
         heat = gr.Plot(label="Temperature map")

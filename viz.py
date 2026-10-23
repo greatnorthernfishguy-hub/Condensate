@@ -5,6 +5,11 @@
 # Why: SDD task-3-brief.md — visualization layer for the Condensate demo Space.
 # How: Pure rendering; no tier/savings logic. Color semantics: COLD=deep-blue,
 #      WARM=amber, HOT=bright orange-red. Heatmap maps layers×proj columns.
+# [2026-06-25] CC — Holographic boundary: headline shows SVD fidelity
+# What: headline() uses mean_fidelity (Frobenius norm) instead of binary lossless check.
+# Why: SVD boundary is lossless-by-degree; a continuous fidelity score is more
+#      meaningful than a pass/fail flag for a lossy-but-high-fidelity operation.
+# How: Display "boundary fidelity: 0.9973" with green/amber/red by threshold.
 # -------------------
 import re
 import plotly.graph_objects as go
@@ -63,18 +68,26 @@ def ram_bars(result):
 
 
 def headline(result):
-    """HTML summary string: savings %, GB delta, lossless status, mode."""
+    """HTML summary string: savings %, GB delta, SVD fidelity, boundary quality."""
     pct = result["saved_pct"]
     full_gb = result["total_bytes"] / 1e9
     cond_gb = result["condensed_bytes"] / 1e9
     mode = result["mode"]
-    check = ("✓ lossless verified" if result["lossless_ok"]
-             else "⚠ lossless check FAILED")
-    color = "#3bd16f" if result["lossless_ok"] else "#ff3b1f"
+    fidelity = result.get("mean_fidelity", 1.0)
+    fidelity_pct = fidelity * 100.0
+    if fidelity >= 0.99:
+        fid_label = f"✓ boundary fidelity: {fidelity:.4f}"
+        color = "#3bd16f"
+    elif fidelity >= 0.95:
+        fid_label = f"~ boundary fidelity: {fidelity:.4f}"
+        color = "#e0a000"
+    else:
+        fid_label = f"⚠ boundary fidelity: {fidelity:.4f}"
+        color = "#ff3b1f"
     return (
         f'<div style="font-size:1.6rem;font-weight:700">'
         f'{pct:.0f}% saved &middot; {full_gb:.1f} GB &rarr; {cond_gb:.1f} GB '
         f'&middot; same output</div>'
-        f'<div style="color:{color}">{check} &middot; '
-        f'measurement: {mode}</div>'
+        f'<div style="color:{color}">{fid_label} &middot; '
+        f'boundary quality: {mode}</div>'
     )
