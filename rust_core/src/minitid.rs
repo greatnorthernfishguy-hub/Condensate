@@ -237,6 +237,16 @@
 // How:  MINITID_USER_DEPOSIT_ONCE (LAW 5, default on; "0" = the old every-request deposit, a no-rebuild rollback).
 //       After a restart the in-memory marks are empty, so each live session deposits its current prompt once more
 //       (harmless). Tests: test_user_deposit_*.
+// [2026-10-24] Claude Code (Opus 5.5, laptop) — #1173 law review (2026-10-24): a failed user-frame append is no longer silent
+// What: deposit_experience_entry / deposit_turn (now deposit_turn_at) return the write result instead of dropping it.
+//       After the deposit task writes, settle_user_deposit looks at the USER frame's result: on Err it RELEASES the claim
+//       (so the next request of the same human turn deposits the prompt, as the every-request deposit did by accident
+//       before #1173) and logs one ERROR line ("<3>" = journald priority err) naming the session key (a digest, never
+//       text) and the failure. A failed assistant frame (cannot be retried) is logged at ERROR too.
+// Why:  LAW 7 / the silent-deposit-failure pattern: with once-per-turn, an I/O error or 64 inode changes in a row lost
+//       the prompt for the whole turn with nothing logged (law review item 1 rec MEDIUM; Josh 2026-10-24 option A).
+// How:  test_user_deposit_failed_append_releases_the_claim (unwritable path -> Err -> released -> the next round trip
+//       deposits; a good path keeps the claim). The KISS gate (SessionStore, decision_for_request, rewrite) is untouched.
 // -------------------
 
 use axum::body::Body;
@@ -1156,9 +1166,9 @@ fn cc_gateway_tract_path() -> String {
     })
 }
 
-fn deposit_experience_entry(path: &str, source: &str, content: String) {
+fn deposit_experience_entry(path: &str, source: &str, content: String) -> std::io::Result<()> {
     if content.trim().is_empty() {
-        return;
+        return Ok(());
     }
     let entry = ng_tract::ExperienceEntry {
         timestamp: std::time::SystemTime::now()
@@ -1170,7 +1180,7 @@ fn deposit_experience_entry(path: &str, source: &str, content: String) {
         content: content.into_bytes(),
     };
     let bytes = ng_tract::write::write_experience(&entry);
-    let _ = append_frame_locked(path, &bytes);
+    append_frame_locked(path, &bytes)
 }
 
 /// #1176 (2026-10-23): append one frame the way ng_tract's deposit_to_file does (open by path with O_APPEND,
@@ -1217,15 +1227,63 @@ fn append_frame_locked(path: &str, data: &[u8]) -> std::io::Result<()> {
 /// record -- the daemon's own dual-pass chains consecutive conversational
 /// deposits via a delayed synapse regardless of physical turn boundaries.
 /// Fails soft: this must never affect the proxied response to the client.
-fn deposit_turn(user_message: Option<String>, assistant_text: String) {
-    let path = cc_gateway_tract_path();
-    if let Some(dir) = std::path::Path::new(&path).parent() {
+/// Returns the USER frame's write result (None when there was no user text to
+/// write), so the caller can release a claim whose frame never landed (#1173
+/// law review 2026-10-24: a failed append must not silently lose the prompt).
+/// A failed ASSISTANT frame cannot be retried (the next request carries a new
+/// answer); it is logged at ERROR here, never dropped silently (LAW 7).
+fn deposit_turn(user_message: Option<String>, assistant_text: String) -> Option<std::io::Result<()>> {
+    deposit_turn_at(&cc_gateway_tract_path(), user_message, assistant_text)
+}
+
+fn deposit_turn_at(
+    path: &str,
+    user_message: Option<String>,
+    assistant_text: String,
+) -> Option<std::io::Result<()>> {
+    if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Some(user_text) = user_message {
-        deposit_experience_entry(&path, "cc_gateway", user_text);
+    let user_result = user_message.map(|user_text| deposit_experience_entry(path, "cc_gateway", user_text));
+    if let Err(e) = deposit_experience_entry(path, "cc_gateway", assistant_text) {
+        // "<3>": journald's syslog-level prefix (SyslogLevelPrefix=, on by default) -> priority err.
+        eprintln!("<3>miniTID deposit ERROR: assistant frame NOT written to {path}: {e} (this answer is lost from the tract)");
     }
-    deposit_experience_entry(&path, "cc_gateway", assistant_text);
+    user_result
+}
+
+/// #1173 law review 2026-10-24 (LAW 7): after the user frame was attempted, a
+/// failed write must not lose the prompt for the whole turn. Before #1173 the
+/// next tool round trip re-deposited it by accident; with once-per-turn nothing
+/// would. So on Err: release the claim (the next request of this turn deposits
+/// the prompt again) and log one ERROR line naming the session key (a digest,
+/// no text) and the failure. Returns true when a claim was released.
+fn settle_user_deposit(
+    tracker: &Mutex<UserDepositTracker>,
+    decision: Option<&UserDeposit>,
+    user_result: Option<&std::io::Result<()>>,
+) -> bool {
+    let Some(Err(e)) = user_result else {
+        return false;
+    };
+    let (who, released) = match decision {
+        Some(d @ UserDeposit::Deposit(DepositClaim::Session { key, .. })) => {
+            release_user_deposit(tracker, d);
+            (format!("session={key}"), true)
+        }
+        Some(d @ UserDeposit::Deposit(DepositClaim::Recent { digest, .. })) => {
+            release_user_deposit(tracker, d);
+            (format!("recent text_sha256={}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>()), true)
+        }
+        _ => ("untracked (MINITID_USER_DEPOSIT_ONCE=0)".to_string(), false),
+    };
+    let next = if released {
+        "claim RELEASED: the next request of this turn deposits the prompt"
+    } else {
+        "nothing to release: the next request deposits the prompt anyway"
+    };
+    eprintln!("<3>miniTID deposit ERROR: user frame NOT written ({who}): {e}; {next}");
+    released
 }
 
 // ── #1173: the user prompt once per human turn ──────────────────────────────
@@ -1626,6 +1684,7 @@ async fn proxy(
     // #1173: from here every path that does not write the deposit releases the claim (the guard's Drop),
     // including axum dropping this future when the client goes away mid-request.
     let mut user_deposit = UserDepositGuard { state: Arc::clone(&state), decision: user_deposit };
+    let deposit_state = Arc::clone(&state); // #1173: settle_user_deposit releases through it after a failed append
 
     // Claude's native summary request must reach the provider byte-for-byte and
     // cannot consume a human-turn gate decision.
@@ -1721,7 +1780,9 @@ async fn proxy(
         if is_messages {
             eprintln!("miniTID deposit: user={user_label} via={via}");
         }
-        deposit_turn(user_text, assistant_text);
+        let user_result = deposit_turn(user_text, assistant_text);
+        // #1173 law review 2026-10-24: a failed user-frame append releases the claim and logs at ERROR.
+        settle_user_deposit(&deposit_state.user_deposits, user_deposit.as_ref(), user_result.as_ref());
     });
 
     let out_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -3171,6 +3232,49 @@ mod tests {
         let c = decide(&t, &nb, &h, 100);
         release_user_deposit(&t, &c);
         assert!(matches!(decide(&t, &nb, &h, 101), UserDeposit::Deposit(_)));
+    }
+
+    /// #1173 law review 2026-10-24 (LAW 7): a user frame that fails to land releases the claim,
+    /// so the next tool round trip of the same turn deposits the prompt; a frame that lands keeps it.
+    #[test]
+    fn test_user_deposit_failed_append_releases_the_claim() {
+        let t = tracker();
+        let h = headers(None);
+        let b = body("s1", agentic(&["write this down"], 0));
+        let first = decide(&t, &b, &h, 0);
+        assert!(matches!(first, UserDeposit::Deposit(DepositClaim::Session { .. })));
+        // an unwritable tract path: its parent is a regular FILE, so open() fails (ENOTDIR)
+        let dir = std::env::temp_dir().join(format!("minitid_failappend_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not_a_dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad = blocker.join("turns.tract");
+        let result = deposit_turn_at(bad.to_str().unwrap(), Some("write this down".into()), "answer".into());
+        assert!(matches!(result, Some(Err(_))), "the user frame write must report its failure");
+        assert!(settle_user_deposit(&t, Some(&first), result.as_ref()), "the claim must be released");
+        // the next round trip of the SAME turn deposits the prompt (before: lost for the whole turn)
+        let retry = decide(&t, &body("s1", agentic(&["write this down"], 1)), &h, 1);
+        assert!(matches!(retry, UserDeposit::Deposit(_)), "the prompt must be retried, not lost");
+        // and it lands at a good path: the claim is kept, the following rounds skip
+        let good = dir.join("ok").join("turns.tract");
+        let ok = deposit_turn_at(good.to_str().unwrap(), Some("write this down".into()), "answer".into());
+        assert!(matches!(ok, Some(Ok(()))));
+        assert!(!settle_user_deposit(&t, Some(&retry), ok.as_ref()));
+        assert_eq!(decide(&t, &body("s1", agentic(&["write this down"], 2)), &h, 2), UserDeposit::SkipSameTurn);
+        assert!(std::fs::metadata(&good).unwrap().len() > 0, "both frames written");
+        // the recent path releases too; no user text -> nothing to settle
+        let nb = json!({"messages": [{"role": "user", "content": "no id"}]});
+        let c = decide(&t, &nb, &h, 100);
+        let r = deposit_turn_at(bad.to_str().unwrap(), Some("no id".into()), String::new());
+        assert!(settle_user_deposit(&t, Some(&c), r.as_ref()));
+        assert!(matches!(decide(&t, &nb, &h, 101), UserDeposit::Deposit(_)));
+        assert!(deposit_turn_at(bad.to_str().unwrap(), None, String::new()).is_none());
+        assert!(!settle_user_deposit(&t, None, None));
+        // untracked (switch off): nothing to release, still reported
+        let e: std::io::Result<()> = Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        assert!(!settle_user_deposit(&t, Some(&UserDeposit::Untracked), Some(&e)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
