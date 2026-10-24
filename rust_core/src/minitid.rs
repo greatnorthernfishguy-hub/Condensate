@@ -210,6 +210,27 @@
 //       reach the proxied response. CC_GATEWAY_TRACT_PATH (LAW 5) is read
 //       independently here and by the Python drain side (cc_ng_organism.py), same
 //       default on both. See docs/superpowers/specs/2026-07-04-cc-gateway-turn-deposit-design.md.
+// [2026-10-23] Claude Code (Opus 5.5, laptop) — #1173: the user prompt is deposited ONCE per human turn
+// What: proxy() deposited extract_last_user_message() on EVERY /v1/messages request, and the latest genuine human
+//       prompt is the same on every tool round trip of an agentic turn, so one prompt landed ~N times in turns.tract
+//       (93.9 % of its frames were copies, 5-70 s apart). Now UserDepositTracker decides per request:
+//       (a) a request with session identity (session_key: session_id + x-claude-code-agent-id, so each subagent has
+//           its own key) deposits the user text only when its human turn ADVANCES since the last user deposit for
+//           that key -- the same human_turn_marker and the same advance rule decision_for_request uses for the KISS
+//           gate (marker_advances), kept in a separate store so the gate's own state is untouched (LAW 4);
+//       (b) a request without session identity (or Claude's own compaction request) deposits a text only when the
+//           same text was not seen within MINITID_USER_DEPOSIT_RECENT_WINDOW_S (default 1800 s; a sliding window,
+//           like the backlog collapse's 30-min episode rule).
+//       The assistant text is still deposited on every request (each one is new text; empty ones were and are
+//       skipped). The decision is CLAIMED at request time and RELEASED when no deposit happens (the upstream send
+//       fails, or the accumulator task dies), so a retried request still deposits the prompt: nothing is lost (LAW 7).
+//       One stderr line per /v1/messages request: `miniTID deposit: user=<deposited|skipped_same_turn|
+//       skipped_recent|none|released> via=<session|recent|off|->` (no text, no ids).
+// Why:  #1173 (docs dev-log 2026-10-23_turn-duplication-1173, Josh's approval 2026-10-23 ~19:30). ~90 % of TID
+//       extraction calls since 10-03 were duplicate work and the bind added parallel topology per copy.
+// How:  MINITID_USER_DEPOSIT_ONCE (LAW 5, default on; "0" = the old every-request deposit, a no-rebuild rollback).
+//       After a restart the in-memory marks are empty, so each live session deposits its current prompt once more
+//       (harmless). Tests: test_user_deposit_*.
 // -------------------
 
 use axum::body::Body;
@@ -324,6 +345,8 @@ struct AppState {
     upstream_fallback: String,
     client: Client,
     sessions: Mutex<SessionStore>,
+    // #1173: last user deposit per session key / recent text (separate from the KISS gate's store).
+    user_deposits: Mutex<UserDepositTracker>,
 }
 
 // Read the live upstream URL from ~/.config/minitid/upstream, falling back to
@@ -479,6 +502,19 @@ fn human_turn_marker(messages: &[Value]) -> Option<([u8; 32], usize)> {
     Some((digest.finalize().into(), count))
 }
 
+/// The ONE human-turn advance rule (#1173 shares it with the KISS gate): a new
+/// latest genuine human text, or the same text with more genuine human
+/// messages visible (a genuine re-sent prompt). A shrinking count with the same
+/// text (history compacted) is not an advance.
+fn marker_advances(
+    prev_marker: &[u8; 32],
+    prev_count: usize,
+    marker: &[u8; 32],
+    count: usize,
+) -> bool {
+    marker != prev_marker || (count > prev_count && marker == prev_marker)
+}
+
 fn decision_for_request(
     session_key: String,
     messages: &[Value],
@@ -505,9 +541,12 @@ fn decision_for_request(
     };
     session.last_access = access;
 
-    let advances = human_marker != session.human_marker
-        || (visible_human_count > session.visible_human_count
-            && human_marker == session.human_marker);
+    let advances = marker_advances(
+        &session.human_marker,
+        session.visible_human_count,
+        &human_marker,
+        visible_human_count,
+    );
     session.visible_human_count = visible_human_count;
     if !advances {
         return Some(session.decision);
@@ -1092,6 +1131,11 @@ fn last_genuine_user_message_index(messages: &[Value]) -> Option<usize> {
 
 fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
     let body: Value = serde_json::from_slice(body_bytes).ok()?;
+    last_user_message_of(&body)
+}
+
+/// extract_last_user_message on an already-parsed body (#1173: proxy() parses once).
+fn last_user_message_of(body: &Value) -> Option<String> {
     let messages = body["messages"].as_array()?;
     messages.iter().rev().find_map(genuine_user_text)
 }
@@ -1139,6 +1183,263 @@ fn deposit_turn(user_message: Option<String>, assistant_text: String) {
         deposit_experience_entry(&path, "cc_gateway", user_text);
     }
     deposit_experience_entry(&path, "cc_gateway", assistant_text);
+}
+
+// ── #1173: the user prompt once per human turn ──────────────────────────────
+
+const DEFAULT_USER_DEPOSIT_RECENT_WINDOW_S: u64 = 1_800;
+const MIN_USER_DEPOSIT_RECENT_WINDOW_S: u64 = 1;
+const MAX_USER_DEPOSIT_RECENT_WINDOW_S: u64 = 86_400;
+
+/// MINITID_USER_DEPOSIT_ONCE (LAW 5): default on. "0" restores the old
+/// behaviour (the user text deposited on every request) without a rebuild.
+fn user_deposit_once() -> bool {
+    configured_user_deposit_once(env::var("MINITID_USER_DEPOSIT_ONCE").ok().as_deref())
+}
+
+fn configured_user_deposit_once(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("0"))
+}
+
+/// MINITID_USER_DEPOSIT_RECENT_WINDOW_S (LAW 5): how long a text seen on a
+/// request WITHOUT session identity suppresses another deposit of the same
+/// text (sliding: every sighting restarts it). Default 1800 s.
+fn user_deposit_recent_window_s() -> u64 {
+    configured_user_deposit_recent_window_s(
+        env::var("MINITID_USER_DEPOSIT_RECENT_WINDOW_S").ok().as_deref(),
+    )
+}
+
+fn configured_user_deposit_recent_window_s(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(MIN_USER_DEPOSIT_RECENT_WINDOW_S, MAX_USER_DEPOSIT_RECENT_WINDOW_S))
+        .unwrap_or(DEFAULT_USER_DEPOSIT_RECENT_WINDOW_S)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DepositMark {
+    marker: [u8; 32],
+    count: usize,
+    last_access: u64,
+}
+
+/// What a request does with its user text. A Deposit holds the claim that
+/// must be released if the deposit never happens.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UserDeposit {
+    /// Deposit the user text. `release` undoes the claim when nothing was written.
+    Deposit(DepositClaim),
+    /// Same human turn as the last user deposit for this session key.
+    SkipSameTurn,
+    /// The same text was seen within the recent window (no session identity).
+    SkipRecent,
+    /// The tracker is switched off (MINITID_USER_DEPOSIT_ONCE=0): always deposit.
+    Untracked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DepositClaim {
+    Session { key: String, prev: Option<DepositMark>, set: DepositMark },
+    Recent { digest: [u8; 32], prev: Option<u64>, set: u64 },
+}
+
+/// Per-session (and, for requests without identity, per-text) memory of the
+/// last user deposit. Bounded like SessionStore: least recently used entries
+/// are evicted at `capacity`.
+struct UserDepositTracker {
+    sessions: HashMap<String, DepositMark>,
+    recent: HashMap<[u8; 32], u64>,
+    access_clock: u64,
+    capacity: usize,
+}
+
+impl UserDepositTracker {
+    fn new(capacity: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            recent: HashMap::new(),
+            access_clock: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn next_access(&mut self) -> u64 {
+        self.access_clock = self.access_clock.saturating_add(1);
+        self.access_clock
+    }
+
+    fn evict_session_if_full(&mut self) {
+        if self.sessions.len() < self.capacity {
+            return;
+        }
+        let victim = self
+            .sessions
+            .iter()
+            .min_by(|(ka, a), (kb, b)| a.last_access.cmp(&b.last_access).then_with(|| ka.cmp(kb)))
+            .map(|(k, _)| k.clone());
+        if let Some(k) = victim {
+            self.sessions.remove(&k);
+        }
+    }
+
+    fn evict_recent_if_full(&mut self) {
+        if self.recent.len() < self.capacity {
+            return;
+        }
+        let victim = self
+            .recent
+            .iter()
+            .min_by(|(ka, a), (kb, b)| a.cmp(b).then_with(|| ka.cmp(kb)))
+            .map(|(k, _)| *k);
+        if let Some(k) = victim {
+            self.recent.remove(&k);
+        }
+    }
+
+    /// A request WITH session identity: deposit only when the human turn
+    /// advanced since this key's last user deposit (marker_advances, the KISS
+    /// gate's rule). The first request of an unknown key deposits.
+    fn claim_session(&mut self, key: String, marker: [u8; 32], count: usize) -> UserDeposit {
+        let access = self.next_access();
+        match self.sessions.get_mut(&key) {
+            Some(mark) => {
+                if !marker_advances(&mark.marker, mark.count, &marker, count) {
+                    // Same turn. Keep the count current so a later genuine
+                    // re-send is measured against what was last visible.
+                    mark.count = count;
+                    mark.last_access = access;
+                    return UserDeposit::SkipSameTurn;
+                }
+                let prev = *mark;
+                let set = DepositMark { marker, count, last_access: access };
+                *mark = set;
+                UserDeposit::Deposit(DepositClaim::Session { key, prev: Some(prev), set })
+            }
+            None => {
+                self.evict_session_if_full();
+                let set = DepositMark { marker, count, last_access: access };
+                self.sessions.insert(key.clone(), set);
+                UserDeposit::Deposit(DepositClaim::Session { key, prev: None, set })
+            }
+        }
+    }
+
+    /// A request WITHOUT session identity (or Claude's compaction request):
+    /// deposit a text only when it was not seen within `window_s`. Every
+    /// sighting restarts the window, so a burst with gaps shorter than the
+    /// window is one deposit.
+    fn claim_recent(&mut self, text: &str, now: u64, window_s: u64) -> UserDeposit {
+        let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        match self.recent.get_mut(&digest) {
+            Some(seen) if now.saturating_sub(*seen) < window_s => {
+                *seen = now;
+                UserDeposit::SkipRecent
+            }
+            Some(seen) => {
+                let prev = *seen;
+                *seen = now;
+                UserDeposit::Deposit(DepositClaim::Recent { digest, prev: Some(prev), set: now })
+            }
+            None => {
+                self.evict_recent_if_full();
+                self.recent.insert(digest, now);
+                UserDeposit::Deposit(DepositClaim::Recent { digest, prev: None, set: now })
+            }
+        }
+    }
+
+    /// Undo a claim whose deposit never happened, so the next request of the
+    /// same turn deposits the text instead (nothing lost, LAW 7). Only while
+    /// the entry still holds what this claim set (a later claim is kept).
+    fn release(&mut self, claim: &DepositClaim) {
+        match claim {
+            DepositClaim::Session { key, prev, set } => {
+                if self.sessions.get(key) == Some(set) {
+                    match prev {
+                        Some(p) => {
+                            self.sessions.insert(key.clone(), *p);
+                        }
+                        None => {
+                            self.sessions.remove(key);
+                        }
+                    }
+                }
+            }
+            DepositClaim::Recent { digest, prev, set } => {
+                if self.recent.get(digest) == Some(set) {
+                    match prev {
+                        Some(p) => {
+                            self.recent.insert(*digest, *p);
+                        }
+                        None => {
+                            self.recent.remove(digest);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Decide what this /v1/messages request does with its user text. `body` is the
+/// ORIGINAL request (before any rewrite), `user_text` its latest genuine human
+/// text (extract_last_user_message). Never fails: a poisoned lock deposits.
+fn user_deposit_for_request(
+    body: Option<&Value>,
+    headers: &HeaderMap,
+    user_text: &str,
+    tracker: &Mutex<UserDepositTracker>,
+    enabled: bool,
+    now: u64,
+    window_s: u64,
+) -> UserDeposit {
+    if !enabled {
+        return UserDeposit::Untracked;
+    }
+    let Ok(mut t) = tracker.lock() else {
+        return UserDeposit::Untracked;
+    };
+    let messages = body.and_then(|b| b.get("messages")).and_then(Value::as_array);
+    let compaction = headers.contains_key("x-cc-compaction-request")
+        || messages.map(|m| latest_user_role_is_compaction_request(m)).unwrap_or(false);
+    if !compaction {
+        if let (Some(b), Some(m)) = (body, messages) {
+            if let (Some(key), Some((marker, count))) = (session_key(b, headers), human_turn_marker(m)) {
+                return t.claim_session(key, marker, count);
+            }
+        }
+    }
+    t.claim_recent(user_text, now, window_s)
+}
+
+fn release_user_deposit(tracker: &Mutex<UserDepositTracker>, decision: &UserDeposit) {
+    if let UserDeposit::Deposit(claim) = decision {
+        if let Ok(mut t) = tracker.lock() {
+            t.release(claim);
+        }
+    }
+}
+
+fn user_deposit_label(decision: &UserDeposit) -> (&'static str, &'static str) {
+    match decision {
+        UserDeposit::Deposit(DepositClaim::Session { .. }) => ("deposited", "session"),
+        UserDeposit::Deposit(DepositClaim::Recent { .. }) => ("deposited", "recent"),
+        UserDeposit::SkipSameTurn => ("skipped_same_turn", "session"),
+        UserDeposit::SkipRecent => ("skipped_recent", "recent"),
+        UserDeposit::Untracked => ("deposited", "off"),
+    }
+}
+
+fn user_deposit_writes(decision: &UserDeposit) -> bool {
+    matches!(decision, UserDeposit::Deposit(_) | UserDeposit::Untracked)
 }
 
 /// Reconstruct the assistant's full generated text from accumulated SSE
@@ -1215,11 +1516,30 @@ async fn proxy(
 
     // Extract the latest genuine user message from the original bytes, before any
     // rewrite. Trailing user-role entries may be tool results or injected harness context.
-    let last_user_message = if is_messages {
-        extract_last_user_message(&body_bytes)
+    // #1173: parsed once here; the same original body feeds the deposit decision.
+    let original: Option<Value> = if is_messages {
+        serde_json::from_slice(&body_bytes).ok()
     } else {
         None
     };
+    let last_user_message = original.as_ref().and_then(last_user_message_of);
+    // #1173: decide (and claim) the user-text deposit from the ORIGINAL request,
+    // before any rewrite. Released below when no deposit happens.
+    let user_deposit = match &last_user_message {
+        Some(text) => {
+            Some(user_deposit_for_request(
+                original.as_ref(),
+                &headers,
+                text,
+                &state.user_deposits,
+                user_deposit_once(),
+                now_secs(),
+                user_deposit_recent_window_s(),
+            ))
+        }
+        None => None,
+    };
+    drop(original); // #1173: the decision is made; do not hold the parsed body across the upstream call
 
     // Claude's native summary request must reach the provider byte-for-byte and
     // cannot consume a human-turn gate decision.
@@ -1257,10 +1577,20 @@ async fn proxy(
     }
     rb = rb.body(body_bytes.to_vec());
 
-    let upstream_resp = rb
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let upstream_resp = match rb.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            // #1173: nothing is deposited on this path, so the claim is
+            // released and the retry of this turn deposits the prompt.
+            if let Some(decision) = &user_deposit {
+                release_user_deposit(&state.user_deposits, decision);
+                if is_messages {
+                    eprintln!("miniTID deposit: user=released via=send_error");
+                }
+            }
+            return Err((StatusCode::BAD_GATEWAY, e.to_string()));
+        }
+    };
 
     // Map status and headers, stream body back.
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())
@@ -1294,13 +1624,32 @@ async fn proxy(
         accumulated
     });
 
+    let deposit_state = Arc::clone(&state);
     tokio::spawn(async move {
         let accumulated = match accumulator_task.await {
             Ok(bytes) => bytes,
-            Err(_) => return, // task panicked -- nothing to deposit, never crash the proxy
+            Err(_) => {
+                // task panicked -- nothing to deposit, never crash the proxy;
+                // #1173: release the claim so the prompt is not lost.
+                if let Some(decision) = &user_deposit {
+                    release_user_deposit(&deposit_state.user_deposits, decision);
+                }
+                return;
+            }
         };
         let assistant_text = reconstruct_assistant_text(&accumulated);
-        deposit_turn(last_user_message, assistant_text);
+        let (user_label, via) = match &user_deposit {
+            Some(decision) => user_deposit_label(decision),
+            None => ("none", "-"),
+        };
+        let user_text = match &user_deposit {
+            Some(decision) if user_deposit_writes(decision) => last_user_message,
+            _ => None,
+        };
+        if is_messages {
+            eprintln!("miniTID deposit: user={user_label} via={via}");
+        }
+        deposit_turn(user_text, assistant_text);
     });
 
     let out_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -1327,6 +1676,7 @@ async fn main() {
     let state = Arc::new(AppState {
         client: Client::builder().build().expect("reqwest client"),
         sessions: Mutex::new(SessionStore::new(session_capacity())),
+        user_deposits: Mutex::new(UserDepositTracker::new(session_capacity())),
         upstream_fallback: upstream.clone(),
     });
 
@@ -2644,6 +2994,269 @@ mod tests {
         ]}"#;
         let result = extract_last_user_message(body);
         assert_eq!(result, Some("still a real question".to_string()));
+    }
+
+    // ── #1173: the user prompt once per human turn ──────────────────────────
+
+    fn tracker() -> Mutex<UserDepositTracker> {
+        Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY))
+    }
+
+    /// One agentic turn: the human prompt, then `rounds` tool round trips.
+    fn agentic(prompts: &[&str], rounds: usize) -> Vec<Value> {
+        let mut m = conversation(prompts);
+        for i in 0..rounds {
+            m.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("tu_{i}"), "name": "Bash", "input": {}}]}));
+            m.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("tu_{i}"), "content": "out"}]}));
+        }
+        m
+    }
+
+    fn decide(t: &Mutex<UserDepositTracker>, b: &Value, h: &HeaderMap, now: u64) -> UserDeposit {
+        let text = last_user_message_of(b).expect("a genuine user text");
+        user_deposit_for_request(Some(b), h, &text, t, true, now, DEFAULT_USER_DEPOSIT_RECENT_WINDOW_S)
+    }
+
+    #[test]
+    fn test_user_deposit_once_per_agentic_turn() {
+        let t = tracker();
+        let h = headers(None);
+        assert!(matches!(decide(&t, &body("s1", agentic(&["fix it"], 0)), &h, 0), UserDeposit::Deposit(_)));
+        for r in 1..=12 {
+            assert_eq!(decide(&t, &body("s1", agentic(&["fix it"], r)), &h, r as u64), UserDeposit::SkipSameTurn);
+        }
+        // the next human turn deposits once, then its tool rounds skip
+        assert!(matches!(decide(&t, &body("s1", agentic(&["fix it", "now test"], 0)), &h, 20), UserDeposit::Deposit(_)));
+        assert_eq!(decide(&t, &body("s1", agentic(&["fix it", "now test"], 3)), &h, 21), UserDeposit::SkipSameTurn);
+    }
+
+    #[test]
+    fn test_user_deposit_subagent_and_session_are_separate_keys() {
+        let t = tracker();
+        let b = body("s1", agentic(&["same words"], 0));
+        assert!(matches!(decide(&t, &b, &headers(None), 0), UserDeposit::Deposit(_)));
+        assert!(matches!(decide(&t, &b, &headers(Some("agent-a")), 0), UserDeposit::Deposit(_)));
+        assert!(matches!(decide(&t, &body("s2", agentic(&["same words"], 0)), &headers(None), 0), UserDeposit::Deposit(_)));
+        assert_eq!(decide(&t, &b, &headers(Some("agent-a")), 1), UserDeposit::SkipSameTurn);
+    }
+
+    #[test]
+    fn test_user_deposit_genuine_resend_deposits_compaction_shrink_does_not() {
+        let t = tracker();
+        let h = headers(None);
+        assert!(matches!(decide(&t, &body("s1", conversation(&["a", "go"])), &h, 0), UserDeposit::Deposit(_)));
+        // the human types the same prompt again: one more genuine user message is visible
+        assert!(matches!(decide(&t, &body("s1", conversation(&["a", "go", "go"])), &h, 1), UserDeposit::Deposit(_)));
+        // history compacted: fewer messages, same latest text -> same turn
+        assert_eq!(decide(&t, &body("s1", conversation(&["go"])), &h, 2), UserDeposit::SkipSameTurn);
+    }
+
+    #[test]
+    fn test_user_deposit_without_session_uses_recent_window_sliding() {
+        let t = tracker();
+        let h = headers(None);
+        let b = json!({"messages": [{"role": "user", "content": "no identity here"}]});
+        assert!(matches!(decide(&t, &b, &h, 1_000), UserDeposit::Deposit(DepositClaim::Recent { .. })));
+        assert_eq!(decide(&t, &b, &h, 1_000 + 1_799), UserDeposit::SkipRecent);
+        // sliding: the sighting at +1799 restarts the window
+        assert_eq!(decide(&t, &b, &h, 1_000 + 1_799 + 1_799), UserDeposit::SkipRecent);
+        assert!(matches!(decide(&t, &b, &h, 1_000 + 1_799 + 1_799 + 1_800), UserDeposit::Deposit(_)));
+        let other = json!({"messages": [{"role": "user", "content": "a different text"}]});
+        assert!(matches!(decide(&t, &other, &h, 5_000), UserDeposit::Deposit(_)));
+    }
+
+    #[test]
+    fn test_user_deposit_compaction_request_uses_recent_path() {
+        let t = tracker();
+        let mut h = headers(None);
+        let b = body("s1", conversation(&["keep going"]));
+        assert!(matches!(decide(&t, &b, &h, 0), UserDeposit::Deposit(DepositClaim::Session { .. })));
+        h.insert("x-cc-compaction-request", "1".parse().unwrap());
+        // not the session path: the compaction request never consumes or advances the session mark
+        assert!(matches!(decide(&t, &b, &h, 0), UserDeposit::Deposit(DepositClaim::Recent { .. })));
+        assert_eq!(decide(&t, &b, &h, 10), UserDeposit::SkipRecent);
+        assert_eq!(decide(&t, &b, &headers(None), 11), UserDeposit::SkipSameTurn);
+    }
+
+    #[test]
+    fn test_user_deposit_release_lets_the_retry_deposit() {
+        let t = tracker();
+        let h = headers(None);
+        let b = body("s1", agentic(&["do the thing"], 0));
+        let first = decide(&t, &b, &h, 0);
+        assert!(matches!(first, UserDeposit::Deposit(_)));
+        release_user_deposit(&t, &first); // the upstream send failed: nothing written
+        let retry = decide(&t, &b, &h, 1);
+        assert!(matches!(retry, UserDeposit::Deposit(_)), "the retry must deposit the prompt");
+        assert_eq!(decide(&t, &b, &h, 2), UserDeposit::SkipSameTurn);
+        // a stale release (an older claim) never undoes a newer one
+        release_user_deposit(&t, &first);
+        assert_eq!(decide(&t, &b, &h, 3), UserDeposit::SkipSameTurn);
+        // the recent path releases too
+        let nb = json!({"messages": [{"role": "user", "content": "x"}]});
+        let c = decide(&t, &nb, &h, 100);
+        release_user_deposit(&t, &c);
+        assert!(matches!(decide(&t, &nb, &h, 101), UserDeposit::Deposit(_)));
+    }
+
+    #[test]
+    fn test_user_deposit_disabled_is_untracked_and_writes() {
+        let t = tracker();
+        let b = body("s1", agentic(&["p"], 0));
+        let d = user_deposit_for_request(Some(&b), &headers(None), "p", &t, false, 0, 1_800);
+        assert_eq!(d, UserDeposit::Untracked);
+        assert!(user_deposit_writes(&d));
+        assert!(!user_deposit_writes(&UserDeposit::SkipSameTurn));
+        assert!(!user_deposit_writes(&UserDeposit::SkipRecent));
+    }
+
+    #[test]
+    fn test_user_deposit_env_parsing() {
+        assert!(configured_user_deposit_once(None));
+        assert!(configured_user_deposit_once(Some("1")));
+        assert!(!configured_user_deposit_once(Some("0")));
+        assert!(!configured_user_deposit_once(Some(" 0 ")));
+        assert_eq!(configured_user_deposit_recent_window_s(None), 1_800);
+        assert_eq!(configured_user_deposit_recent_window_s(Some("junk")), 1_800);
+        assert_eq!(configured_user_deposit_recent_window_s(Some("0")), 1);
+        assert_eq!(configured_user_deposit_recent_window_s(Some("999999")), 86_400);
+        assert_eq!(configured_user_deposit_recent_window_s(Some("600")), 600);
+    }
+
+    #[test]
+    fn test_user_deposit_tracker_is_bounded() {
+        let t = Mutex::new(UserDepositTracker::new(16));
+        let h = headers(None);
+        for i in 0..100 {
+            let _ = decide(&t, &body(&format!("s{i}"), conversation(&["hi"])), &h, i);
+            let _ = decide(&t, &json!({"messages": [{"role": "user", "content": format!("t{i}")}]}), &h, i);
+        }
+        let g = t.lock().unwrap();
+        assert!(g.sessions.len() <= 16 && g.recent.len() <= 16);
+    }
+
+    #[test]
+    fn test_marker_advances_is_the_gate_rule() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert!(marker_advances(&a, 3, &b, 3));
+        assert!(marker_advances(&a, 3, &a, 4));
+        assert!(!marker_advances(&a, 3, &a, 3));
+        assert!(!marker_advances(&a, 3, &a, 2));
+    }
+
+    /// End to end through proxy(): a mock upstream on 127.0.0.1, HOME pointed at
+    /// a temp dir (read_upstream then falls back to the mock; never the real API),
+    /// the tract at a temp path. 1 human prompt x 6 tool round trips + a second
+    /// prompt: the tract holds each prompt ONCE and every non-empty assistant text.
+    /// A failed send releases the claim, so its retry deposits the prompt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_user_deposit_end_to_end_through_proxy() {
+        use ng_tract::read::{ReadResult, TractReader};
+        use ng_tract::TractEntry;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        async fn upstream() -> Response<Body> {
+            let n = HITS.fetch_add(1, Ordering::SeqCst);
+            let sse = format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta", "text": format!("answer {n}")}})
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
+            r
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(upstream)).await.unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("minitid_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".config/minitid")).unwrap();
+        let tract = dir.join("turns.tract");
+        std::env::set_var("HOME", &dir);
+        std::env::set_var("CC_GATEWAY_TRACT_PATH", &tract);
+        std::env::remove_var("MINITID_PITH_PENINSULA");
+        std::env::remove_var("MINITID_USER_DEPOSIT_ONCE");
+        let upstream_file = dir.join(".config/minitid/upstream");
+
+        let state = Arc::new(AppState {
+            client: Client::builder().build().unwrap(),
+            sessions: Mutex::new(SessionStore::new(DEFAULT_SESSION_CAPACITY)),
+            user_deposits: Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY)),
+            upstream_fallback: mock.clone(),
+        });
+        async fn send(state: &Arc<AppState>, b: &Value) -> axum::http::StatusCode {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(b).unwrap()))
+                .unwrap();
+            match proxy(State(Arc::clone(state)), req).await {
+                Ok(resp) => {
+                    let st = resp.status();
+                    let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+                    st
+                }
+                Err((st, _)) => st,
+            }
+        }
+        fn frames(path: &std::path::Path) -> Vec<String> {
+            let data = std::fs::read(path).unwrap_or_default();
+            let mut r = TractReader::new(&data);
+            let mut out = Vec::new();
+            while let Some(x) = r.next_entry() {
+                if let Ok(ReadResult::Entry(TractEntry::Experience(e))) = x {
+                    out.push(String::from_utf8_lossy(&e.content).to_string());
+                }
+            }
+            out
+        }
+        async fn settle(path: &std::path::Path, want: usize) -> Vec<String> {
+            for _ in 0..200 {
+                let f = frames(path);
+                if f.len() >= want {
+                    return f;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            frames(path)
+        }
+
+        // 1) a failed send (closed port) first: nothing written, the claim released
+        std::fs::write(&upstream_file, "http://127.0.0.1:9").unwrap();
+        assert_eq!(send(&state, &body("e2e", agentic(&["first prompt"], 0))).await,
+                   axum::http::StatusCode::BAD_GATEWAY);
+        std::fs::remove_file(&upstream_file).unwrap(); // back to the mock (fallback)
+        // 2) the retry and 6 tool round trips of the same human turn
+        let mut want = 0;
+        for r in 0..=6 {
+            assert!(send(&state, &body("e2e", agentic(&["first prompt"], r))).await.is_success());
+            want += if r == 0 { 2 } else { 1 };
+            settle(&tract, want).await;
+        }
+        // 3) the next human turn and 2 round trips
+        for r in 0..=2 {
+            assert!(send(&state, &body("e2e", agentic(&["first prompt", "second prompt"], r))).await.is_success());
+            want += if r == 0 { 2 } else { 1 };
+            settle(&tract, want).await;
+        }
+        let f = settle(&tract, want).await;
+        assert_eq!(f.iter().filter(|c| *c == "first prompt").count(), 1, "{f:?}");
+        assert_eq!(f.iter().filter(|c| *c == "second prompt").count(), 1, "{f:?}");
+        assert_eq!(f.iter().filter(|c| c.starts_with("answer ")).count(), 10, "{f:?}");
+        assert_eq!(f.len(), 12, "{f:?}");
+        // the prompt precedes its turn's first answer
+        let p1 = f.iter().position(|c| c == "first prompt").unwrap();
+        assert_eq!(p1, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
