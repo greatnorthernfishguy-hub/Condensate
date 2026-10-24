@@ -222,10 +222,16 @@
 //           same text was not seen within MINITID_USER_DEPOSIT_RECENT_WINDOW_S (default 1800 s; a sliding window,
 //           like the backlog collapse's 30-min episode rule).
 //       The assistant text is still deposited on every request (each one is new text; empty ones were and are
-//       skipped). The decision is CLAIMED at request time and RELEASED when no deposit happens (the upstream send
-//       fails, or the accumulator task dies), so a retried request still deposits the prompt: nothing is lost (LAW 7).
+//       skipped). The decision is CLAIMED at request time and held by a UserDepositGuard: every path that does not
+//       write the deposit RELEASES it as the guard drops -- the upstream send fails, axum drops proxy()'s future because
+//       the client went away (law review 2026-10-23 finding 1), or the accumulator task dies -- so a retried request
+//       still deposits the prompt: nothing is lost (LAW 7). A release matches by claim id, so a same-turn request in
+//       between (which only refreshes the count) cannot block it (finding 4).
 //       One stderr line per /v1/messages request: `miniTID deposit: user=<deposited|skipped_same_turn|
-//       skipped_recent|none|released> via=<session|recent|off|->` (no text, no ids).
+//       skipped_recent|none> via=<session|recent|off|->`, plus `user=released via=no_deposit` (no text, no ids).
+//       #1176: frames are appended by append_frame_locked (deposit_to_file's open-by-path + O_APPEND + flock(LOCK_EX),
+//       plus a re-check that the path is still the locked inode, re-opening if not), because the CC drain now trims
+//       the tract by renaming the remainder over it while holding that lock (NG cc_ng_organism._drain_trim_head_locked).
 // Why:  #1173 (docs dev-log 2026-10-23_turn-duplication-1173, Josh's approval 2026-10-23 ~19:30). ~90 % of TID
 //       extraction calls since 10-03 were duplicate work and the bind added parallel topology per copy.
 // How:  MINITID_USER_DEPOSIT_ONCE (LAW 5, default on; "0" = the old every-request deposit, a no-rebuild rollback).
@@ -1164,7 +1170,44 @@ fn deposit_experience_entry(path: &str, source: &str, content: String) {
         content: content.into_bytes(),
     };
     let bytes = ng_tract::write::write_experience(&entry);
-    let _ = ng_tract::write::deposit_to_file(path, &bytes);
+    let _ = append_frame_locked(path, &bytes);
+}
+
+/// #1176 (2026-10-23): append one frame the way ng_tract's deposit_to_file does (open by path with O_APPEND,
+/// flock(LOCK_EX), write all, unlock) PLUS one check after the lock is held: the path must still be the inode we
+/// locked. The CC drain trims the tract's head by renaming the remainder over the tract while it holds this same lock;
+/// a writer that opened the old inode and waited on the lock would otherwise append to the replaced file and the frame
+/// would be lost. On a mismatch: unlock, close, re-open the path. Not a vendored file: miniTID's own write path.
+fn append_frame_locked(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+    for _ in 0..64 {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o664)
+            .open(path)?;
+        let fd = f.as_raw_fd();
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let same = match (f.metadata(), std::fs::metadata(path)) {
+            (Ok(a), Ok(b)) => a.ino() == b.ino() && a.dev() == b.dev(),
+            _ => false,
+        };
+        if !same {
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            continue;
+        }
+        let result = f.write_all(data);
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return result;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "tract path kept changing under the lock",
+    ))
 }
 
 /// Deposit both sides of one turn as raw experience (LAW 7) -- no
@@ -1229,6 +1272,8 @@ struct DepositMark {
     marker: [u8; 32],
     count: usize,
     last_access: u64,
+    /// The id of the claim that set `marker` (a same-turn request updates count/last_access, never this).
+    claim: u64,
 }
 
 /// What a request does with its user text. A Deposit holds the claim that
@@ -1247,8 +1292,8 @@ enum UserDeposit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DepositClaim {
-    Session { key: String, prev: Option<DepositMark>, set: DepositMark },
-    Recent { digest: [u8; 32], prev: Option<u64>, set: u64 },
+    Session { key: String, prev: Option<DepositMark>, id: u64 },
+    Recent { digest: [u8; 32], prev: Option<(u64, u64)>, id: u64 },
 }
 
 /// Per-session (and, for requests without identity, per-text) memory of the
@@ -1256,8 +1301,10 @@ enum DepositClaim {
 /// are evicted at `capacity`.
 struct UserDepositTracker {
     sessions: HashMap<String, DepositMark>,
-    recent: HashMap<[u8; 32], u64>,
+    /// digest -> (last seen, id of the claim that last deposited it)
+    recent: HashMap<[u8; 32], (u64, u64)>,
     access_clock: u64,
+    claim_clock: u64,
     capacity: usize,
 }
 
@@ -1267,6 +1314,7 @@ impl UserDepositTracker {
             sessions: HashMap::new(),
             recent: HashMap::new(),
             access_clock: 0,
+            claim_clock: 0,
             capacity: capacity.max(1),
         }
     }
@@ -1274,6 +1322,11 @@ impl UserDepositTracker {
     fn next_access(&mut self) -> u64 {
         self.access_clock = self.access_clock.saturating_add(1);
         self.access_clock
+    }
+
+    fn next_claim(&mut self) -> u64 {
+        self.claim_clock = self.claim_clock.saturating_add(1);
+        self.claim_clock
     }
 
     fn evict_session_if_full(&mut self) {
@@ -1297,7 +1350,7 @@ impl UserDepositTracker {
         let victim = self
             .recent
             .iter()
-            .min_by(|(ka, a), (kb, b)| a.cmp(b).then_with(|| ka.cmp(kb)))
+            .min_by(|(ka, a), (kb, b)| a.0.cmp(&b.0).then_with(|| ka.cmp(kb)))
             .map(|(k, _)| *k);
         if let Some(k) = victim {
             self.recent.remove(&k);
@@ -1309,6 +1362,7 @@ impl UserDepositTracker {
     /// gate's rule). The first request of an unknown key deposits.
     fn claim_session(&mut self, key: String, marker: [u8; 32], count: usize) -> UserDeposit {
         let access = self.next_access();
+        let id = self.next_claim();
         match self.sessions.get_mut(&key) {
             Some(mark) => {
                 if !marker_advances(&mark.marker, mark.count, &marker, count) {
@@ -1319,15 +1373,14 @@ impl UserDepositTracker {
                     return UserDeposit::SkipSameTurn;
                 }
                 let prev = *mark;
-                let set = DepositMark { marker, count, last_access: access };
-                *mark = set;
-                UserDeposit::Deposit(DepositClaim::Session { key, prev: Some(prev), set })
+                *mark = DepositMark { marker, count, last_access: access, claim: id };
+                UserDeposit::Deposit(DepositClaim::Session { key, prev: Some(prev), id })
             }
             None => {
                 self.evict_session_if_full();
-                let set = DepositMark { marker, count, last_access: access };
-                self.sessions.insert(key.clone(), set);
-                UserDeposit::Deposit(DepositClaim::Session { key, prev: None, set })
+                self.sessions
+                    .insert(key.clone(), DepositMark { marker, count, last_access: access, claim: id });
+                UserDeposit::Deposit(DepositClaim::Session { key, prev: None, id })
             }
         }
     }
@@ -1338,31 +1391,34 @@ impl UserDepositTracker {
     /// window is one deposit.
     fn claim_recent(&mut self, text: &str, now: u64, window_s: u64) -> UserDeposit {
         let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        let id = self.next_claim();
         match self.recent.get_mut(&digest) {
-            Some(seen) if now.saturating_sub(*seen) < window_s => {
-                *seen = now;
+            Some(seen) if now.saturating_sub(seen.0) < window_s => {
+                seen.0 = now;
                 UserDeposit::SkipRecent
             }
             Some(seen) => {
                 let prev = *seen;
-                *seen = now;
-                UserDeposit::Deposit(DepositClaim::Recent { digest, prev: Some(prev), set: now })
+                *seen = (now, id);
+                UserDeposit::Deposit(DepositClaim::Recent { digest, prev: Some(prev), id })
             }
             None => {
                 self.evict_recent_if_full();
-                self.recent.insert(digest, now);
-                UserDeposit::Deposit(DepositClaim::Recent { digest, prev: None, set: now })
+                self.recent.insert(digest, (now, id));
+                UserDeposit::Deposit(DepositClaim::Recent { digest, prev: None, id })
             }
         }
     }
 
     /// Undo a claim whose deposit never happened, so the next request of the
     /// same turn deposits the text instead (nothing lost, LAW 7). Only while
-    /// the entry still holds what this claim set (a later claim is kept).
+    /// the entry still carries THIS claim's id: a same-turn request in between
+    /// (which only touches count / last seen) does not block the release, and a
+    /// newer claim is never undone.
     fn release(&mut self, claim: &DepositClaim) {
         match claim {
-            DepositClaim::Session { key, prev, set } => {
-                if self.sessions.get(key) == Some(set) {
+            DepositClaim::Session { key, prev, id } => {
+                if self.sessions.get(key).map(|m| m.claim) == Some(*id) {
                     match prev {
                         Some(p) => {
                             self.sessions.insert(key.clone(), *p);
@@ -1373,8 +1429,8 @@ impl UserDepositTracker {
                     }
                 }
             }
-            DepositClaim::Recent { digest, prev, set } => {
-                if self.recent.get(digest) == Some(set) {
+            DepositClaim::Recent { digest, prev, id } => {
+                if self.recent.get(digest).map(|r| r.1) == Some(*id) {
                     match prev {
                         Some(p) => {
                             self.recent.insert(*digest, *p);
@@ -1418,6 +1474,33 @@ fn user_deposit_for_request(
         }
     }
     t.claim_recent(user_text, now, window_s)
+}
+
+/// Holds a request's user-deposit decision until the deposit is written. Dropped
+/// without `take()` -- the upstream send failed, the client went away and axum
+/// dropped the handler future, or the accumulator task died -- it RELEASES the
+/// claim, so the next request of the same turn deposits the prompt (LAW 7).
+struct UserDepositGuard {
+    state: Arc<AppState>,
+    decision: Option<UserDeposit>,
+}
+
+impl UserDepositGuard {
+    /// Disarm: the deposit is about to be written.
+    fn take(&mut self) -> Option<UserDeposit> {
+        self.decision.take()
+    }
+}
+
+impl Drop for UserDepositGuard {
+    fn drop(&mut self) {
+        if let Some(decision) = self.decision.take() {
+            if matches!(decision, UserDeposit::Deposit(_)) {
+                release_user_deposit(&self.state.user_deposits, &decision);
+                eprintln!("miniTID deposit: user=released via=no_deposit");
+            }
+        }
+    }
 }
 
 fn release_user_deposit(tracker: &Mutex<UserDepositTracker>, decision: &UserDeposit) {
@@ -1540,6 +1623,9 @@ async fn proxy(
         None => None,
     };
     drop(original); // #1173: the decision is made; do not hold the parsed body across the upstream call
+    // #1173: from here every path that does not write the deposit releases the claim (the guard's Drop),
+    // including axum dropping this future when the client goes away mid-request.
+    let mut user_deposit = UserDepositGuard { state: Arc::clone(&state), decision: user_deposit };
 
     // Claude's native summary request must reach the provider byte-for-byte and
     // cannot consume a human-turn gate decision.
@@ -1577,20 +1663,11 @@ async fn proxy(
     }
     rb = rb.body(body_bytes.to_vec());
 
-    let upstream_resp = match rb.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            // #1173: nothing is deposited on this path, so the claim is
-            // released and the retry of this turn deposits the prompt.
-            if let Some(decision) = &user_deposit {
-                release_user_deposit(&state.user_deposits, decision);
-                if is_messages {
-                    eprintln!("miniTID deposit: user=released via=send_error");
-                }
-            }
-            return Err((StatusCode::BAD_GATEWAY, e.to_string()));
-        }
-    };
+    // #1173: a send error returns here; the guard releases the claim as it drops.
+    let upstream_resp = rb
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
     // Map status and headers, stream body back.
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())
@@ -1624,20 +1701,15 @@ async fn proxy(
         accumulated
     });
 
-    let deposit_state = Arc::clone(&state);
     tokio::spawn(async move {
         let accumulated = match accumulator_task.await {
             Ok(bytes) => bytes,
-            Err(_) => {
-                // task panicked -- nothing to deposit, never crash the proxy;
-                // #1173: release the claim so the prompt is not lost.
-                if let Some(decision) = &user_deposit {
-                    release_user_deposit(&deposit_state.user_deposits, decision);
-                }
-                return;
-            }
+            // task panicked -- nothing to deposit, never crash the proxy;
+            // #1173: the guard (moved in here) releases the claim as it drops.
+            Err(_) => return,
         };
         let assistant_text = reconstruct_assistant_text(&accumulated);
+        let user_deposit = user_deposit.take();
         let (user_label, via) = match &user_deposit {
             Some(decision) => user_deposit_label(decision),
             None => ("none", "-"),
@@ -3147,6 +3219,60 @@ mod tests {
         assert!(!marker_advances(&a, 3, &a, 2));
     }
 
+    #[test]
+    fn test_user_deposit_release_survives_a_same_turn_request_in_between() {
+        // review finding 4: a same-key request that lands between the claim and the failed send only updates the
+        // count / last access; the release must still undo the claim.
+        let t = tracker();
+        let h = headers(None);
+        let first = decide(&t, &body("s1", agentic(&["p"], 0)), &h, 0);
+        assert!(matches!(first, UserDeposit::Deposit(_)));
+        assert_eq!(decide(&t, &body("s1", agentic(&["p"], 1)), &h, 1), UserDeposit::SkipSameTurn);
+        release_user_deposit(&t, &first);
+        assert!(matches!(decide(&t, &body("s1", agentic(&["p"], 2)), &h, 2), UserDeposit::Deposit(_)));
+        // the recent path: a sighting in between slides `seen` but keeps the claim id
+        let nb = json!({"messages": [{"role": "user", "content": "x"}]});
+        let c = decide(&t, &nb, &h, 100);
+        assert_eq!(decide(&t, &nb, &h, 101), UserDeposit::SkipRecent);
+        release_user_deposit(&t, &c);
+        assert!(matches!(decide(&t, &nb, &h, 102), UserDeposit::Deposit(_)));
+    }
+
+    #[test]
+    fn test_append_frame_locked_follows_a_rename_under_the_lock() {
+        // #1176: the drain holds LOCK_EX on the tract inode, renames the trimmed remainder over the tract, then
+        // unlocks. A writer that opened the OLD inode and waited on the lock must land in the NEW tract.
+        use std::os::unix::io::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("minitid_rename_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("turns.tract");
+        std::fs::write(&path, b"consumedREMAINDER").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let p2 = path.to_str().unwrap().to_string();
+        let writer = std::thread::spawn(move || append_frame_locked(&p2, b"LATE").unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!writer.is_finished(), "the append must wait for the lock");
+        let tmp = dir.join("turns.tract.trim-tmp");
+        std::fs::write(&tmp, b"REMAINDER").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+        writer.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"REMAINDERLATE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_append_frame_locked_plain_append_creates_and_appends() {
+        let path = std::env::temp_dir().join(format!("minitid_append_{}.tract", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        append_frame_locked(path.to_str().unwrap(), b"a").unwrap();
+        append_frame_locked(path.to_str().unwrap(), b"b").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ab");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// End to end through proxy(): a mock upstream on 127.0.0.1, HOME pointed at
     /// a temp dir (read_upstream then falls back to the mock; never the real API),
     /// the tract at a temp path. 1 human prompt x 6 tool round trips + a second
@@ -3159,7 +3285,11 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static HITS: AtomicUsize = AtomicUsize::new(0);
+        static SLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         async fn upstream() -> Response<Body> {
+            if SLOW.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await; // the client gives up first
+            }
             let n = HITS.fetch_add(1, Ordering::SeqCst);
             let sse = format!(
                 "event: content_block_delta\ndata: {}\n\n",
@@ -3235,6 +3365,23 @@ mod tests {
         assert_eq!(send(&state, &body("e2e", agentic(&["first prompt"], 0))).await,
                    axum::http::StatusCode::BAD_GATEWAY);
         std::fs::remove_file(&upstream_file).unwrap(); // back to the mock (fallback)
+        // 1b) the client goes away while the upstream is still thinking: axum drops proxy()'s future (here: the
+        //     timeout drops it). The claim must be released by the guard (review finding 1).
+        SLOW.store(true, Ordering::SeqCst);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body("e2e", agentic(&["first prompt"], 0))).unwrap()))
+            .unwrap();
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            proxy(State(Arc::clone(&state)), req),
+        )
+        .await;
+        assert!(dropped.is_err(), "the request must still be pending when the client gives up");
+        SLOW.store(false, Ordering::SeqCst);
+        assert!(frames(&tract).is_empty());
         // 2) the retry and 6 tool round trips of the same human turn
         let mut want = 0;
         for r in 0..=6 {
