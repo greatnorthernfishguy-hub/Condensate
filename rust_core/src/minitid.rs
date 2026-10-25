@@ -247,7 +247,7 @@
 //       the prompt for the whole turn with nothing logged (law review item 1 rec MEDIUM; Josh 2026-10-24 option A).
 // How:  test_user_deposit_failed_append_releases_the_claim (unwritable path -> Err -> released -> the next round trip
 //       deposits; a good path keeps the claim). The KISS gate (SessionStore, decision_for_request, rewrite) is untouched.
-// [2026-10-25] Claude Code (Opus 5.5, laptop) — #1185: durable turn appends (fdatasync cadence + torn-tail repair)
+// [2026-10-25] Claude Code (Opus 5.5, laptop) — #1189: durable turn appends (fdatasync cadence + torn-tail repair)
 // What: append_frame_locked now (a) writes the frame from one buffer (unchanged), (b) fdatasyncs at a bounded cadence:
 //       every NG_TRACT_FSYNC_EVERY_FRAMES frames (default 64) or when NG_TRACT_FSYNC_INTERVAL_MS (default 1000) have
 //       passed since the last sync, so at miniTID's turn rate nearly every frame is synced, (c) on the FIRST append to a
@@ -256,10 +256,10 @@
 //       data; no cut when unsure (no valid frame in the last 4 MiB, a '{' JSONL tail, or a size change meanwhile).
 // Why:  Josh 2026-10-24 "Do it, DudeMan" (Stage 1 lane A): tract writers never flushed, so OOM kills / host hangs left
 //       zero-filled pages (Syl's condensate tracts: 162 / 248 regions). Same contract as ng-tract-rs tract_write.rs
-//       (cc-laptop-tract-durable-20261025) and the ng_tract_bridge.py drain (#1185), same .damaged record format.
+//       (cc-laptop-tract-durable-20261025) and the ng_tract_bridge.py drain (#1189), same .damaged record format.
 // How:  TractDurability (process-wide Mutex<HashMap<path, state>>); repair_torn_tail_locked; fdatasync via libc.
 //       This duplicates ~80 lines of ng-tract-rs tract_write.rs because miniTID links the Condensate vendor ng_tract
-//       crate, not ng-tract-rs; folding miniTID onto the ng-tract-rs rlib (#334 "one writer") is filed with #1185.
+//       crate, not ng-tract-rs; folding miniTID onto the ng-tract-rs rlib (#334 "one writer") is filed with #1189.
 // -------------------
 
 use axum::body::Body;
@@ -1224,7 +1224,7 @@ fn append_frame_locked(path: &str, data: &[u8]) -> std::io::Result<()> {
             unsafe { libc::flock(fd, libc::LOCK_UN) };
             continue;
         }
-        // #1185: the first append to this path in this process repairs a torn tail (under the lock).
+        // #1189: the first append to this path in this process repairs a torn tail (under the lock).
         if tract_durability().first_append(path) {
             if let Err(e) = repair_torn_tail_locked(&mut f, path) {
                 eprintln!("<4>miniTID: torn-tail check of {path} failed (nothing truncated): {e}");
@@ -1246,7 +1246,7 @@ fn append_frame_locked(path: &str, data: &[u8]) -> std::io::Result<()> {
     ))
 }
 
-/// #1185: per-path fdatasync cadence + "checked once" state (process-wide).
+/// #1189: per-path fdatasync cadence + "checked once" state (process-wide).
 struct TractDurability {
     every: u64,
     interval: Option<std::time::Duration>,
@@ -3523,7 +3523,7 @@ mod tests {
 
     #[test]
     fn test_append_frame_locked_repairs_a_torn_tail_once_and_keeps_its_bytes() {
-        // #1185: a crash left half a frame at the end; the restarted writer's first append cuts ONLY that tail, after
+        // #1189: a crash left half a frame at the end; the restarted writer's first append cuts ONLY that tail, after
         // copying it byte-exact to <tract>.damaged, and then appends whole frames.
         let dir = std::env::temp_dir().join(format!("minitid_torn_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
