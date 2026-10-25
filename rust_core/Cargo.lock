@@ -126,6 +126,7 @@ name = "condensate_core"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "crc32fast",
  "futures-util",
  "libc",
  "lz4_flex",

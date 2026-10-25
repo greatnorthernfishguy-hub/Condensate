@@ -247,6 +247,19 @@
 //       the prompt for the whole turn with nothing logged (law review item 1 rec MEDIUM; Josh 2026-10-24 option A).
 // How:  test_user_deposit_failed_append_releases_the_claim (unwritable path -> Err -> released -> the next round trip
 //       deposits; a good path keeps the claim). The KISS gate (SessionStore, decision_for_request, rewrite) is untouched.
+// [2026-10-25] Claude Code (Opus 5.5, laptop) — #1185: durable turn appends (fdatasync cadence + torn-tail repair)
+// What: append_frame_locked now (a) writes the frame from one buffer (unchanged), (b) fdatasyncs at a bounded cadence:
+//       every NG_TRACT_FSYNC_EVERY_FRAMES frames (default 64) or when NG_TRACT_FSYNC_INTERVAL_MS (default 1000) have
+//       passed since the last sync, so at miniTID's turn rate nearly every frame is synced, (c) on the FIRST append to a
+//       path in this process (a restart, e.g. after a crash) repairs a torn tail under the lock: bytes after the last
+//       whole CRC-valid BTF frame are copied to <tract>.damaged (fsynced) and only then truncated. Never cuts valid
+//       data; no cut when unsure (no valid frame in the last 4 MiB, a '{' JSONL tail, or a size change meanwhile).
+// Why:  Josh 2026-10-24 "Do it, DudeMan" (Stage 1 lane A): tract writers never flushed, so OOM kills / host hangs left
+//       zero-filled pages (Syl's condensate tracts: 162 / 248 regions). Same contract as ng-tract-rs tract_write.rs
+//       (cc-laptop-tract-durable-20261025) and the ng_tract_bridge.py drain (#1185), same .damaged record format.
+// How:  TractDurability (process-wide Mutex<HashMap<path, state>>); repair_torn_tail_locked; fdatasync via libc.
+//       This duplicates ~80 lines of ng-tract-rs tract_write.rs because miniTID links the Condensate vendor ng_tract
+//       crate, not ng-tract-rs; folding miniTID onto the ng-tract-rs rlib (#334 "one writer") is filed with #1185.
 // -------------------
 
 use axum::body::Body;
@@ -1194,6 +1207,7 @@ fn append_frame_locked(path: &str, data: &[u8]) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
     for _ in 0..64 {
         let mut f = std::fs::OpenOptions::new()
+            .read(true)
             .append(true)
             .create(true)
             .mode(0o664)
@@ -1210,7 +1224,19 @@ fn append_frame_locked(path: &str, data: &[u8]) -> std::io::Result<()> {
             unsafe { libc::flock(fd, libc::LOCK_UN) };
             continue;
         }
-        let result = f.write_all(data);
+        // #1185: the first append to this path in this process repairs a torn tail (under the lock).
+        if tract_durability().first_append(path) {
+            if let Err(e) = repair_torn_tail_locked(&mut f, path) {
+                eprintln!("<4>miniTID: torn-tail check of {path} failed (nothing truncated): {e}");
+            }
+        }
+        let result = f.write_all(data).and_then(|_| {
+            if tract_durability().sync_due(path) {
+                f.sync_data()
+            } else {
+                Ok(())
+            }
+        });
         unsafe { libc::flock(fd, libc::LOCK_UN) };
         return result;
     }
@@ -1218,6 +1244,123 @@ fn append_frame_locked(path: &str, data: &[u8]) -> std::io::Result<()> {
         std::io::ErrorKind::Other,
         "tract path kept changing under the lock",
     ))
+}
+
+/// #1185: per-path fdatasync cadence + "checked once" state (process-wide).
+struct TractDurability {
+    every: u64,
+    interval: Option<std::time::Duration>,
+    paths: Mutex<HashMap<String, (u64, std::time::Instant, bool)>>, // pending, last_sync, checked
+}
+
+fn tract_durability() -> &'static TractDurability {
+    static D: std::sync::OnceLock<TractDurability> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        let num = |name: &str, default: u64| -> u64 {
+            env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+        };
+        let ms = num("NG_TRACT_FSYNC_INTERVAL_MS", 1000);
+        TractDurability {
+            every: num("NG_TRACT_FSYNC_EVERY_FRAMES", 64),
+            interval: if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) },
+            paths: Mutex::new(HashMap::new()),
+        }
+    })
+}
+
+impl TractDurability {
+    fn first_append(&self, path: &str) -> bool {
+        let mut m = self.paths.lock().unwrap_or_else(|p| p.into_inner());
+        let e = m.entry(path.to_string()).or_insert((0, std::time::Instant::now(), false));
+        let first = !e.2;
+        e.2 = true;
+        first
+    }
+
+    fn sync_due(&self, path: &str) -> bool {
+        let mut m = self.paths.lock().unwrap_or_else(|p| p.into_inner());
+        let e = m.entry(path.to_string()).or_insert((0, std::time::Instant::now(), true));
+        e.0 += 1;
+        let due = (self.every > 0 && e.0 >= self.every)
+            || self.interval.map_or(false, |iv| e.1.elapsed() >= iv);
+        if due {
+            e.0 = 0;
+            e.1 = std::time::Instant::now();
+        }
+        due
+    }
+}
+
+/// A whole CRC-valid BTF frame at buf[i..] (magic "BT", version 1, type 1..3, LE length, payload CRC32): its length.
+fn btf_valid_frame_at(buf: &[u8], i: usize, max_frame: usize) -> Option<usize> {
+    let h = buf.get(i..i + 24)?;
+    if h[0] != 0x42 || h[1] != 0x54 || h[2] != 1 || !(1..=3).contains(&h[3]) {
+        return None;
+    }
+    let total = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
+    if total < 24 || total > max_frame || i + total > buf.len() {
+        return None;
+    }
+    let crc = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
+    (crc32fast::hash(&buf[i + 24..i + total]) == crc).then_some(total)
+}
+
+/// Under the caller's flock: cut a torn tail (bytes after the last whole valid frame), keeping it in <path>.damaged.
+fn repair_torn_tail_locked(f: &mut std::fs::File, path: &str) -> std::io::Result<Option<(u64, u64)>> {
+    use std::io::{Read as _, Seek as _, Write as _};
+    let max_frame = env::var("NG_TRACT_DRAIN_CHUNK_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v >= 24)
+        .unwrap_or(64 * 1024 * 1024);
+    let size = f.metadata()?.len();
+    if size == 0 {
+        return Ok(None);
+    }
+    let win = size.min(4 * 1024 * 1024);
+    let base = size - win;
+    let mut buf = vec![0u8; win as usize];
+    f.seek(std::io::SeekFrom::Start(base))?;
+    f.read_exact(&mut buf)?;
+    let (mut i, mut last) = (0usize, None);
+    while i + 24 <= buf.len() {
+        if let Some(n) = btf_valid_frame_at(&buf, i, max_frame) {
+            i += n;
+            last = Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    let end = match last {
+        Some(e) if e < buf.len() => e,
+        _ => return Ok(None), // clean, or no valid frame to anchor on: not provably torn
+    };
+    if buf[end] == b'{' || f.metadata()?.len() != size {
+        return Ok(None);
+    }
+    let tail = &buf[end..];
+    let cut_at = base + end as u64;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let mut rec = format!(
+        "#ng-tract-damaged v1 offset={cut_at} length={} reason=torn-tail ts={ts:.6}\n",
+        tail.len()
+    )
+    .into_bytes();
+    rec.extend_from_slice(tail);
+    rec.push(b'\n');
+    let mut d = std::fs::OpenOptions::new().append(true).create(true).open(format!("{path}.damaged"))?;
+    d.write_all(&rec)?;
+    d.sync_all()?;
+    f.set_len(cut_at)?;
+    f.sync_data()?;
+    eprintln!(
+        "<4>miniTID: {path}: TORN TAIL repaired: {} byte(s) after the last valid frame (offset {cut_at}) copied to {path}.damaged and truncated",
+        tail.len()
+    );
+    Ok(Some((cut_at, tail.len() as u64)))
 }
 
 /// Deposit both sides of one turn as raw experience (LAW 7) -- no
@@ -3365,6 +3508,55 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"REMAINDERLATE");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn btf_test_frame(i: u8, body: usize) -> Vec<u8> {
+        let payload: Vec<u8> = (0..body).map(|k| (k as u8) ^ i).collect();
+        let mut v = vec![0x42, 0x54, 1, 3];
+        v.extend_from_slice(&((24 + body) as u32).to_le_bytes());
+        v.extend_from_slice(&(i as f64).to_le_bytes());
+        v.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        v.extend_from_slice(&[1, 0, 0, 0]);
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    #[test]
+    fn test_append_frame_locked_repairs_a_torn_tail_once_and_keeps_its_bytes() {
+        // #1185: a crash left half a frame at the end; the restarted writer's first append cuts ONLY that tail, after
+        // copying it byte-exact to <tract>.damaged, and then appends whole frames.
+        let dir = std::env::temp_dir().join(format!("minitid_torn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("turns.tract");
+        let p = path.to_str().unwrap();
+        let good: Vec<u8> = (0..10u8).flat_map(|i| btf_test_frame(i, 200)).collect();
+        let torn = btf_test_frame(77, 200)[..90].to_vec();
+        let mut data = good.clone();
+        data.extend_from_slice(&torn);
+        std::fs::write(&path, &data).unwrap();
+        append_frame_locked(p, &btf_test_frame(11, 200)).unwrap();
+        append_frame_locked(p, &btf_test_frame(12, 200)).unwrap();
+        let mut want = good.clone();
+        want.extend(btf_test_frame(11, 200));
+        want.extend(btf_test_frame(12, 200));
+        assert_eq!(std::fs::read(&path).unwrap(), want);
+        let dmg = std::fs::read(dir.join("turns.tract.damaged")).unwrap();
+        let nl = dmg.iter().position(|&b| b == b'\n').unwrap();
+        let head = String::from_utf8_lossy(&dmg[..nl]).to_string();
+        assert!(head.starts_with(&format!("#ng-tract-damaged v1 offset={} length=90 reason=torn-tail", good.len())));
+        assert_eq!(&dmg[nl + 1..nl + 91], &torn[..]);
+        assert_eq!(dmg.len(), nl + 92);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_append_frame_locked_never_cuts_without_a_valid_anchor() {
+        let path = std::env::temp_dir().join(format!("minitid_noanchor_{}.tract", std::process::id()));
+        std::fs::write(&path, vec![0u8; 5000]).unwrap();
+        append_frame_locked(path.to_str().unwrap(), b"x").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 5001);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
