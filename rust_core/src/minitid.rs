@@ -7,16 +7,17 @@
 //       counters. ONE RULE CHANGED, for review: #1173's claim/release supersedes Card 7b's
 //       UndepositedTurn drop-guard. A request that ends before its deposit (send failed, client gone,
 //       accumulator died) or a user frame that fails to write RELEASES the claim, so the next request of
-//       the same human turn deposits the prompt. The release is counted on the new `released=` field
-//       (USER_CLAIMS_RELEASED, "deposit deferred"); if the session's next claim is a NEW turn instead (or
-//       the key is evicted) the released prompt was never written and is settled as one lost turn on
-//       turn_deposits_lost (UserDepositTracker::deferred; LE review finding 1). Requests without session
-//       identity cannot be settled and stay counted on released= only. Definite losses also count on
-//       turn_deposits_lost: an assistant frame that cannot be written (#1173 only logged it), a dead
-//       accumulator on a /v1/messages request (#717 path 1), and a failed user frame when the tracker is
-//       off (MINITID_USER_DEPOSIT_ONCE=0, nothing to release). (2) CARD 9: MINITID_PITH_ZERO_REPLAY (LAW 5), OFF unless exactly "1". Off = shadow:
-//       Pith runs on every request (counts line + review records show what it composed or why it failed)
-//       but the ORIGINAL bytes are forwarded byte-for-byte (select_forwarded). "1" = live swap: Pith's
+//       the same human turn deposits the prompt. [FINAL RULE, after the review rounds below:] such a
+//       deferred prompt is counted on the new `released=` field (USER_CLAIMS_RELEASED) -- also when there is
+//       no claim to undo (tracker off or its lock poisoned: those requests deposit untracked). It is LOST
+//       (turn_deposits_lost, with an ERROR line) when a newer claim blocks the release, when the session's
+//       next claim is a new turn (UserDepositTracker::deferred), or when the deferred list overflows
+//       (oldest, "presumed lost"); eviction alone presumes nothing. Requests without session identity, and
+//       untracked ones, cannot be settled. Definite losses also count on turn_deposits_lost: an assistant
+//       frame that cannot be written (#1173 only logged it) and a dead accumulator on a turn (#717 path 1). (2) CARD 9: MINITID_PITH_ZERO_REPLAY (LAW 5), OFF unless exactly "1". Off = shadow:
+//       the ORIGINAL bytes are forwarded at once, byte-for-byte (select_forwarded); Pith runs in the
+//       background on a spaced, single-flight SAMPLE of requests (ShadowGate) and writes nothing to the
+//       live mind -- the counts line + review records show what it composed or why it failed. "1" = live swap: Pith's
 //       composition forwarded when it composed one; any failure forwards the original (P309(1)). The
 //       deployed build's MINITID_PITH_PENINSULA is not read (it was removed in 951f360). (3) #433
 //       RETENTION (Josh 2026-10-29): MINITID_PITH_REVIEW_DIR (LAW 5), unset = off. Set = one JSON line per
@@ -68,6 +69,14 @@
 //       N6 a skipped request gets the full counts line; N7 the shadow gate is injectable (ShadowGate,
 //       shadow_pith_with; pith_pass takes the tract path so a test can never write the live tract) with a
 //       hanging-socket test; N8 a skipped request still advances the KISS cadence gate. 108 passed (x3).
+//       SHADOW WRITES NOTHING TO THE LIVE MIND (Josh 2026-10-29: "No reason for it to write and bloat the
+//       live mind"): a Pith failure is deposited raw on the tract only in live zero-replay mode; in shadow it
+//       goes to the #433 review record + counts line only. LE final check of 584c09f (COMPLIANT WITH NOTES,
+//       no shadow-deploy blocker) folded: F1 the untracked label names "tracker off or its lock poisoned";
+//       F2 untracked releases documented as never settled; F4 the changelog "What" text and the proxy
+//       comment state the final rules; F5 the 6 s floor's coupling to CC_NG_PROVIDER_LOCK_WAIT_S noted; F6
+//       shadow spacing on a monotonic clock. F3 (spacing 0 allowed) left to Josh, documented unsafe while
+//       #1201 is open. 109 passed, 0 failed (x3).
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7b:
 //   a turn miniTID read but could not deposit is counted and named
 //   (#717, #719)
@@ -1018,6 +1027,8 @@ fn pith_shadow_timeout_ms() -> u64 {
 fn configured_pith_shadow_timeout_ms(value: Option<&str>) -> u64 {
     value
         .and_then(|v| v.trim().parse::<u64>().ok())
+        // 6 s floor: tied by hand to the daemon's CC_NG_PROVIDER_LOCK_WAIT_S default (5 s) plus margin;
+        // raise it if that variable is raised (LE final F5).
         .map(|v| v.clamp(6_000, 120_000))
         .unwrap_or(DEFAULT_PITH_SHADOW_TIMEOUT_MS)
 }
@@ -1027,7 +1038,9 @@ const DEFAULT_PITH_SHADOW_MIN_INTERVAL_MS: u64 = 30_000;
 /// MINITID_PITH_SHADOW_MIN_INTERVAL_MS (LAW 5): least time between the STARTS of
 /// two shadow Pith passes; requests in between are recorded as shadow_skipped.
 /// Caps how often shadow mode asks the daemon for its graph lock (LAW 8: Pith must
-/// not pace the Tonic; #1201).  Default 30 s, clamped 0-3,600,000 (0 = no spacing).
+/// not pace the Tonic; #1201).  Default 30 s, clamped 0-3,600,000.  0 = no spacing:
+/// UNSAFE while #1201 is open (Pith becomes a back-to-back waiter on the unfair
+/// graph lock whenever chat is busy) -- Josh's call (LE final F3).
 fn pith_shadow_min_interval_ms() -> u64 {
     configured_pith_shadow_min_interval_ms(env::var("MINITID_PITH_SHADOW_MIN_INTERVAL_MS").ok().as_deref())
 }
@@ -1764,7 +1777,9 @@ fn count_lost_deposit(result: std::io::Result<()>, lost: &AtomicU64) {
 /// LOST turn on turn_deposits_lost, each with an ERROR line: the session's next
 /// claim is a new turn (UserDepositTracker::deferred), or the deferred list
 /// overflowed (presumed lost).  A release blocked by a newer claim is lost at
-/// once.  Requests without session identity cannot be settled: theirs stay here.
+/// once.  Never settled, so they stay counted only here: requests without
+/// session identity, and untracked ones (tracker off or its lock poisoned) --
+/// such a prompt is really lost if its turn sends no further request.
 static USER_CLAIMS_RELEASED: AtomicU64 = AtomicU64::new(0);
 
 /// #433 review records that could not be written (counted and named, #560).
@@ -2147,7 +2162,7 @@ fn settle_user_deposit_counted(
             release_user_deposit(tracker, d),
         ),
         // Tracker off: every request deposits, so the turn's next request writes it (deferred).
-        _ => ("untracked (MINITID_USER_DEPOSIT_ONCE=0)".to_string(), ReleaseOutcome::NoClaim),
+        _ => ("untracked (tracker off, MINITID_USER_DEPOSIT_ONCE=0, or its lock poisoned)".to_string(), ReleaseOutcome::NoClaim),
     };
     // Card 9: lost only when a newer claim holds the session; otherwise deferred (released=).
     account_release(outcome, counters);
@@ -2155,7 +2170,7 @@ fn settle_user_deposit_counted(
         ReleaseOutcome::Restored => "claim RELEASED: the next request of this turn deposits the prompt",
         ReleaseOutcome::NewerClaim => "a newer claim holds the session: the prompt is LOST (turn_deposits_lost)",
         ReleaseOutcome::Poisoned => "tracker lock poisoned: requests deposit untracked, so the next request of this turn writes it",
-        ReleaseOutcome::NoClaim => "tracker off: the next request of this turn writes it",
+        ReleaseOutcome::NoClaim => "untracked (tracker off or its lock poisoned): the next request of this turn writes it",
     };
     eprintln!("<3>miniTID deposit ERROR: user frame NOT written ({who}): {e}; {next}");
     outcome == ReleaseOutcome::Restored
@@ -2787,7 +2802,10 @@ async fn pith_pass(
         .failure
         .as_ref()
         .map(|f| PithFailure::new(f.what, f.why.clone()));
-    if let Some(failure) = rewrite.failure {
+    // Josh 2026-10-29: "No reason for it to write and bloat the live mind." Shadow Pith writes NOTHING to
+    // the tract: its failures go to the #433 review record and the counts line only. Live zero-replay
+    // deposits each failure raw (Card 7/#714, P309(1)).
+    if let Some(failure) = rewrite.failure.filter(|_| zero_replay) {
         tokio::spawn(async move {
             count_lost_deposit(deposit_pith_failure(&tract, &failure), &FAILURE_DEPOSITS_LOST);
         });
@@ -2886,11 +2904,11 @@ impl Drop for ShadowSlot {
     }
 }
 
+/// Milliseconds on a monotonic clock since the first call (never 0): shadow
+/// spacing must not stall if the wall clock steps backwards (LE final F6).
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
 }
 
 /// Card 9 shadow mode: the caller has already forwarded the original bytes.
@@ -3019,7 +3037,8 @@ async fn proxy(
     let mut user_deposit = UserDepositGuard { state: Arc::clone(&state), decision: user_deposit };
     let deposit_state = Arc::clone(&state); // #1173: settle_user_deposit releases through it after a failed append
 
-    // Every /v1/messages request goes through Pith (pith_pass).  Card 9: the
+    // /v1/messages requests go through Pith (pith_pass; in shadow mode a sample,
+    // see ShadowGate).  Card 9: the
     // zero-replay switch decides what is FORWARDED and whether the request
     // waits.  On: the request waits (live limits, 2 s) and Pith's composition is
     // forwarded when it composed one.  Off (the default, shadow): the original
@@ -5067,7 +5086,7 @@ mod tests {
         assert!(t.elapsed() < std::time::Duration::from_millis(50), "shadow never waits: {:?}", t.elapsed());
         tokio::time::sleep(std::time::Duration::from_millis(500)).await; // past the 200 ms timeout
         assert!(gate.in_flight.load(Ordering::Acquire), "held while the worker still waits on the daemon");
-        shadow_pith_with(Arc::clone(&state), inbound, headers(None), daemon, tract, gate, 0, 2);
+        shadow_pith_with(Arc::clone(&state), inbound, headers(None), daemon, tract.clone(), gate, 0, 2);
         assert_eq!(gate.skipped.load(Ordering::Relaxed), 1, "a request meanwhile is skipped");
         hold.join().unwrap();
         for _ in 0..200 {
@@ -5077,6 +5096,36 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(!gate.in_flight.load(Ordering::Acquire), "freed once the worker ended");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!std::path::Path::new(&tract).exists(), "shadow writes nothing to the tract (Josh 2026-10-29)");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn live_mode_still_deposits_a_pith_failure_raw_and_shadow_does_not() {
+        let dir = std::env::temp_dir().join(format!("minitid_live_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(AppState {
+            client: Client::builder().build().unwrap(),
+            sessions: Mutex::new(SessionStore::new(DEFAULT_SESSION_CAPACITY)),
+            user_deposits: Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY)),
+            upstream_fallback: "http://127.0.0.1:9".to_string(),
+        });
+        let inbound = axum::body::Bytes::from(serde_json::to_vec(&body("live-fail", history_then_live_turn(1))).unwrap());
+        for (zero_replay, name) in [(true, "live.tract"), (false, "shadow.tract")] {
+            let tract = dir.join(name).to_str().unwrap().to_string();
+            let fwd = pith_pass(Arc::clone(&state), inbound.clone(), headers(None), zero_replay,
+                                PithDaemon::from(missing_sock()), tract.clone()).await;
+            assert_eq!(fwd, inbound, "a failure forwards the original in both modes");
+            let mut exists = false;
+            for _ in 0..100 {
+                exists = std::path::Path::new(&tract).exists();
+                if exists { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(exists, zero_replay, "{name}: only live mode deposits the failure");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5736,8 +5785,8 @@ mod tests {
                 Err((st, _)) => st,
             }
         }
-        // Card 9 merge: the card stack deposits every Pith failure raw on the same tract (#714); there is
-        // no daemon here, so every request also leaves one. This test is about the turn frames.
+        // Card 9: in LIVE mode the card stack deposits every Pith failure raw on this tract (#714); this test
+        // runs in shadow mode (the default), which deposits none. The filter keeps it about turn frames.
         fn all_frames(path: &std::path::Path) -> Vec<String> {
             let data = std::fs::read(path).unwrap_or_default();
             let mut r = TractReader::new(&data);
@@ -5807,8 +5856,8 @@ mod tests {
         assert_eq!(f.iter().filter(|c| c.starts_with("answer ")).count(), 10, "{f:?}");
         assert_eq!(f.len(), 12, "{f:?}");
         assert!(
-            all_frames(&tract).iter().any(|c| c.starts_with("miniTID Pith peninsula failed: ")),
-            "the Pith failures (no daemon) are deposited raw alongside the turn"
+            !all_frames(&tract).iter().any(|c| c.starts_with("miniTID Pith peninsula failed: ")),
+            "shadow mode (the default) deposits no Pith failure frames (Josh 2026-10-29)"
         );
         // the prompt precedes its turn's first answer
         let p1 = f.iter().position(|c| c == "first prompt").unwrap();
