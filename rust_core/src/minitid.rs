@@ -77,6 +77,10 @@
 //       comment state the final rules; F5 the 6 s floor's coupling to CC_NG_PROVIDER_LOCK_WAIT_S noted; F6
 //       shadow spacing on a monotonic clock. F3 (spacing 0 allowed) left to Josh, documented unsafe while
 //       #1201 is open. 109 passed, 0 failed (x3).
+//       Grok final check of 584c09f (PASS-WITH-NOTES) folded: F1 a spacing-clock reading before the last
+//       start counts as elapsed (the gate cannot stick; the clock is already monotonic since the LE fold);
+//       F2 the N3 eviction test now evicts a key that still holds a released claim (prev Some), verified to
+//       fail against the old eviction-is-a-loss rule. 109 passed, 0 failed (x3).
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7b:
 //   a turn miniTID read but could not deposit is counted and named
 //   (#717, #719)
@@ -2882,7 +2886,8 @@ impl ShadowGate {
     /// Take the slot, or say why not ("in flight" / "spacing").
     fn try_start(&'static self, now_ms: u64, interval_ms: u64) -> Result<ShadowSlot, &'static str> {
         let last = self.last_start_ms.load(Ordering::Acquire);
-        if last != 0 && now_ms.saturating_sub(last) < interval_ms {
+        // A clock reading before the last start counts as elapsed, so the gate can never stick (Grok final F1).
+        if last != 0 && now_ms >= last && now_ms - last < interval_ms {
             return Err("spacing: the previous shadow pass started under MINITID_PITH_SHADOW_MIN_INTERVAL_MS ago");
         }
         self.in_flight
@@ -4951,13 +4956,18 @@ mod tests {
         publish_settled(settled, &lost);
         assert_eq!(lost.load(Ordering::Relaxed), 1, "published = counted");
 
-        // N3: eviction settles nothing (the evicted key's retry still deposits) ...
+        // N3: eviction settles nothing (the evicted key's retry still deposits).  Grok final F2: the key
+        // must still be in `sessions` when evicted, so its released claim needs a prior mark (prev Some).
         let mut small = UserDepositTracker::new(1);
-        let c1 = small.claim_session("c".into(), turn1, 1);
-        if let UserDeposit::Deposit(c) = &c1 { assert!(small.release(c)) } else { panic!("{c1:?}") }
-        small.claim_session("d".into(), turn1, 1);
+        assert!(matches!(small.claim_session("c".into(), turn1, 1), UserDeposit::Deposit(_)));
+        let c2 = small.claim_session("c".into(), turn2, 2);
+        if let UserDeposit::Deposit(c) = &c2 { assert!(small.release(c)) } else { panic!("{c2:?}") }
+        assert!(small.sessions.contains_key("c") && small.deferred.contains_key("c"), "released, still tracked");
+        assert!(matches!(small.claim_session("d".into(), turn1, 1), UserDeposit::Deposit(_)));
+        assert!(!small.sessions.contains_key("c"), "c was evicted");
         assert!(small.take_settled().is_empty(), "eviction is not a presumed loss");
-        assert!(matches!(small.claim_session("c".into(), turn1, 1), UserDeposit::Deposit(_)), "c re-deposits");
+        assert!(matches!(small.claim_session("c".into(), turn2, 2), UserDeposit::Deposit(_)), "c re-deposits");
+        assert!(small.take_settled().is_empty(), "the same turn re-deposited: no loss");
         // ... only a full deferred list presumes its OLDEST pending prompt lost.
         let mut tiny = UserDepositTracker::new(1);
         let e = tiny.claim_session("e".into(), turn1, 1);
@@ -5048,6 +5058,10 @@ mod tests {
         drop(gate2.try_start(10_000, 30_000).expect("first start"));
         assert!(gate2.try_start(39_999, 30_000).err().unwrap().starts_with("spacing"));
         assert!(gate2.try_start(40_000, 30_000).is_ok(), "the interval has passed");
+        // Grok final F1: a reading before the last start never sticks the gate.
+        let gate3: &'static ShadowGate = Box::leak(Box::new(ShadowGate::new()));
+        drop(gate3.try_start(50_000, 30_000).expect("first"));
+        assert!(gate3.try_start(49_999, 30_000).is_ok(), "an earlier reading counts as elapsed");
     }
 
     #[tokio::test]
