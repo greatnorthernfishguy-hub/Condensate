@@ -7,11 +7,14 @@
 //       counters. ONE RULE CHANGED, for review: #1173's claim/release supersedes Card 7b's
 //       UndepositedTurn drop-guard. A request that ends before its deposit (send failed, client gone,
 //       accumulator died) or a user frame that fails to write RELEASES the claim, so the next request of
-//       the same human turn deposits the prompt: that is not a lost turn, so it is no longer counted on
-//       turn_deposits_lost; it is counted on the new `released=` counts-line field (USER_CLAIMS_RELEASED),
-//       keeping #719 "never silent". Definite losses still count on turn_deposits_lost: an assistant frame
-//       that cannot be written (#1173 only logged it) and a dead accumulator on a /v1/messages request
-//       (#717 path 1). (2) CARD 9: MINITID_PITH_ZERO_REPLAY (LAW 5), OFF unless exactly "1". Off = shadow:
+//       the same human turn deposits the prompt. The release is counted on the new `released=` field
+//       (USER_CLAIMS_RELEASED, "deposit deferred"); if the session's next claim is a NEW turn instead (or
+//       the key is evicted) the released prompt was never written and is settled as one lost turn on
+//       turn_deposits_lost (UserDepositTracker::deferred; LE review finding 1). Requests without session
+//       identity cannot be settled and stay counted on released= only. Definite losses also count on
+//       turn_deposits_lost: an assistant frame that cannot be written (#1173 only logged it), a dead
+//       accumulator on a /v1/messages request (#717 path 1), and a failed user frame when the tracker is
+//       off (MINITID_USER_DEPOSIT_ONCE=0, nothing to release). (2) CARD 9: MINITID_PITH_ZERO_REPLAY (LAW 5), OFF unless exactly "1". Off = shadow:
 //       Pith runs on every request (counts line + review records show what it composed or why it failed)
 //       but the ORIGINAL bytes are forwarded byte-for-byte (select_forwarded). "1" = live swap: Pith's
 //       composition forwarded when it composed one; any failure forwards the original (P309(1)). The
@@ -29,6 +32,12 @@
 //       guard/helper replaced by tests of the merged rule; #1173's end-to-end test now counts turn frames
 //       apart from the raw Pith-failure frames the stack deposits on the same tract. cargo test --features
 //       minitid --bin minitid: 100 passed, 0 failed (x3). Not deployed; the live swap is Josh's go.
+//       LE review (neurograph-law-enforcer, VIOLATIONS FOUND, none critical) folded: F1 a released prompt
+//       whose session moves on to a new turn (or is evicted) is settled as lost (UserDepositTracker::
+//       deferred); F2 a failed user frame with the tracker off counts as lost; F3 the counts-line doc
+//       names which counter each path bumps; F4 the e2e test clears the two Card 9 switches, not the dead
+//       MINITID_PITH_PENINSULA; F5 deposit_turn_at takes its loss counter (exact test counts); F6 review
+//       dir/file modes enforced on pre-existing paths too. 102 passed, 0 failed (x3).
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7b:
 //   a turn miniTID read but could not deposit is counted and named
 //   (#717, #719)
@@ -1631,10 +1640,12 @@ fn count_lost_deposit(result: std::io::Result<()>, lost: &AtomicU64) {
 
 /// Card 9 merge (2026-10-29): #1173 user-prompt claims released because the
 /// request ended before its deposit (send failed, client gone, accumulator
-/// died) or the user frame failed to write.  A released claim is not a lost
-/// turn -- the next request of the same human turn deposits the prompt -- but
-/// it is counted and named on the counts line (`released=`), so the #719
-/// "never silent" guarantee holds without counting a re-deposited prompt lost.
+/// died) or the user frame failed to write: the deposit is DEFERRED, counted on
+/// `released=`.  The next request of the same human turn re-deposits it.  If
+/// the session's next claim is a NEW turn instead (or the key is evicted), the
+/// prompt was never written and that is settled as one lost turn on
+/// turn_deposits_lost (UserDepositTracker::deferred, LE finding 1).  Requests
+/// without session identity cannot be settled: theirs stay counted only here.
 static USER_CLAIMS_RELEASED: AtomicU64 = AtomicU64::new(0);
 
 /// #433 review records that could not be written (counted and named, #560).
@@ -1734,14 +1745,18 @@ fn write_review_record(dir: &str, unix_secs: u64, record: &Value) -> std::io::Re
     let mut line = serde_json::to_vec(record).map_err(std::io::Error::other)?;
     line.push(b'\n');
     let _held = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use std::os::unix::fs::PermissionsExt;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    // mode() applies only on creation: enforce it on a pre-existing dir/file too (LE finding 6).
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     let path = format!("{dir}/pith-review-{}.jsonl", utc_yyyymmdd(unix_secs));
-    std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .mode(0o600)
-        .open(&path)?
-        .write_all(&line)
+        .open(&path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(&line)
 }
 
 fn deposit_experience_entry(path: &str, source: &str, content: String) -> std::io::Result<()> {
@@ -1941,13 +1956,14 @@ fn repair_torn_tail_locked(f: &mut std::fs::File, path: &str) -> std::io::Result
 /// A failed ASSISTANT frame cannot be retried (the next request carries a new
 /// answer); it is logged at ERROR here, never dropped silently (LAW 7).
 fn deposit_turn(user_message: Option<String>, assistant_text: String) -> Option<std::io::Result<()>> {
-    deposit_turn_at(&cc_gateway_tract_path(), user_message, assistant_text)
+    deposit_turn_at(&cc_gateway_tract_path(), user_message, assistant_text, &TURN_DEPOSITS_LOST)
 }
 
 fn deposit_turn_at(
     path: &str,
     user_message: Option<String>,
     assistant_text: String,
+    lost: &AtomicU64,
 ) -> Option<std::io::Result<()>> {
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -1956,7 +1972,7 @@ fn deposit_turn_at(
     if let Err(e) = deposit_experience_entry(path, "cc_gateway", assistant_text) {
         // "<3>": journald's syslog-level prefix (SyslogLevelPrefix=, on by default) -> priority err.
         eprintln!("<3>miniTID deposit ERROR: assistant frame NOT written to {path}: {e} (this answer is lost from the tract)");
-        TURN_DEPOSITS_LOST.fetch_add(1, Ordering::Relaxed); // Card 9 merge: a definite loss, counted (#714)
+        lost.fetch_add(1, Ordering::Relaxed); // Card 9 merge: a definite loss, counted (#714)
     }
     user_result
 }
@@ -1984,7 +2000,11 @@ fn settle_user_deposit(
             release_user_deposit(tracker, d);
             (format!("recent text_sha256={}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>()), true)
         }
-        _ => ("untracked (MINITID_USER_DEPOSIT_ONCE=0)".to_string(), false),
+        _ => {
+            // Nothing to release: this request's prompt is lost unless the turn sends another (LE finding 2).
+            TURN_DEPOSITS_LOST.fetch_add(1, Ordering::Relaxed);
+            ("untracked (MINITID_USER_DEPOSIT_ONCE=0)".to_string(), false)
+        }
     };
     if released {
         USER_CLAIMS_RELEASED.fetch_add(1, Ordering::Relaxed); // Card 9 merge: named on the counts line
@@ -2071,6 +2091,13 @@ enum DepositClaim {
 /// are evicted at `capacity`.
 struct UserDepositTracker {
     sessions: HashMap<String, DepositMark>,
+    /// Card 9 (LE finding 1): session key -> turn marker of a claim that was
+    /// RELEASED and not yet re-deposited.  The next claim for the key settles it:
+    /// the same marker re-deposits the prompt; a different marker means the turn
+    /// moved on and the released prompt was never written (one lost turn).
+    deferred: HashMap<String, [u8; 32]>,
+    /// Lost turns settled here, not yet moved onto TURN_DEPOSITS_LOST.
+    settled_lost: u64,
     /// digest -> (last seen, id of the claim that last deposited it)
     recent: HashMap<[u8; 32], (u64, u64)>,
     access_clock: u64,
@@ -2082,6 +2109,8 @@ impl UserDepositTracker {
     fn new(capacity: usize) -> Self {
         Self {
             sessions: HashMap::new(),
+            deferred: HashMap::new(),
+            settled_lost: 0,
             recent: HashMap::new(),
             access_clock: 0,
             claim_clock: 0,
@@ -2110,7 +2139,25 @@ impl UserDepositTracker {
             .map(|(k, _)| k.clone());
         if let Some(k) = victim {
             self.sessions.remove(&k);
+            // A key evicted with a released prompt still pending: it was never written.
+            if self.deferred.remove(&k).is_some() {
+                self.settled_lost += 1;
+            }
         }
+    }
+
+    /// Settle a key's released prompt against the claim now being made.
+    fn settle_deferred(&mut self, key: &str, marker: &[u8; 32]) {
+        if let Some(released) = self.deferred.remove(key) {
+            if &released != marker {
+                self.settled_lost += 1;
+            }
+        }
+    }
+
+    /// Lost turns settled since the last call (moved onto the global counter by the caller).
+    fn take_settled_lost(&mut self) -> u64 {
+        std::mem::take(&mut self.settled_lost)
     }
 
     fn evict_recent_if_full(&mut self) {
@@ -2144,9 +2191,11 @@ impl UserDepositTracker {
                 }
                 let prev = *mark;
                 *mark = DepositMark { marker, count, last_access: access, claim: id };
+                self.settle_deferred(&key, &marker);
                 UserDeposit::Deposit(DepositClaim::Session { key, prev: Some(prev), id })
             }
             None => {
+                self.settle_deferred(&key, &marker);
                 self.evict_session_if_full();
                 self.sessions
                     .insert(key.clone(), DepositMark { marker, count, last_access: access, claim: id });
@@ -2188,7 +2237,15 @@ impl UserDepositTracker {
     fn release(&mut self, claim: &DepositClaim) {
         match claim {
             DepositClaim::Session { key, prev, id } => {
-                if self.sessions.get(key).map(|m| m.claim) == Some(*id) {
+                if let Some(released) = self.sessions.get(key).filter(|m| m.claim == *id).map(|m| m.marker) {
+                    // Bounded like `sessions`: a full map settles one pending prompt as lost first.
+                    if !self.deferred.contains_key(key) && self.deferred.len() >= self.capacity {
+                        if let Some(k) = self.deferred.keys().min().cloned() {
+                            self.deferred.remove(&k);
+                            self.settled_lost += 1;
+                        }
+                    }
+                    self.deferred.insert(key.clone(), released);
                     match prev {
                         Some(p) => {
                             self.sessions.insert(key.clone(), *p);
@@ -2250,7 +2307,9 @@ fn user_deposit_for_request(
     if !compaction {
         if let (Some(b), Some(m)) = (body, messages) {
             if let (Some(key), Some((marker, count))) = (session_key(b, headers), human_turn_marker(m)) {
-                return t.claim_session(key, marker, count);
+                let decision = t.claim_session(key, marker, count);
+                TURN_DEPOSITS_LOST.fetch_add(t.take_settled_lost(), Ordering::Relaxed);
+                return decision;
             }
         }
     }
@@ -2442,14 +2501,20 @@ fn request_path_class(rewrite: &PithRewrite) -> &'static str {
 /// miniTID removed from the received provider context (Packet 177); the
 /// daemon's own assembly count overstates what reached the model by exactly
 /// that much.  `deposits_lost` is (Pith-failure, turn) deposits lost, read
-/// from the two #714 counters.  They are process-wide and cumulative: a loss
-/// is named on a later counts line (a turn loss after a response always is;
-/// one from the req_method or send `?`, or a handler dropped awaiting the
-/// send, races this request's own line, so it is named on that line or a
-/// later one; a
-/// handler dropped awaiting Pith has no line of its own, so a later one
-/// names it), the last loss before idle or restart is not named, and a
-/// restart zeroes both.
+/// from the two #714 counters.  proxy() appends `mode= pith_bytes= released=
+/// review_lost=` (Card 9).  Which counter each path bumps (Card 9 merge):
+/// `released=` -- a #1173 claim released because the request ended before its
+/// deposit (req_method or send `?`, the handler dropped awaiting Pith or the
+/// send, a dead accumulator) or because the user frame failed to write: the
+/// prompt is deferred to the turn's next request.  `turn_deposits_lost=` -- an
+/// assistant frame that cannot be written, a dead accumulator on a turn (the
+/// answer), a deferred prompt whose session moved on to a new turn or was
+/// evicted first, and a failed user frame with the tracker off.
+/// `review_lost=` -- a #433 review record that cannot be written.  All are
+/// process-wide and cumulative: a loss is named on a later counts line (one
+/// from the send path races this request's own line; a handler dropped
+/// awaiting Pith has no line of its own), the last loss before idle or
+/// restart is not named, and a restart zeroes them.
 fn request_counts_line(
     path: &str,
     stripped: usize,
@@ -4395,8 +4460,7 @@ mod tests {
         // returned to the caller (settle_user_deposit releases its claim, so the
         // prompt is re-deposited -- not a loss); an assistant frame that cannot
         // be written is a definite loss and counts on TURN_DEPOSITS_LOST.  The
-        // counter is process-wide (other tests run in parallel), so this checks
-        // that it rose by at least the two losses made here.
+        // counter is injected so the count is exact.
         let dir = std::env::temp_dir().join(format!("minitid_lost_turn_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4406,19 +4470,21 @@ mod tests {
         let tract_is_dir = dir.join("turns.tract");
         std::fs::create_dir_all(&tract_is_dir).unwrap();
 
-        let before = TURN_DEPOSITS_LOST.load(Ordering::Relaxed);
+        let lost = AtomicU64::new(0);
         for path in [&no_dir, &tract_is_dir] {
             let user = deposit_turn_at(
                 path.to_str().unwrap(),
                 Some("a human turn".to_string()),
                 "an assistant reply".to_string(),
+                &lost,
             );
             assert!(matches!(user, Some(Err(_))), "{}", path.display());
         }
-        assert!(TURN_DEPOSITS_LOST.load(Ordering::Relaxed) >= before + 2);
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "one lost answer per turn");
 
         // Nothing to write is neither a user result nor a loss.
-        assert!(deposit_turn_at(tract_is_dir.to_str().unwrap(), None, "  ".to_string()).is_none());
+        assert!(deposit_turn_at(tract_is_dir.to_str().unwrap(), None, "  ".to_string(), &lost).is_none());
+        assert_eq!(lost.load(Ordering::Relaxed), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4439,6 +4505,46 @@ mod tests {
         assert!(matches!(again, UserDeposit::Deposit(_)), "released, so the prompt is not lost");
         // A written frame releases nothing.
         assert!(!settle_user_deposit(&tracker, Some(&again), Some(&Ok(()))));
+    }
+
+    #[test]
+    fn a_released_prompt_is_settled_lost_only_when_its_turn_moves_on() {
+        // LE finding 1: a released claim is re-deposited by the next request of
+        // the SAME turn; if the session's next claim is a new turn, the released
+        // prompt was never written and is one lost turn.
+        let mut t = UserDepositTracker::new(DEFAULT_SESSION_CAPACITY);
+        let turn1 = [1u8; 32];
+        let turn2 = [2u8; 32];
+        // Same turn: release, then the retry re-deposits it.
+        let first = t.claim_session("a".into(), turn1, 1);
+        if let UserDeposit::Deposit(c) = &first { t.release(c) } else { panic!("{first:?}") }
+        assert!(matches!(t.claim_session("a".into(), turn1, 1), UserDeposit::Deposit(_)));
+        assert_eq!(t.take_settled_lost(), 0, "re-deposited by the same turn");
+        // New turn first: the released prompt is lost.
+        let next = t.claim_session("b".into(), turn1, 1);
+        if let UserDeposit::Deposit(c) = &next { t.release(c) } else { panic!("{next:?}") }
+        assert!(matches!(t.claim_session("b".into(), turn2, 2), UserDeposit::Deposit(_)));
+        assert_eq!(t.take_settled_lost(), 1, "the turn moved on");
+        assert_eq!(t.take_settled_lost(), 0, "taken once");
+        // Evicted with a prompt still released: lost.
+        let mut small = UserDepositTracker::new(1);
+        let only = small.claim_session("c".into(), turn1, 1);
+        assert!(matches!(only, UserDeposit::Deposit(DepositClaim::Session { prev: None, .. })));
+        // A key with a prior mark, released, then pushed out by another key.
+        let again = small.claim_session("c".into(), turn2, 2);
+        if let UserDeposit::Deposit(c) = &again { small.release(c) } else { panic!("{again:?}") }
+        small.claim_session("d".into(), turn1, 1);
+        assert_eq!(small.take_settled_lost(), 1, "evicted before re-deposit");
+    }
+
+    #[test]
+    fn a_failed_user_frame_with_the_tracker_off_is_a_loss() {
+        // LE finding 2: MINITID_USER_DEPOSIT_ONCE=0 has no claim to release.
+        let tracker = Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY));
+        let before = TURN_DEPOSITS_LOST.load(Ordering::Relaxed);
+        let failed: std::io::Result<()> = Err(std::io::Error::other("disk full"));
+        assert!(!settle_user_deposit(&tracker, Some(&UserDeposit::Untracked), Some(&failed)));
+        assert!(TURN_DEPOSITS_LOST.load(Ordering::Relaxed) >= before + 1);
     }
 
     #[test]
@@ -4535,6 +4641,12 @@ mod tests {
             .collect();
         assert_eq!(lines, vec![json!({"n": 1}), json!({"n": 2, "text": "a\nb"})]);
         let mode = |p: &str| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(d), 0o700);
+        // Pre-existing with looser modes: tightened on the next write (LE finding 6).
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_review_record(d, 1_793_289_000, &json!({"n": 3})).unwrap();
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(d), 0o700);
         // A record that cannot be written is an Err (proxy() counts it).
@@ -4848,7 +4960,7 @@ mod tests {
         let blocker = dir.join("not_a_dir");
         std::fs::write(&blocker, b"x").unwrap();
         let bad = blocker.join("turns.tract");
-        let result = deposit_turn_at(bad.to_str().unwrap(), Some("write this down".into()), "answer".into());
+        let result = deposit_turn_at(bad.to_str().unwrap(), Some("write this down".into()), "answer".into(), &AtomicU64::new(0));
         assert!(matches!(result, Some(Err(_))), "the user frame write must report its failure");
         assert!(settle_user_deposit(&t, Some(&first), result.as_ref()), "the claim must be released");
         // the next round trip of the SAME turn deposits the prompt (before: lost for the whole turn)
@@ -4856,7 +4968,7 @@ mod tests {
         assert!(matches!(retry, UserDeposit::Deposit(_)), "the prompt must be retried, not lost");
         // and it lands at a good path: the claim is kept, the following rounds skip
         let good = dir.join("ok").join("turns.tract");
-        let ok = deposit_turn_at(good.to_str().unwrap(), Some("write this down".into()), "answer".into());
+        let ok = deposit_turn_at(good.to_str().unwrap(), Some("write this down".into()), "answer".into(), &AtomicU64::new(0));
         assert!(matches!(ok, Some(Ok(()))));
         assert!(!settle_user_deposit(&t, Some(&retry), ok.as_ref()));
         assert_eq!(decide(&t, &body("s1", agentic(&["write this down"], 2)), &h, 2), UserDeposit::SkipSameTurn);
@@ -4864,10 +4976,10 @@ mod tests {
         // the recent path releases too; no user text -> nothing to settle
         let nb = json!({"messages": [{"role": "user", "content": "no id"}]});
         let c = decide(&t, &nb, &h, 100);
-        let r = deposit_turn_at(bad.to_str().unwrap(), Some("no id".into()), String::new());
+        let r = deposit_turn_at(bad.to_str().unwrap(), Some("no id".into()), String::new(), &AtomicU64::new(0));
         assert!(settle_user_deposit(&t, Some(&c), r.as_ref()));
         assert!(matches!(decide(&t, &nb, &h, 101), UserDeposit::Deposit(_)));
-        assert!(deposit_turn_at(bad.to_str().unwrap(), None, String::new()).is_none());
+        assert!(deposit_turn_at(bad.to_str().unwrap(), None, String::new(), &AtomicU64::new(0)).is_none());
         assert!(!settle_user_deposit(&t, None, None));
         // untracked (switch off): nothing to release, still reported
         let e: std::io::Result<()> = Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
@@ -5063,7 +5175,8 @@ mod tests {
         let tract = dir.join("turns.tract");
         std::env::set_var("HOME", &dir);
         std::env::set_var("CC_GATEWAY_TRACT_PATH", &tract);
-        std::env::remove_var("MINITID_PITH_PENINSULA");
+        std::env::remove_var("MINITID_PITH_ZERO_REPLAY"); // Card 9 switches: a developer shell must not change this test
+        std::env::remove_var("MINITID_PITH_REVIEW_DIR");
         std::env::remove_var("MINITID_USER_DEPOSIT_ONCE");
         let upstream_file = dir.join(".config/minitid/upstream");
 
@@ -5182,6 +5295,7 @@ mod tests {
             tmp.to_str().unwrap(),
             Some("what is the numpy issue".to_string()),
             "it's a stray .pth file".to_string(),
+            &AtomicU64::new(0),
         )
         .expect("a user frame was attempted")
         .expect("both entries are written");
