@@ -56,6 +56,18 @@
 //       state and warnings (not_fresh_reason: e.g. state=unavailable warnings=graph_busy). Second canary
 //       (:9091, 3 turns / 5 requests): shadow, records written, each failure now the daemon's own answer.
 //       107 passed, 0 failed (x3).
+//       LE delta re-check (c2779bc..1a3f83b, VIOLATIONS FOUND, none critical) folded: N1 "lost" now means
+//       only a release blocked by a NEWER claim (ReleaseOutcome); tracker off / poisoned lock / Untracked
+//       early end are deferred (released=), since every such request deposits; N2 every loss settled inside
+//       the tracker is published with one ERROR line (publish_settled; also drained after releases); N3
+//       eviction no longer presumes a loss, the deferred list's overflow drops its OLDEST entry as
+//       "presumed lost"; N4 the shadow slot is held until the socket worker ends (PithDaemon::hold_worker),
+//       the shadow timeout floor is 6 s (> the daemon's 5 s lock wait), MINITID_PITH_SHADOW_MIN_INTERVAL_MS
+//       (LAW 5, default 30 s) spaces shadow passes -- live mode has NO single-flight and must not be
+//       switched on before #1201 is fixed (swap gate); N5 counts-line / USER_CLAIMS_RELEASED docs refreshed;
+//       N6 a skipped request gets the full counts line; N7 the shadow gate is injectable (ShadowGate,
+//       shadow_pith_with; pith_pass takes the tract path so a test can never write the live tract) with a
+//       hanging-socket test; N8 a skipped request still advances the KISS cadence gate. 108 passed (x3).
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7b:
 //   a turn miniTID read but could not deposit is counted and named
 //   (#717, #719)
@@ -970,6 +982,9 @@ struct PithDaemon {
     sock: String,
     read: std::time::Duration,
     total: std::time::Duration,
+    /// Shadow: on a timeout, still wait for the socket worker to end, so the
+    /// single-flight slot covers the daemon-side waiter too (LE re-check N4).
+    hold_worker: bool,
 }
 
 impl From<String> for PithDaemon {
@@ -978,6 +993,7 @@ impl From<String> for PithDaemon {
             sock,
             read: std::time::Duration::from_millis(1500),
             total: std::time::Duration::from_millis(2000),
+            hold_worker: false,
         }
     }
 }
@@ -985,7 +1001,7 @@ impl From<String> for PithDaemon {
 impl PithDaemon {
     fn shadow(sock: String, total_ms: u64) -> Self {
         let total = std::time::Duration::from_millis(total_ms);
-        Self { sock, read: total, total }
+        Self { sock, read: total, total, hold_worker: true }
     }
 }
 
@@ -993,7 +1009,8 @@ const DEFAULT_PITH_SHADOW_TIMEOUT_MS: u64 = 15_000;
 
 /// MINITID_PITH_SHADOW_TIMEOUT_MS (LAW 5): how long a background shadow Pith
 /// call may wait for the daemon (whose own graph-lock wait is
-/// CC_NG_PROVIDER_LOCK_WAIT_S, default 5 s).  Default 15 s, clamped 1-120 s.
+/// CC_NG_PROVIDER_LOCK_WAIT_S, default 5 s).  Default 15 s, clamped 6-120 s: never
+/// below the daemon's own wait, so a shadow call is not abandoned mid-wait (N4).
 fn pith_shadow_timeout_ms() -> u64 {
     configured_pith_shadow_timeout_ms(env::var("MINITID_PITH_SHADOW_TIMEOUT_MS").ok().as_deref())
 }
@@ -1001,8 +1018,25 @@ fn pith_shadow_timeout_ms() -> u64 {
 fn configured_pith_shadow_timeout_ms(value: Option<&str>) -> u64 {
     value
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|v| v.clamp(1_000, 120_000))
+        .map(|v| v.clamp(6_000, 120_000))
         .unwrap_or(DEFAULT_PITH_SHADOW_TIMEOUT_MS)
+}
+
+const DEFAULT_PITH_SHADOW_MIN_INTERVAL_MS: u64 = 30_000;
+
+/// MINITID_PITH_SHADOW_MIN_INTERVAL_MS (LAW 5): least time between the STARTS of
+/// two shadow Pith passes; requests in between are recorded as shadow_skipped.
+/// Caps how often shadow mode asks the daemon for its graph lock (LAW 8: Pith must
+/// not pace the Tonic; #1201).  Default 30 s, clamped 0-3,600,000 (0 = no spacing).
+fn pith_shadow_min_interval_ms() -> u64 {
+    configured_pith_shadow_min_interval_ms(env::var("MINITID_PITH_SHADOW_MIN_INTERVAL_MS").ok().as_deref())
+}
+
+fn configured_pith_shadow_min_interval_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.min(3_600_000))
+        .unwrap_or(DEFAULT_PITH_SHADOW_MIN_INTERVAL_MS)
 }
 
 /// Call the CC daemon's read-only `provider_context` handler.  The request
@@ -1013,8 +1047,8 @@ async fn daemon_provider_context(
     current_instruction: String,
     daemon: impl Into<PithDaemon>,
 ) -> Result<String, String> {
-    let PithDaemon { sock, read, total } = daemon.into();
-    let fut = tokio::task::spawn_blocking(move || -> Result<String, String> {
+    let PithDaemon { sock, read, total, hold_worker } = daemon.into();
+    let mut worker = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let mut stream = UnixStream::connect(&sock)
             .map_err(|e| format!("daemon socket unavailable: {e}"))?;
         let t = read;
@@ -1055,10 +1089,15 @@ async fn daemon_provider_context(
         }
         parse_provider_response(&buf).ok_or_else(|| not_fresh_reason(&buf))
     });
-    match tokio::time::timeout(total, fut).await {
+    match tokio::time::timeout(total, &mut worker).await {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => Err(format!("daemon worker failed: {e}")),
-        Err(_) => Err(format!("daemon did not answer within {} ms", total.as_millis())),
+        Err(_) => {
+            if hold_worker {
+                let _ = worker.await; // shadow: the caller's slot covers the daemon-side wait too
+            }
+            Err(format!("daemon did not answer within {} ms", total.as_millis()))
+        }
     }
 }
 
@@ -1717,14 +1756,15 @@ fn count_lost_deposit(result: std::io::Result<()>, lost: &AtomicU64) {
     }
 }
 
-/// Card 9 merge (2026-10-29): #1173 user-prompt claims released because the
-/// request ended before its deposit (send failed, client gone, accumulator
-/// died) or the user frame failed to write: the deposit is DEFERRED, counted on
-/// `released=`.  The next request of the same human turn re-deposits it.  If
-/// the session's next claim is a NEW turn instead (or the key is evicted), the
-/// prompt was never written and that is settled as one lost turn on
-/// turn_deposits_lost (UserDepositTracker::deferred, LE finding 1).  Requests
-/// without session identity cannot be settled: theirs stay counted only here.
+/// Card 9 merge (2026-10-29): user prompts whose deposit was DEFERRED, counted on
+/// `released=`: the request ended before its deposit (send failed, client gone,
+/// accumulator died) or the user frame failed to write, and the turn's next
+/// request writes it -- a #1173 claim undone, or no claim to undo (tracker off,
+/// or its lock poisoned: requests then deposit untracked).  Settled later as a
+/// LOST turn on turn_deposits_lost, each with an ERROR line: the session's next
+/// claim is a new turn (UserDepositTracker::deferred), or the deferred list
+/// overflowed (presumed lost).  A release blocked by a newer claim is lost at
+/// once.  Requests without session identity cannot be settled: theirs stay here.
 static USER_CLAIMS_RELEASED: AtomicU64 = AtomicU64::new(0);
 
 /// #433 review records that could not be written (counted and named, #560).
@@ -2098,7 +2138,7 @@ fn settle_user_deposit_counted(
     let Some(Err(e)) = user_result else {
         return false;
     };
-    let (who, released) = match decision {
+    let (who, outcome) = match decision {
         Some(d @ UserDeposit::Deposit(DepositClaim::Session { key, .. })) => {
             (format!("session={key}"), release_user_deposit(tracker, d))
         }
@@ -2106,18 +2146,19 @@ fn settle_user_deposit_counted(
             format!("recent text_sha256={}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>()),
             release_user_deposit(tracker, d),
         ),
-        // Nothing to release (tracker off): lost unless the turn sends another (LE finding 2).
-        _ => ("untracked (MINITID_USER_DEPOSIT_ONCE=0)".to_string(), false),
+        // Tracker off: every request deposits, so the turn's next request writes it (deferred).
+        _ => ("untracked (MINITID_USER_DEPOSIT_ONCE=0)".to_string(), ReleaseOutcome::NoClaim),
     };
-    // Card 9: undone = deferred (released=); not undone = lost (turn_deposits_lost=), Grok finding 1.
-    account_release(released, counters);
-    let next = if released {
-        "claim RELEASED: the next request of this turn deposits the prompt"
-    } else {
-        "NOT released (no claim, a newer claim, or a poisoned lock): counted as a lost turn"
+    // Card 9: lost only when a newer claim holds the session; otherwise deferred (released=).
+    account_release(outcome, counters);
+    let next = match outcome {
+        ReleaseOutcome::Restored => "claim RELEASED: the next request of this turn deposits the prompt",
+        ReleaseOutcome::NewerClaim => "a newer claim holds the session: the prompt is LOST (turn_deposits_lost)",
+        ReleaseOutcome::Poisoned => "tracker lock poisoned: requests deposit untracked, so the next request of this turn writes it",
+        ReleaseOutcome::NoClaim => "tracker off: the next request of this turn writes it",
     };
     eprintln!("<3>miniTID deposit ERROR: user frame NOT written ({who}): {e}; {next}");
-    released
+    outcome == ReleaseOutcome::Restored
 }
 
 // ── #1173: the user prompt once per human turn ──────────────────────────────
@@ -2197,9 +2238,10 @@ struct UserDepositTracker {
     /// RELEASED and not yet re-deposited.  The next claim for the key settles it:
     /// the same marker re-deposits the prompt; a different marker means the turn
     /// moved on and the released prompt was never written (one lost turn).
-    deferred: HashMap<String, [u8; 32]>,
-    /// Lost turns settled here, not yet moved onto TURN_DEPOSITS_LOST.
-    settled_lost: u64,
+    deferred: HashMap<String, ([u8; 32], u64)>, // (turn marker, access-clock age)
+    /// Lost turns settled here (session key, reason), not yet published by the
+    /// caller onto TURN_DEPOSITS_LOST with an ERROR line each (LE re-check N2).
+    settled: Vec<(String, &'static str)>,
     /// digest -> (last seen, id of the claim that last deposited it)
     recent: HashMap<[u8; 32], (u64, u64)>,
     access_clock: u64,
@@ -2212,7 +2254,7 @@ impl UserDepositTracker {
         Self {
             sessions: HashMap::new(),
             deferred: HashMap::new(),
-            settled_lost: 0,
+            settled: Vec::new(),
             recent: HashMap::new(),
             access_clock: 0,
             claim_clock: 0,
@@ -2240,26 +2282,24 @@ impl UserDepositTracker {
             .min_by(|(ka, a), (kb, b)| a.last_access.cmp(&b.last_access).then_with(|| ka.cmp(kb)))
             .map(|(k, _)| k.clone());
         if let Some(k) = victim {
+            // A pending released prompt is NOT settled here: an evicted key's retry
+            // takes the new-key branch and still deposits it (LE re-check N3).
             self.sessions.remove(&k);
-            // A key evicted with a released prompt still pending: it was never written.
-            if self.deferred.remove(&k).is_some() {
-                self.settled_lost += 1;
-            }
         }
     }
 
     /// Settle a key's released prompt against the claim now being made.
     fn settle_deferred(&mut self, key: &str, marker: &[u8; 32]) {
-        if let Some(released) = self.deferred.remove(key) {
+        if let Some((released, _)) = self.deferred.remove(key) {
             if &released != marker {
-                self.settled_lost += 1;
+                self.settled.push((key.to_string(), "the turn moved on before the released prompt was re-deposited"));
             }
         }
     }
 
-    /// Lost turns settled since the last call (moved onto the global counter by the caller).
-    fn take_settled_lost(&mut self) -> u64 {
-        std::mem::take(&mut self.settled_lost)
+    /// Losses settled since the last call; the caller publishes them (publish_settled).
+    fn take_settled(&mut self) -> Vec<(String, &'static str)> {
+        std::mem::take(&mut self.settled)
     }
 
     fn evict_recent_if_full(&mut self) {
@@ -2343,14 +2383,17 @@ impl UserDepositTracker {
         match claim {
             DepositClaim::Session { key, prev, id } => {
                 if let Some(released) = self.sessions.get(key).filter(|m| m.claim == *id).map(|m| m.marker) {
-                    // Bounded like `sessions`: a full map settles one pending prompt as lost first.
+                    // Bounded like `sessions`: a full list gives up on its OLDEST pending
+                    // prompt, presumed lost (LE re-check N3: by age, not key order).
                     if !self.deferred.contains_key(key) && self.deferred.len() >= self.capacity {
-                        if let Some(k) = self.deferred.keys().min().cloned() {
+                        let oldest = self.deferred.iter().min_by_key(|(_, (_, age))| *age).map(|(k, _)| k.clone());
+                        if let Some(k) = oldest {
                             self.deferred.remove(&k);
-                            self.settled_lost += 1;
+                            self.settled.push((k, "presumed lost: the deferred-prompt list was full"));
                         }
                     }
-                    self.deferred.insert(key.clone(), released);
+                    let age = self.next_access();
+                    self.deferred.insert(key.clone(), (released, age));
                     match prev {
                         Some(p) => {
                             self.sessions.insert(key.clone(), *p);
@@ -2419,7 +2462,7 @@ fn user_deposit_for_request(
         if let (Some(b), Some(m)) = (body, messages) {
             if let (Some(key), Some((marker, count))) = (session_key(b, headers), human_turn_marker(m)) {
                 let decision = t.claim_session(key, marker, count);
-                TURN_DEPOSITS_LOST.fetch_add(t.take_settled_lost(), Ordering::Relaxed);
+                publish_settled(t.take_settled(), &TURN_DEPOSITS_LOST);
                 return decision;
             }
         }
@@ -2446,25 +2489,57 @@ impl UserDepositGuard {
 impl Drop for UserDepositGuard {
     fn drop(&mut self) {
         if let Some(decision) = self.decision.take() {
-            if matches!(decision, UserDeposit::Deposit(_)) {
-                let restored = release_user_deposit(&self.state.user_deposits, &decision);
-                account_release(restored, &GLOBAL_LOSS); // Card 9: released= or turn_deposits_lost=
-                if restored {
-                    eprintln!("miniTID deposit: user=released via=no_deposit");
+            if user_deposit_writes(&decision) {
+                // Card 9: Deposit releases its claim; Untracked (tracker off or poisoned) has none,
+                // and its next request deposits anyway. Either way counted (LE re-check N1).
+                let outcome = release_user_deposit(&self.state.user_deposits, &decision);
+                account_release(outcome, &GLOBAL_LOSS);
+                if outcome == ReleaseOutcome::NewerClaim {
+                    eprintln!("<3>miniTID deposit ERROR: user=lost via=no_deposit (a newer claim holds the session)");
                 } else {
-                    eprintln!("<3>miniTID deposit ERROR: user=lost via=no_deposit (a newer claim holds the session, or the tracker lock is poisoned)");
+                    eprintln!("miniTID deposit: user=released via=no_deposit ({outcome:?})");
                 }
             }
         }
     }
 }
 
-/// True when the claim was undone; false for a newer claim, a poisoned lock,
-/// or a decision that held no claim (the prompt will NOT be re-deposited).
-fn release_user_deposit(tracker: &Mutex<UserDepositTracker>, decision: &UserDeposit) -> bool {
-    match decision {
-        UserDeposit::Deposit(claim) => tracker.lock().map(|mut t| t.release(claim)).unwrap_or(false),
-        _ => false,
+/// What releasing a prompt's claim achieved (LE re-check N1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleaseOutcome {
+    /// The claim was undone: the turn's next request re-deposits the prompt.
+    Restored,
+    /// A newer claim holds the session: this prompt will not be re-deposited (lost).
+    NewerClaim,
+    /// The tracker lock is poisoned: user_deposit_for_request then answers Untracked,
+    /// which deposits on every request, so the prompt is deferred, not lost.
+    Poisoned,
+    /// No claim (tracker off / Untracked): every request deposits, so deferred.
+    NoClaim,
+}
+
+fn release_user_deposit(tracker: &Mutex<UserDepositTracker>, decision: &UserDeposit) -> ReleaseOutcome {
+    let UserDeposit::Deposit(claim) = decision else {
+        return ReleaseOutcome::NoClaim;
+    };
+    let Ok(mut t) = tracker.lock() else {
+        return ReleaseOutcome::Poisoned;
+    };
+    let restored = t.release(claim);
+    publish_settled(t.take_settled(), &TURN_DEPOSITS_LOST); // a release can overflow the deferred list
+    if restored {
+        ReleaseOutcome::Restored
+    } else {
+        ReleaseOutcome::NewerClaim
+    }
+}
+
+/// Count and name each loss the tracker settled: one ERROR line per prompt,
+/// with the session key (already a SHA-256 digest) and the reason (#560).
+fn publish_settled(settled: Vec<(String, &'static str)>, lost: &AtomicU64) {
+    for (key, why) in settled {
+        lost.fetch_add(1, Ordering::Relaxed);
+        eprintln!("<3>miniTID deposit ERROR: user prompt LOST (session={key}): {why}");
     }
 }
 
@@ -2477,13 +2552,13 @@ struct LossCounters<'a> {
 const GLOBAL_LOSS: LossCounters<'static> =
     LossCounters { released: &USER_CLAIMS_RELEASED, lost: &TURN_DEPOSITS_LOST };
 
-/// A prompt whose deposit did not happen: deferred if its claim was undone,
-/// otherwise lost (newer claim, poisoned lock, or no claim at all).
-fn account_release(restored: bool, counters: &LossCounters) {
-    if restored {
-        counters.released.fetch_add(1, Ordering::Relaxed);
-    } else {
+/// A prompt whose deposit did not happen: lost only when a newer claim holds
+/// its session; otherwise deferred to the turn's next request (released=).
+fn account_release(outcome: ReleaseOutcome, counters: &LossCounters) {
+    if outcome == ReleaseOutcome::NewerClaim {
         counters.lost.fetch_add(1, Ordering::Relaxed);
+    } else {
+        counters.released.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2637,16 +2712,19 @@ fn request_path_class(rewrite: &PithRewrite) -> &'static str {
 /// miniTID removed from the received provider context (Packet 177); the
 /// daemon's own assembly count overstates what reached the model by exactly
 /// that much.  `deposits_lost` is (Pith-failure, turn) deposits lost, read
-/// from the two #714 counters.  proxy() appends `mode= pith_bytes= released=
-/// review_lost=` (Card 9).  Which counter each path bumps (Card 9 merge):
-/// `released=` -- a #1173 claim released because the request ended before its
-/// deposit (req_method or send `?`, the handler dropped awaiting Pith or the
-/// send, a dead accumulator) or because the user frame failed to write: the
-/// prompt is deferred to the turn's next request.  `turn_deposits_lost=` -- an
-/// assistant frame that cannot be written, a dead accumulator on a turn (the
-/// answer), a deferred prompt whose session moved on to a new turn or was
-/// evicted first, and a failed user frame with the tracker off.
-/// `review_lost=` -- a #433 review record that cannot be written.  All are
+/// from the two #714 counters.  pith_pass() (and a shadow skip) appends `mode=
+/// pith_bytes= released= review_lost= shadow_skipped=` (Card 9).  Which counter
+/// each path bumps: `released=` -- a prompt whose deposit is deferred to the
+/// turn's next request: the request ended before its deposit (req_method or send
+/// `?`, the handler dropped awaiting the send -- or awaiting Pith, live mode only
+/// -- a dead accumulator) or the user frame failed to write, with its #1173
+/// claim undone or no claim to undo (tracker off or its lock poisoned).
+/// `turn_deposits_lost=` -- an assistant frame that cannot be written, a dead
+/// accumulator on a turn (the answer), a release blocked by a newer claim, and a
+/// deferred prompt settled lost later (its session moved on to a new turn, or the
+/// deferred list overflowed), each with an ERROR line.  `review_lost=` -- a #433
+/// review record that cannot be written.  `shadow_skipped=` -- shadow passes not
+/// run (one in flight, or under the minimum interval).  All are
 /// process-wide and cumulative: a loss is named on a later counts line (one
 /// from the send path races this request's own line; a handler dropped
 /// awaiting Pith has no line of its own), the last loss before idle or
@@ -2692,6 +2770,7 @@ async fn pith_pass(
     headers: HeaderMap,
     zero_replay: bool,
     daemon: PithDaemon,
+    tract: String,
 ) -> axum::body::Bytes {
     let rewrite =
         rewrite_request_body(&body_bytes, &headers, &state.sessions, daemon)
@@ -2710,10 +2789,7 @@ async fn pith_pass(
         .map(|f| PithFailure::new(f.what, f.why.clone()));
     if let Some(failure) = rewrite.failure {
         tokio::spawn(async move {
-            count_lost_deposit(
-                deposit_pith_failure(&cc_gateway_tract_path(), &failure),
-                &FAILURE_DEPOSITS_LOST,
-            );
+            count_lost_deposit(deposit_pith_failure(&tract, &failure), &FAILURE_DEPOSITS_LOST);
         });
     }
     let original = body_bytes.clone();
@@ -2757,71 +2833,139 @@ async fn pith_pass(
             if zero_replay { "live" } else { "shadow" },
             USER_CLAIMS_RELEASED.load(Ordering::Relaxed),
             REVIEW_RECORDS_LOST.load(Ordering::Relaxed),
-            SHADOW_SKIPPED.load(Ordering::Relaxed),
+            SHADOW.skipped.load(Ordering::Relaxed),
         );
     });
     forwarded
 }
 
-/// Shadow Pith calls in flight (at most one): a request arriving while one runs
-/// is recorded as skipped instead of queueing on the daemon's graph lock (the
-/// 2026-10-04 SIGUSR1 dump: 66 queued provider_context requests starved autosave).
-static SHADOW_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Card 9 shadow single-flight + spacing (LE re-check N4/N7).  At most one
+/// shadow pass at a time, and at least `interval` between two starts; a request
+/// in between is recorded as shadow_skipped instead of queueing on the daemon's
+/// graph lock (the 2026-10-04 SIGUSR1 dump: 66 queued provider_context requests
+/// starved autosave).  Injectable so tests never touch the process-wide one.
+/// LIVE mode (MINITID_PITH_ZERO_REPLAY=1) has no such gate: it must not be
+/// switched on before #1201 is fixed (swap gate, LE re-check N4).
+struct ShadowGate {
+    in_flight: std::sync::atomic::AtomicBool,
+    last_start_ms: AtomicU64,
+    skipped: AtomicU64,
+}
 
-/// Shadow requests not run because one was already in flight (counts line `shadow_skipped=`).
-static SHADOW_SKIPPED: AtomicU64 = AtomicU64::new(0);
+impl ShadowGate {
+    const fn new() -> Self {
+        Self {
+            in_flight: std::sync::atomic::AtomicBool::new(false),
+            last_start_ms: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+        }
+    }
 
-/// Clears SHADOW_IN_FLIGHT when the background pass ends, however it ends.
-struct ShadowSlot;
-
-impl Drop for ShadowSlot {
-    fn drop(&mut self) {
-        SHADOW_IN_FLIGHT.store(false, Ordering::Release);
+    /// Take the slot, or say why not ("in flight" / "spacing").
+    fn try_start(&'static self, now_ms: u64, interval_ms: u64) -> Result<ShadowSlot, &'static str> {
+        let last = self.last_start_ms.load(Ordering::Acquire);
+        if last != 0 && now_ms.saturating_sub(last) < interval_ms {
+            return Err("spacing: the previous shadow pass started under MINITID_PITH_SHADOW_MIN_INTERVAL_MS ago");
+        }
+        self.in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "in flight: a previous shadow Pith call was still running")?;
+        self.last_start_ms.store(now_ms.max(1), Ordering::Release);
+        Ok(ShadowSlot(self))
     }
 }
 
-/// Take the single shadow slot, or None when a shadow pass is already running.
-fn try_shadow_slot() -> Option<ShadowSlot> {
-    SHADOW_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .ok()
-        .map(|_| ShadowSlot)
+static SHADOW: ShadowGate = ShadowGate::new();
+
+/// Clears the gate's in-flight flag when the background pass ends, however it ends.
+struct ShadowSlot(&'static ShadowGate);
+
+impl Drop for ShadowSlot {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::Release);
+    }
 }
 
-/// Card 9 shadow mode: run pith_pass in the background with the shadow
-/// timeout; the caller has already forwarded the original bytes.  A skipped
-/// request is counted, logged on a counts line and (under #433) recorded.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Card 9 shadow mode: the caller has already forwarded the original bytes.
 fn shadow_pith(state: Arc<AppState>, body_bytes: axum::body::Bytes, headers: HeaderMap) {
-    let Some(slot) = try_shadow_slot() else {
-        let skipped = SHADOW_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
-        tokio::spawn(async move {
-            if let Some(dir) = pith_review_dir() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
+    shadow_pith_with(
+        state,
+        body_bytes,
+        headers,
+        PithDaemon::shadow(peninsula_sock_path(), pith_shadow_timeout_ms()),
+        cc_gateway_tract_path(),
+        &SHADOW,
+        pith_shadow_min_interval_ms(),
+        now_ms(),
+    );
+}
+
+/// Run pith_pass in the background, or record the skip: the KISS cadence gate
+/// still advances (N8), the full counts line is written (N6), and under #433 a
+/// "shadow_skipped" record says why.
+#[allow(clippy::too_many_arguments)]
+fn shadow_pith_with(
+    state: Arc<AppState>,
+    body_bytes: axum::body::Bytes,
+    headers: HeaderMap,
+    daemon: PithDaemon,
+    tract: String,
+    gate: &'static ShadowGate,
+    interval_ms: u64,
+    now_ms: u64,
+) {
+    let slot = match gate.try_start(now_ms, interval_ms) {
+        Ok(slot) => slot,
+        Err(why) => {
+            gate.skipped.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
                 let original = serde_json::from_slice::<Value>(&body_bytes).ok();
-                let msgs_in = original
-                    .as_ref()
-                    .and_then(|b| b["messages"].as_array().map(Vec::len))
-                    .unwrap_or(0);
-                let session = original.as_ref().and_then(|b| session_key(b, &headers));
-                let why = PithFailure::new("shadow", "a previous shadow Pith call was still in flight");
-                let record = review_record(
-                    now.as_secs_f64(), false, "shadow_skipped", 0, session.as_deref(), msgs_in, None, Some(&why),
+                if let Some(b) = original.as_ref() {
+                    let _ = gate_for_body(b, &headers, &state.sessions); // N8: cadence advances as if run
+                }
+                if let Some(dir) = pith_review_dir() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let msgs_in = original
+                        .as_ref()
+                        .and_then(|b| b["messages"].as_array().map(Vec::len))
+                        .unwrap_or(0);
+                    let session = original.as_ref().and_then(|b| session_key(b, &headers));
+                    let why = PithFailure::new("shadow", why);
+                    let record = review_record(
+                        now.as_secs_f64(), false, "shadow_skipped", 0, session.as_deref(), msgs_in, None, Some(&why),
+                    );
+                    let written = tokio::task::spawn_blocking(move || write_review_record(&dir, now.as_secs(), &record))
+                        .await
+                        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+                    count_lost_deposit(written, &REVIEW_RECORDS_LOST);
+                }
+                let deposits_lost = (
+                    FAILURE_DEPOSITS_LOST.load(Ordering::Relaxed),
+                    TURN_DEPOSITS_LOST.load(Ordering::Relaxed),
                 );
-                let written = tokio::task::spawn_blocking(move || write_review_record(&dir, now.as_secs(), &record))
-                    .await
-                    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
-                count_lost_deposit(written, &REVIEW_RECORDS_LOST);
-            }
-            eprintln!("miniTID request path=shadow_skipped mode=shadow shadow_skipped={skipped}");
-        });
-        return;
+                eprintln!(
+                    "{} mode=shadow pith_bytes=0 released={} review_lost={} shadow_skipped={}",
+                    request_counts_line("shadow_skipped", 0, &body_bytes, &body_bytes, deposits_lost),
+                    USER_CLAIMS_RELEASED.load(Ordering::Relaxed),
+                    REVIEW_RECORDS_LOST.load(Ordering::Relaxed),
+                    gate.skipped.load(Ordering::Relaxed),
+                );
+            });
+            return;
+        }
     };
-    let daemon = PithDaemon::shadow(peninsula_sock_path(), pith_shadow_timeout_ms());
     tokio::spawn(async move {
         let _slot = slot;
-        pith_pass(state, body_bytes, headers, false, daemon).await;
+        pith_pass(state, body_bytes, headers, false, daemon, tract).await;
     });
 }
 
@@ -2892,6 +3036,7 @@ async fn proxy(
                 headers.clone(),
                 true,
                 PithDaemon::from(peninsula_sock_path()),
+                cc_gateway_tract_path(),
             )
             .await
         } else {
@@ -4730,15 +4875,16 @@ mod tests {
         assert!(matches!(newer, UserDeposit::Deposit(_)));
         assert!(!settle_user_deposit_counted(&tracker, Some(&again), Some(&failed), &c));
         assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (1, 1));
-        // A poisoned tracker lock cannot undo anything either.
+        // A poisoned tracker lock cannot undo the claim, but the prompt is not lost.
         let poisoned = Mutex::new(UserDepositTracker::new(1));
         let d = poisoned.lock().unwrap().claim_session("p".into(), [1u8; 32], 1);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _g = poisoned.lock().unwrap();
             panic!("poison");
         }));
+        // LE re-check N1: a poisoned lock makes requests deposit untracked, so deferred.
         assert!(!settle_user_deposit_counted(&poisoned, Some(&d), Some(&failed), &c));
-        assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (1, 2));
+        assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (2, 1));
     }
 
     #[tokio::test]
@@ -4765,43 +4911,56 @@ mod tests {
 
     #[test]
     fn a_released_prompt_is_settled_lost_only_when_its_turn_moves_on() {
-        // LE finding 1: a released claim is re-deposited by the next request of
-        // the SAME turn; if the session's next claim is a new turn, the released
-        // prompt was never written and is one lost turn.
+        // LE finding 1 / re-check N2-N3: a released claim is re-deposited by the
+        // next request of the SAME turn; if the session's next claim is a new
+        // turn, the released prompt was never written and is one named loss.
         let mut t = UserDepositTracker::new(DEFAULT_SESSION_CAPACITY);
         let turn1 = [1u8; 32];
         let turn2 = [2u8; 32];
-        // Same turn: release, then the retry re-deposits it.
         let first = t.claim_session("a".into(), turn1, 1);
         if let UserDeposit::Deposit(c) = &first { assert!(t.release(c)) } else { panic!("{first:?}") }
         assert!(matches!(t.claim_session("a".into(), turn1, 1), UserDeposit::Deposit(_)));
-        assert_eq!(t.take_settled_lost(), 0, "re-deposited by the same turn");
-        // New turn first: the released prompt is lost.
+        assert!(t.take_settled().is_empty(), "re-deposited by the same turn");
         let next = t.claim_session("b".into(), turn1, 1);
         if let UserDeposit::Deposit(c) = &next { assert!(t.release(c)) } else { panic!("{next:?}") }
         assert!(matches!(t.claim_session("b".into(), turn2, 2), UserDeposit::Deposit(_)));
-        assert_eq!(t.take_settled_lost(), 1, "the turn moved on");
-        assert_eq!(t.take_settled_lost(), 0, "taken once");
-        // Evicted with a prompt still released: lost.
+        let settled = t.take_settled();
+        assert_eq!(settled.len(), 1, "the turn moved on");
+        assert_eq!(settled[0].0, "b");
+        assert!(t.take_settled().is_empty(), "taken once");
+        let lost = AtomicU64::new(0);
+        publish_settled(settled, &lost);
+        assert_eq!(lost.load(Ordering::Relaxed), 1, "published = counted");
+
+        // N3: eviction settles nothing (the evicted key's retry still deposits) ...
         let mut small = UserDepositTracker::new(1);
-        let only = small.claim_session("c".into(), turn1, 1);
-        assert!(matches!(only, UserDeposit::Deposit(DepositClaim::Session { prev: None, .. })));
-        // A key with a prior mark, released, then pushed out by another key.
-        let again = small.claim_session("c".into(), turn2, 2);
-        if let UserDeposit::Deposit(c) = &again { assert!(small.release(c)) } else { panic!("{again:?}") }
+        let c1 = small.claim_session("c".into(), turn1, 1);
+        if let UserDeposit::Deposit(c) = &c1 { assert!(small.release(c)) } else { panic!("{c1:?}") }
         small.claim_session("d".into(), turn1, 1);
-        assert_eq!(small.take_settled_lost(), 1, "evicted before re-deposit");
+        assert!(small.take_settled().is_empty(), "eviction is not a presumed loss");
+        assert!(matches!(small.claim_session("c".into(), turn1, 1), UserDeposit::Deposit(_)), "c re-deposits");
+        // ... only a full deferred list presumes its OLDEST pending prompt lost.
+        let mut tiny = UserDepositTracker::new(1);
+        let e = tiny.claim_session("e".into(), turn1, 1);
+        if let UserDeposit::Deposit(c) = &e { assert!(tiny.release(c)) } else { panic!("{e:?}") }
+        let f = tiny.claim_session("f".into(), turn1, 1);
+        if let UserDeposit::Deposit(c) = &f { assert!(tiny.release(c)) } else { panic!("{f:?}") }
+        let over = tiny.take_settled();
+        assert_eq!(over.len(), 1);
+        assert_eq!(over[0].0, "e", "the oldest goes first");
+        assert!(over[0].1.starts_with("presumed lost"));
     }
 
     #[test]
-    fn a_failed_user_frame_with_the_tracker_off_is_a_loss() {
-        // LE finding 2: MINITID_USER_DEPOSIT_ONCE=0 has no claim to release.
+    fn a_failed_user_frame_with_the_tracker_off_is_deferred() {
+        // LE re-check N1: tracker off (Untracked) deposits on every request, so the
+        // turn's next request writes the prompt: deferred (released=), not lost.
         let tracker = Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY));
         let (released, lost) = (AtomicU64::new(0), AtomicU64::new(0));
         let c = LossCounters { released: &released, lost: &lost };
         let failed: std::io::Result<()> = Err(std::io::Error::other("disk full"));
         assert!(!settle_user_deposit_counted(&tracker, Some(&UserDeposit::Untracked), Some(&failed), &c));
-        assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (0, 1));
+        assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (1, 0));
     }
 
     #[test]
@@ -4823,7 +4982,11 @@ mod tests {
         assert_eq!((shadow.read.as_millis(), shadow.total.as_millis()), (15_000, 15_000));
         assert_eq!(configured_pith_shadow_timeout_ms(None), 15_000);
         assert_eq!(configured_pith_shadow_timeout_ms(Some("x")), 15_000);
-        assert_eq!(configured_pith_shadow_timeout_ms(Some("10")), 1_000, "clamped up");
+        assert_eq!(configured_pith_shadow_timeout_ms(Some("10")), 6_000, "never below the daemon's 5 s wait");
+        assert!(!live.hold_worker && shadow.hold_worker);
+        assert_eq!(configured_pith_shadow_min_interval_ms(None), 30_000);
+        assert_eq!(configured_pith_shadow_min_interval_ms(Some("0")), 0);
+        assert_eq!(configured_pith_shadow_min_interval_ms(Some("99999999")), 3_600_000);
         assert_eq!(configured_pith_shadow_timeout_ms(Some("999999")), 120_000, "clamped down");
         assert_eq!(configured_pith_shadow_timeout_ms(Some(" 30000 ")), 30_000);
     }
@@ -4845,6 +5008,7 @@ mod tests {
             sock: sock.clone(),
             read: std::time::Duration::from_millis(5_000),
             total: std::time::Duration::from_millis(300),
+            hold_worker: false,
         };
         let t = std::time::Instant::now();
         let err = daemon_provider_context("hi".into(), daemon).await.unwrap_err();
@@ -4855,23 +5019,65 @@ mod tests {
     }
 
     #[test]
-    fn one_shadow_pass_at_a_time() {
-        // Other tests' proxy() calls run shadow passes too; wait for a free slot.
-        let slot = (0..500)
-            .find_map(|_| try_shadow_slot().or_else(|| {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                None
-            }))
-            .expect("the slot frees");
-        assert!(try_shadow_slot().is_none(), "a second pass is refused while one runs");
+    fn one_shadow_pass_at_a_time_and_spaced() {
+        let gate: &'static ShadowGate = Box::leak(Box::new(ShadowGate::new()));
+        let slot = gate.try_start(1_000, 0).expect("free");
+        assert!(gate.try_start(1_001, 0).err().unwrap().starts_with("in flight"));
         drop(slot);
-        assert!(
-            (0..500).any(|_| try_shadow_slot().map(drop).is_some() || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                false
-            }),
-            "dropping the slot frees it"
-        );
+        assert!(gate.try_start(1_002, 0).is_ok(), "dropping the slot frees it (spacing 0)");
+        let gate2: &'static ShadowGate = Box::leak(Box::new(ShadowGate::new()));
+        drop(gate2.try_start(10_000, 30_000).expect("first start"));
+        assert!(gate2.try_start(39_999, 30_000).err().unwrap().starts_with("spacing"));
+        assert!(gate2.try_start(40_000, 30_000).is_ok(), "the interval has passed");
+    }
+
+    #[tokio::test]
+    async fn shadow_returns_at_once_and_holds_the_slot_until_the_worker_ends() {
+        // LE re-check N4/N7: with a daemon that accepts and never answers, shadow
+        // returns immediately; the slot stays held past miniTID's own timeout
+        // until the socket worker ends; a request meanwhile is skipped.
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("minitid_shadow_hold_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("d.sock").to_str().unwrap().to_string();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let hold = std::thread::spawn(move || {
+            let held = listener.accept().map(|(s, _)| s);
+            std::thread::sleep(std::time::Duration::from_millis(900));
+            drop(held);
+        });
+        let state = Arc::new(AppState {
+            client: Client::builder().build().unwrap(),
+            sessions: Mutex::new(SessionStore::new(DEFAULT_SESSION_CAPACITY)),
+            user_deposits: Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY)),
+            upstream_fallback: "http://127.0.0.1:9".to_string(),
+        });
+        let gate: &'static ShadowGate = Box::leak(Box::new(ShadowGate::new()));
+        let daemon = PithDaemon {
+            sock,
+            read: std::time::Duration::from_millis(5_000),
+            total: std::time::Duration::from_millis(200),
+            hold_worker: true,
+        };
+        let tract = dir.join("t.tract").to_str().unwrap().to_string();
+        let inbound = axum::body::Bytes::from(serde_json::to_vec(&body("hold", history_then_live_turn(1))).unwrap());
+        let t = std::time::Instant::now();
+        shadow_pith_with(Arc::clone(&state), inbound.clone(), headers(None), daemon.clone(), tract.clone(), gate, 0, 1);
+        assert!(t.elapsed() < std::time::Duration::from_millis(50), "shadow never waits: {:?}", t.elapsed());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await; // past the 200 ms timeout
+        assert!(gate.in_flight.load(Ordering::Acquire), "held while the worker still waits on the daemon");
+        shadow_pith_with(Arc::clone(&state), inbound, headers(None), daemon, tract, gate, 0, 2);
+        assert_eq!(gate.skipped.load(Ordering::Relaxed), 1, "a request meanwhile is skipped");
+        hold.join().unwrap();
+        for _ in 0..200 {
+            if !gate.in_flight.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!gate.in_flight.load(Ordering::Acquire), "freed once the worker ended");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
