@@ -38,6 +38,12 @@
 //       names which counter each path bumps; F4 the e2e test clears the two Card 9 switches, not the dead
 //       MINITID_PITH_PENINSULA; F5 deposit_turn_at takes its loss counter (exact test counts); F6 review
 //       dir/file modes enforced on pre-existing paths too. 102 passed, 0 failed (x3).
+//       Grok 4.7 cross-family review of c2779bc (PASS-WITH-NOTES) folded: G1 a release that cannot undo its
+//       claim (a newer claim holds the key, or the tracker lock is poisoned) is a LOST prompt, not deferred
+//       -- release() reports whether it undid the claim and account_release() books it on released= or
+//       turn_deposits_lost=; G3 loss counters injectable (LossCounters, await_accumulator) with exact
+//       tests, incl. real panicked/cancelled accumulators; G5 the e2e test also clears
+//       MINITID_PENINSULA_SOCK. G2/G4 were already fixed by LE F2/F6. 103 passed, 0 failed (x3).
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7b:
 //   a turn miniTID read but could not deposit is counted and named
 //   (#717, #719)
@@ -1722,6 +1728,25 @@ fn review_record(
     })
 }
 
+/// #717 path 1 (Card 9 merge): await the response accumulator.  A panicked or
+/// cancelled accumulator leaves no answer to deposit; on a /v1/messages request
+/// that answer is one lost turn, counted on `lost`.  Other requests carry none.
+async fn await_accumulator(
+    task: tokio::task::JoinHandle<Vec<u8>>,
+    is_messages: bool,
+    lost: &AtomicU64,
+) -> Option<Vec<u8>> {
+    match task.await {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            if is_messages {
+                lost.fetch_add(1, Ordering::Relaxed);
+            }
+            None
+        }
+    }
+}
+
 /// Card 9: the bytes proxy() forwards.  Pith's composed request only when the
 /// zero-replay switch is on AND Pith composed one; otherwise the original
 /// inbound bytes, byte-for-byte (shadow mode, and every Pith failure).
@@ -1988,31 +2013,35 @@ fn settle_user_deposit(
     decision: Option<&UserDeposit>,
     user_result: Option<&std::io::Result<()>>,
 ) -> bool {
+    settle_user_deposit_counted(tracker, decision, user_result, &GLOBAL_LOSS)
+}
+
+fn settle_user_deposit_counted(
+    tracker: &Mutex<UserDepositTracker>,
+    decision: Option<&UserDeposit>,
+    user_result: Option<&std::io::Result<()>>,
+    counters: &LossCounters,
+) -> bool {
     let Some(Err(e)) = user_result else {
         return false;
     };
     let (who, released) = match decision {
         Some(d @ UserDeposit::Deposit(DepositClaim::Session { key, .. })) => {
-            release_user_deposit(tracker, d);
-            (format!("session={key}"), true)
+            (format!("session={key}"), release_user_deposit(tracker, d))
         }
-        Some(d @ UserDeposit::Deposit(DepositClaim::Recent { digest, .. })) => {
-            release_user_deposit(tracker, d);
-            (format!("recent text_sha256={}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>()), true)
-        }
-        _ => {
-            // Nothing to release: this request's prompt is lost unless the turn sends another (LE finding 2).
-            TURN_DEPOSITS_LOST.fetch_add(1, Ordering::Relaxed);
-            ("untracked (MINITID_USER_DEPOSIT_ONCE=0)".to_string(), false)
-        }
+        Some(d @ UserDeposit::Deposit(DepositClaim::Recent { digest, .. })) => (
+            format!("recent text_sha256={}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            release_user_deposit(tracker, d),
+        ),
+        // Nothing to release (tracker off): lost unless the turn sends another (LE finding 2).
+        _ => ("untracked (MINITID_USER_DEPOSIT_ONCE=0)".to_string(), false),
     };
-    if released {
-        USER_CLAIMS_RELEASED.fetch_add(1, Ordering::Relaxed); // Card 9 merge: named on the counts line
-    }
+    // Card 9: undone = deferred (released=); not undone = lost (turn_deposits_lost=), Grok finding 1.
+    account_release(released, counters);
     let next = if released {
         "claim RELEASED: the next request of this turn deposits the prompt"
     } else {
-        "nothing to release: the next request deposits the prompt anyway"
+        "NOT released (no claim, a newer claim, or a poisoned lock): counted as a lost turn"
     };
     eprintln!("<3>miniTID deposit ERROR: user frame NOT written ({who}): {e}; {next}");
     released
@@ -2234,7 +2263,10 @@ impl UserDepositTracker {
     /// the entry still carries THIS claim's id: a same-turn request in between
     /// (which only touches count / last seen) does not block the release, and a
     /// newer claim is never undone.
-    fn release(&mut self, claim: &DepositClaim) {
+    /// Returns true when THIS claim was undone (the prompt will be re-deposited
+    /// by the turn's next request); false when a newer claim already holds the
+    /// entry, i.e. the turn moved on and this prompt is lost (Grok finding 1).
+    fn release(&mut self, claim: &DepositClaim) -> bool {
         match claim {
             DepositClaim::Session { key, prev, id } => {
                 if let Some(released) = self.sessions.get(key).filter(|m| m.claim == *id).map(|m| m.marker) {
@@ -2254,6 +2286,9 @@ impl UserDepositTracker {
                             self.sessions.remove(key);
                         }
                     }
+                    true
+                } else {
+                    false
                 }
             }
             DepositClaim::Recent { digest, prev, id } => {
@@ -2266,6 +2301,9 @@ impl UserDepositTracker {
                             self.recent.remove(digest);
                         }
                     }
+                    true
+                } else {
+                    false
                 }
             }
         }
@@ -2336,19 +2374,43 @@ impl Drop for UserDepositGuard {
     fn drop(&mut self) {
         if let Some(decision) = self.decision.take() {
             if matches!(decision, UserDeposit::Deposit(_)) {
-                release_user_deposit(&self.state.user_deposits, &decision);
-                USER_CLAIMS_RELEASED.fetch_add(1, Ordering::Relaxed); // Card 9 merge: named on the counts line
-                eprintln!("miniTID deposit: user=released via=no_deposit");
+                let restored = release_user_deposit(&self.state.user_deposits, &decision);
+                account_release(restored, &GLOBAL_LOSS); // Card 9: released= or turn_deposits_lost=
+                if restored {
+                    eprintln!("miniTID deposit: user=released via=no_deposit");
+                } else {
+                    eprintln!("<3>miniTID deposit ERROR: user=lost via=no_deposit (a newer claim holds the session, or the tracker lock is poisoned)");
+                }
             }
         }
     }
 }
 
-fn release_user_deposit(tracker: &Mutex<UserDepositTracker>, decision: &UserDeposit) {
-    if let UserDeposit::Deposit(claim) = decision {
-        if let Ok(mut t) = tracker.lock() {
-            t.release(claim);
-        }
+/// True when the claim was undone; false for a newer claim, a poisoned lock,
+/// or a decision that held no claim (the prompt will NOT be re-deposited).
+fn release_user_deposit(tracker: &Mutex<UserDepositTracker>, decision: &UserDeposit) -> bool {
+    match decision {
+        UserDeposit::Deposit(claim) => tracker.lock().map(|mut t| t.release(claim)).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Card 9: the loss counters a release is accounted on (injectable for exact tests).
+struct LossCounters<'a> {
+    released: &'a AtomicU64,
+    lost: &'a AtomicU64,
+}
+
+const GLOBAL_LOSS: LossCounters<'static> =
+    LossCounters { released: &USER_CLAIMS_RELEASED, lost: &TURN_DEPOSITS_LOST };
+
+/// A prompt whose deposit did not happen: deferred if its claim was undone,
+/// otherwise lost (newer claim, poisoned lock, or no claim at all).
+fn account_release(restored: bool, counters: &LossCounters) {
+    if restored {
+        counters.released.fetch_add(1, Ordering::Relaxed);
+    } else {
+        counters.lost.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2737,17 +2799,10 @@ async fn proxy(
     });
 
     tokio::spawn(async move {
-        let accumulated = match accumulator_task.await {
-            Ok(bytes) => bytes,
-            // task panicked -- nothing to deposit, never crash the proxy;
-            // #1173: the guard (moved in here) releases the claim as it drops.
-            // #717 path 1 (Card 9 merge): the answer is lost; on a turn it is counted.
-            Err(_) => {
-                if is_messages {
-                    TURN_DEPOSITS_LOST.fetch_add(1, Ordering::Relaxed);
-                }
-                return;
-            }
+        // task panicked or was cancelled -- nothing to deposit, never crash the proxy;
+        // #1173: the guard (moved in here) releases the claim as it drops.
+        let Some(accumulated) = await_accumulator(accumulator_task, is_messages, &TURN_DEPOSITS_LOST).await else {
+            return;
         };
         let assistant_text = reconstruct_assistant_text(&accumulated);
         let user_deposit = user_deposit.take();
@@ -4496,15 +4551,54 @@ mod tests {
         let tracker = Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY));
         let decision = tracker.lock().unwrap().claim_session("k".into(), [7u8; 32], 1);
         assert!(matches!(decision, UserDeposit::Deposit(_)));
-        let before = USER_CLAIMS_RELEASED.load(Ordering::Relaxed);
+        let (released, lost) = (AtomicU64::new(0), AtomicU64::new(0));
+        let c = LossCounters { released: &released, lost: &lost };
         let failed: std::io::Result<()> = Err(std::io::Error::other("disk full"));
-        assert!(settle_user_deposit(&tracker, Some(&decision), Some(&failed)));
-        assert!(USER_CLAIMS_RELEASED.load(Ordering::Relaxed) >= before + 1);
+        assert!(settle_user_deposit_counted(&tracker, Some(&decision), Some(&failed), &c));
+        assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (1, 0));
         // The released key deposits again on its next request.
         let again = tracker.lock().unwrap().claim_session("k".into(), [7u8; 32], 1);
         assert!(matches!(again, UserDeposit::Deposit(_)), "released, so the prompt is not lost");
         // A written frame releases nothing.
-        assert!(!settle_user_deposit(&tracker, Some(&again), Some(&Ok(()))));
+        assert!(!settle_user_deposit_counted(&tracker, Some(&again), Some(&Ok(())), &c));
+        assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (1, 0));
+        // Grok finding 1: a release that cannot undo its claim (a newer claim holds
+        // the key) is a lost prompt, not a deferred one.
+        let newer = tracker.lock().unwrap().claim_session("k".into(), [8u8; 32], 2);
+        assert!(matches!(newer, UserDeposit::Deposit(_)));
+        assert!(!settle_user_deposit_counted(&tracker, Some(&again), Some(&failed), &c));
+        assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (1, 1));
+        // A poisoned tracker lock cannot undo anything either.
+        let poisoned = Mutex::new(UserDepositTracker::new(1));
+        let d = poisoned.lock().unwrap().claim_session("p".into(), [1u8; 32], 1);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = poisoned.lock().unwrap();
+            panic!("poison");
+        }));
+        assert!(!settle_user_deposit_counted(&poisoned, Some(&d), Some(&failed), &c));
+        assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_dead_accumulator_on_a_turn_is_one_lost_answer() {
+        // #717 path 1 through the helper proxy() uses, with real JoinErrors.
+        let lost = AtomicU64::new(0);
+        let panicked = tokio::spawn(async { panic!("accumulator panicked") });
+        assert!(await_accumulator(panicked, true, &lost).await.is_none());
+        assert_eq!(lost.load(Ordering::Relaxed), 1, "panic");
+        let cancelled = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Vec::new()
+        });
+        cancelled.abort();
+        assert!(await_accumulator(cancelled, true, &lost).await.is_none());
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "cancellation");
+        let not_a_turn = tokio::spawn(async { panic!("accumulator panicked") });
+        assert!(await_accumulator(not_a_turn, false, &lost).await.is_none());
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "a non-/v1/messages request carries no turn");
+        let finished = tokio::spawn(async { b"ok".to_vec() });
+        assert_eq!(await_accumulator(finished, true, &lost).await.as_deref(), Some(&b"ok"[..]));
+        assert_eq!(lost.load(Ordering::Relaxed), 2, "a finished accumulator is not a loss");
     }
 
     #[test]
@@ -4517,12 +4611,12 @@ mod tests {
         let turn2 = [2u8; 32];
         // Same turn: release, then the retry re-deposits it.
         let first = t.claim_session("a".into(), turn1, 1);
-        if let UserDeposit::Deposit(c) = &first { t.release(c) } else { panic!("{first:?}") }
+        if let UserDeposit::Deposit(c) = &first { assert!(t.release(c)) } else { panic!("{first:?}") }
         assert!(matches!(t.claim_session("a".into(), turn1, 1), UserDeposit::Deposit(_)));
         assert_eq!(t.take_settled_lost(), 0, "re-deposited by the same turn");
         // New turn first: the released prompt is lost.
         let next = t.claim_session("b".into(), turn1, 1);
-        if let UserDeposit::Deposit(c) = &next { t.release(c) } else { panic!("{next:?}") }
+        if let UserDeposit::Deposit(c) = &next { assert!(t.release(c)) } else { panic!("{next:?}") }
         assert!(matches!(t.claim_session("b".into(), turn2, 2), UserDeposit::Deposit(_)));
         assert_eq!(t.take_settled_lost(), 1, "the turn moved on");
         assert_eq!(t.take_settled_lost(), 0, "taken once");
@@ -4532,7 +4626,7 @@ mod tests {
         assert!(matches!(only, UserDeposit::Deposit(DepositClaim::Session { prev: None, .. })));
         // A key with a prior mark, released, then pushed out by another key.
         let again = small.claim_session("c".into(), turn2, 2);
-        if let UserDeposit::Deposit(c) = &again { small.release(c) } else { panic!("{again:?}") }
+        if let UserDeposit::Deposit(c) = &again { assert!(small.release(c)) } else { panic!("{again:?}") }
         small.claim_session("d".into(), turn1, 1);
         assert_eq!(small.take_settled_lost(), 1, "evicted before re-deposit");
     }
@@ -4541,10 +4635,11 @@ mod tests {
     fn a_failed_user_frame_with_the_tracker_off_is_a_loss() {
         // LE finding 2: MINITID_USER_DEPOSIT_ONCE=0 has no claim to release.
         let tracker = Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY));
-        let before = TURN_DEPOSITS_LOST.load(Ordering::Relaxed);
+        let (released, lost) = (AtomicU64::new(0), AtomicU64::new(0));
+        let c = LossCounters { released: &released, lost: &lost };
         let failed: std::io::Result<()> = Err(std::io::Error::other("disk full"));
-        assert!(!settle_user_deposit(&tracker, Some(&UserDeposit::Untracked), Some(&failed)));
-        assert!(TURN_DEPOSITS_LOST.load(Ordering::Relaxed) >= before + 1);
+        assert!(!settle_user_deposit_counted(&tracker, Some(&UserDeposit::Untracked), Some(&failed), &c));
+        assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (0, 1));
     }
 
     #[test]
@@ -5177,6 +5272,7 @@ mod tests {
         std::env::set_var("CC_GATEWAY_TRACT_PATH", &tract);
         std::env::remove_var("MINITID_PITH_ZERO_REPLAY"); // Card 9 switches: a developer shell must not change this test
         std::env::remove_var("MINITID_PITH_REVIEW_DIR");
+        std::env::remove_var("MINITID_PENINSULA_SOCK"); // HOME is the temp dir: no daemon socket there
         std::env::remove_var("MINITID_USER_DEPOSIT_ONCE");
         let upstream_file = dir.join(".config/minitid/upstream");
 
