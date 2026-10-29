@@ -1,4 +1,34 @@
 // ---- Changelog ----
+// [2026-10-29] DudeMan CC (Claude Opus 5.5, laptop) — Card 9 (zero-replay switch) + #433 review
+//   retention, on the checked card stack (7fbbe83) merged with the deployed line (be77994, #1173/#1185)
+// What: (1) MERGE: the card stack (Cards 2/7/7b, counts line) and the deployed durable-deposit line had
+//       diverged at 7cb779c (#1200). Kept both: #1176/#1185/#1189 locked durable appends + torn-tail repair;
+//       #1173 once-per-human-turn user deposit with claim/release; #714 Pith-failure deposits + loss
+//       counters. ONE RULE CHANGED, for review: #1173's claim/release supersedes Card 7b's
+//       UndepositedTurn drop-guard. A request that ends before its deposit (send failed, client gone,
+//       accumulator died) or a user frame that fails to write RELEASES the claim, so the next request of
+//       the same human turn deposits the prompt: that is not a lost turn, so it is no longer counted on
+//       turn_deposits_lost; it is counted on the new `released=` counts-line field (USER_CLAIMS_RELEASED),
+//       keeping #719 "never silent". Definite losses still count on turn_deposits_lost: an assistant frame
+//       that cannot be written (#1173 only logged it) and a dead accumulator on a /v1/messages request
+//       (#717 path 1). (2) CARD 9: MINITID_PITH_ZERO_REPLAY (LAW 5), OFF unless exactly "1". Off = shadow:
+//       Pith runs on every request (counts line + review records show what it composed or why it failed)
+//       but the ORIGINAL bytes are forwarded byte-for-byte (select_forwarded). "1" = live swap: Pith's
+//       composition forwarded when it composed one; any failure forwards the original (P309(1)). The
+//       deployed build's MINITID_PITH_PENINSULA is not read (it was removed in 951f360). (3) #433
+//       RETENTION (Josh 2026-10-29): MINITID_PITH_REVIEW_DIR (LAW 5), unset = off. Set = one JSON line per
+//       /v1/messages request in <dir>/pith-review-YYYYMMDD.jsonl (UTC): ts, mode, path, stripped,
+//       session_sha256 (digest only), msgs_in, failure {what, why}, composed_messages (verbatim, or null).
+//       Dir 0700, files 0600, one process lock per write, written off the response path; a record that
+//       cannot be written counts on `review_lost=`. Nothing sends a record anywhere. (4) Counts line
+//       gains `mode= pith_bytes= released= review_lost=` (appended; existing fields unchanged).
+// Why:  Josh 2026-10-29: Pith stays off until the prompts it builds are good, and "we want to see what it's
+//       trying to output, good, bad, and indifferent". The deployed binary passed through only because
+//       composition failed (#1200: replace-mode flag on, ~1,000 discarded contexts a day, no reason logged).
+// How:  merge with the six minitid.rs conflicts resolved as above; Card 7b's three tests for the removed
+//       guard/helper replaced by tests of the merged rule; #1173's end-to-end test now counts turn frames
+//       apart from the raw Pith-failure frames the stack deposits on the same tract. cargo test --features
+//       minitid --bin minitid: 100 passed, 0 failed (x3). Not deployed; the live swap is Josh's go.
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7b:
 //   a turn miniTID read but could not deposit is counted and named
 //   (#717, #719)
@@ -454,6 +484,56 @@
 //       reach the proxied response. CC_GATEWAY_TRACT_PATH (LAW 5) is read
 //       independently here and by the Python drain side (cc_ng_organism.py), same
 //       default on both. See docs/superpowers/specs/2026-07-04-cc-gateway-turn-deposit-design.md.
+// [2026-10-23] Claude Code (Opus 5.5, laptop) — #1173: the user prompt is deposited ONCE per human turn
+// What: proxy() deposited extract_last_user_message() on EVERY /v1/messages request, and the latest genuine human
+//       prompt is the same on every tool round trip of an agentic turn, so one prompt landed ~N times in turns.tract
+//       (93.9 % of its frames were copies, 5-70 s apart). Now UserDepositTracker decides per request:
+//       (a) a request with session identity (session_key: session_id + x-claude-code-agent-id, so each subagent has
+//           its own key) deposits the user text only when its human turn ADVANCES since the last user deposit for
+//           that key -- the same human_turn_marker and the same advance rule decision_for_request uses for the KISS
+//           gate (marker_advances), kept in a separate store so the gate's own state is untouched (LAW 4);
+//       (b) a request without session identity (or Claude's own compaction request) deposits a text only when the
+//           same text was not seen within MINITID_USER_DEPOSIT_RECENT_WINDOW_S (default 1800 s; a sliding window,
+//           like the backlog collapse's 30-min episode rule).
+//       The assistant text is still deposited on every request (each one is new text; empty ones were and are
+//       skipped). The decision is CLAIMED at request time and held by a UserDepositGuard: every path that does not
+//       write the deposit RELEASES it as the guard drops -- the upstream send fails, axum drops proxy()'s future because
+//       the client went away (law review 2026-10-23 finding 1), or the accumulator task dies -- so a retried request
+//       still deposits the prompt: nothing is lost (LAW 7). A release matches by claim id, so a same-turn request in
+//       between (which only refreshes the count) cannot block it (finding 4).
+//       One stderr line per /v1/messages request: `miniTID deposit: user=<deposited|skipped_same_turn|
+//       skipped_recent|none> via=<session|recent|off|->`, plus `user=released via=no_deposit` (no text, no ids).
+//       #1176: frames are appended by append_frame_locked (deposit_to_file's open-by-path + O_APPEND + flock(LOCK_EX),
+//       plus a re-check that the path is still the locked inode, re-opening if not), because the CC drain now trims
+//       the tract by renaming the remainder over it while holding that lock (NG cc_ng_organism._drain_trim_head_locked).
+// Why:  #1173 (docs dev-log 2026-10-23_turn-duplication-1173, Josh's approval 2026-10-23 ~19:30). ~90 % of TID
+//       extraction calls since 10-03 were duplicate work and the bind added parallel topology per copy.
+// How:  MINITID_USER_DEPOSIT_ONCE (LAW 5, default on; "0" = the old every-request deposit, a no-rebuild rollback).
+//       After a restart the in-memory marks are empty, so each live session deposits its current prompt once more
+//       (harmless). Tests: test_user_deposit_*.
+// [2026-10-24] Claude Code (Opus 5.5, laptop) — #1173 law review (2026-10-24): a failed user-frame append is no longer silent
+// What: deposit_experience_entry / deposit_turn (now deposit_turn_at) return the write result instead of dropping it.
+//       After the deposit task writes, settle_user_deposit looks at the USER frame's result: on Err it RELEASES the claim
+//       (so the next request of the same human turn deposits the prompt, as the every-request deposit did by accident
+//       before #1173) and logs one ERROR line ("<3>" = journald priority err) naming the session key (a digest, never
+//       text) and the failure. A failed assistant frame (cannot be retried) is logged at ERROR too.
+// Why:  LAW 7 / the silent-deposit-failure pattern: with once-per-turn, an I/O error or 64 inode changes in a row lost
+//       the prompt for the whole turn with nothing logged (law review item 1 rec MEDIUM; Josh 2026-10-24 option A).
+// How:  test_user_deposit_failed_append_releases_the_claim (unwritable path -> Err -> released -> the next round trip
+//       deposits; a good path keeps the claim). The KISS gate (SessionStore, decision_for_request, rewrite) is untouched.
+// [2026-10-25] Claude Code (Opus 5.5, laptop) — #1189: durable turn appends (fdatasync cadence + torn-tail repair)
+// What: append_frame_locked now (a) writes the frame from one buffer (unchanged), (b) fdatasyncs at a bounded cadence:
+//       every NG_TRACT_FSYNC_EVERY_FRAMES frames (default 64) or when NG_TRACT_FSYNC_INTERVAL_MS (default 1000) have
+//       passed since the last sync, so at miniTID's turn rate nearly every frame is synced, (c) on the FIRST append to a
+//       path in this process (a restart, e.g. after a crash) repairs a torn tail under the lock: bytes after the last
+//       whole CRC-valid BTF frame are copied to <tract>.damaged (fsynced) and only then truncated. Never cuts valid
+//       data; no cut when unsure (no valid frame in the last 4 MiB, a '{' JSONL tail, or a size change meanwhile).
+// Why:  Josh 2026-10-24 "Do it, DudeMan" (Stage 1 lane A): tract writers never flushed, so OOM kills / host hangs left
+//       zero-filled pages (Syl's condensate tracts: 162 / 248 regions). Same contract as ng-tract-rs tract_write.rs
+//       (cc-laptop-tract-durable-20261025) and the ng_tract_bridge.py drain (#1189), same .damaged record format.
+// How:  TractDurability (process-wide Mutex<HashMap<path, state>>); repair_torn_tail_locked; fdatasync via libc.
+//       This duplicates ~80 lines of ng-tract-rs tract_write.rs because miniTID links the Condensate vendor ng_tract
+//       crate, not ng-tract-rs; folding miniTID onto the ng-tract-rs rlib (#334 "one writer") is filed with #1189.
 // -------------------
 
 use axum::body::Body;
@@ -568,6 +648,8 @@ struct AppState {
     upstream_fallback: String,
     client: Client,
     sessions: Mutex<SessionStore>,
+    // #1173: last user deposit per session key / recent text (separate from the KISS gate's store).
+    user_deposits: Mutex<UserDepositTracker>,
 }
 
 // Read the live upstream URL from ~/.config/minitid/upstream, falling back to
@@ -721,6 +803,19 @@ fn human_turn_marker(messages: &[Value]) -> Option<([u8; 32], usize)> {
     Some((digest.finalize().into(), count))
 }
 
+/// The ONE human-turn advance rule (#1173 shares it with the KISS gate): a new
+/// latest genuine human text, or the same text with more genuine human
+/// messages visible (a genuine re-sent prompt). A shrinking count with the same
+/// text (history compacted) is not an advance.
+fn marker_advances(
+    prev_marker: &[u8; 32],
+    prev_count: usize,
+    marker: &[u8; 32],
+    count: usize,
+) -> bool {
+    marker != prev_marker || (count > prev_count && marker == prev_marker)
+}
+
 fn decision_for_request(
     session_key: String,
     messages: &[Value],
@@ -747,9 +842,12 @@ fn decision_for_request(
     };
     session.last_access = access;
 
-    let advances = human_marker != session.human_marker
-        || (visible_human_count > session.visible_human_count
-            && human_marker == session.human_marker);
+    let advances = marker_advances(
+        &session.human_marker,
+        session.visible_human_count,
+        &human_marker,
+        visible_human_count,
+    );
     session.visible_human_count = visible_human_count;
     if !advances {
         return Some(session.decision);
@@ -1497,6 +1595,11 @@ fn last_genuine_user_message_index(messages: &[Value]) -> Option<usize> {
 
 fn extract_last_user_message(body_bytes: &[u8]) -> Option<String> {
     let body: Value = serde_json::from_slice(body_bytes).ok()?;
+    last_user_message_of(&body)
+}
+
+/// extract_last_user_message on an already-parsed body (#1173: proxy() parses once).
+fn last_user_message_of(body: &Value) -> Option<String> {
     let messages = body["messages"].as_array()?;
     messages.iter().rev().find_map(genuine_user_text)
 }
@@ -1526,6 +1629,121 @@ fn count_lost_deposit(result: std::io::Result<()>, lost: &AtomicU64) {
     }
 }
 
+/// Card 9 merge (2026-10-29): #1173 user-prompt claims released because the
+/// request ended before its deposit (send failed, client gone, accumulator
+/// died) or the user frame failed to write.  A released claim is not a lost
+/// turn -- the next request of the same human turn deposits the prompt -- but
+/// it is counted and named on the counts line (`released=`), so the #719
+/// "never silent" guarantee holds without counting a re-deposited prompt lost.
+static USER_CLAIMS_RELEASED: AtomicU64 = AtomicU64::new(0);
+
+/// #433 review records that could not be written (counted and named, #560).
+static REVIEW_RECORDS_LOST: AtomicU64 = AtomicU64::new(0);
+
+/// Card 9: MINITID_PITH_ZERO_REPLAY (LAW 5).  "1" forwards Pith's composed
+/// request (zero history replay, the live swap).  Anything else -- unset by
+/// default -- forwards the ORIGINAL request byte-for-byte while Pith still
+/// runs on every request, so the counts line and the review records show
+/// what it would have sent.
+fn pith_zero_replay() -> bool {
+    configured_pith_zero_replay(env::var("MINITID_PITH_ZERO_REPLAY").ok().as_deref())
+}
+
+fn configured_pith_zero_replay(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
+
+/// #433 (Josh 2026-10-29: "Yes to keeping the output for review. We'll keep it
+/// until we decide we don't need it anymore, and delete it. We want to see what
+/// it's trying to output, good, bad, and indifferent."): MINITID_PITH_REVIEW_DIR
+/// (LAW 5).  Unset or blank = no records.  Set = one JSON line per /v1/messages
+/// request in <dir>/pith-review-YYYYMMDD.jsonl (UTC day): every outcome, raw.
+/// Local only: dir 0700, files 0600; nothing here sends a record anywhere.
+fn pith_review_dir() -> Option<String> {
+    configured_pith_review_dir(env::var("MINITID_PITH_REVIEW_DIR").ok().as_deref())
+}
+
+fn configured_pith_review_dir(value: Option<&str>) -> Option<String> {
+    value.map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+/// UTC civil date (YYYYMMDD) for a Unix time, without a date crate
+/// (days-from-civil inverse, Howard Hinnant's algorithm).
+fn utc_yyyymmdd(unix_secs: u64) -> String {
+    let z = (unix_secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}{m:02}{d:02}")
+}
+
+/// The record for one request: what Pith composed (the outgoing `messages`,
+/// verbatim) or why it failed, never the incoming history.
+fn review_record(
+    ts: f64,
+    zero_replay: bool,
+    path: &str,
+    stripped: usize,
+    session: Option<&str>,
+    msgs_in: usize,
+    composed: Option<&[u8]>,
+    failure: Option<&PithFailure>,
+) -> Value {
+    let composed_messages = composed
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+        .map(|mut body| body["messages"].take());
+    serde_json::json!({
+        "ts": ts,
+        "mode": if zero_replay { "live" } else { "shadow" },
+        "path": path,
+        "stripped": stripped,
+        "session_sha256": session.map(|k| {
+            Sha256::digest(k.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()
+        }),
+        "msgs_in": msgs_in,
+        "failure": failure.map(|f| serde_json::json!({"what": f.what, "why": f.why})),
+        "composed_messages": composed_messages,
+    })
+}
+
+/// Card 9: the bytes proxy() forwards.  Pith's composed request only when the
+/// zero-replay switch is on AND Pith composed one; otherwise the original
+/// inbound bytes, byte-for-byte (shadow mode, and every Pith failure).
+fn select_forwarded(
+    composed: Option<&axum::body::Bytes>,
+    original: axum::body::Bytes,
+    zero_replay: bool,
+) -> axum::body::Bytes {
+    match composed {
+        Some(c) if zero_replay => c.clone(),
+        _ => original,
+    }
+}
+
+/// Append one record (one line) under a process-wide lock so concurrent
+/// requests never interleave.  `Err` is counted by the caller.
+fn write_review_record(dir: &str, unix_secs: u64, record: &Value) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    static LOCK: Mutex<()> = Mutex::new(());
+    let mut line = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    let _held = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let path = format!("{dir}/pith-review-{}.jsonl", utc_yyyymmdd(unix_secs));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(&path)?
+        .write_all(&line)
+}
+
 fn deposit_experience_entry(path: &str, source: &str, content: String) -> std::io::Result<()> {
     if content.trim().is_empty() {
         return Ok(());
@@ -1540,7 +1758,174 @@ fn deposit_experience_entry(path: &str, source: &str, content: String) -> std::i
         content: content.into_bytes(),
     };
     let bytes = ng_tract::write::write_experience(&entry);
-    ng_tract::write::deposit_to_file(path, &bytes)
+    append_frame_locked(path, &bytes)
+}
+
+/// #1176 (2026-10-23): append one frame the way ng_tract's deposit_to_file does (open by path with O_APPEND,
+/// flock(LOCK_EX), write all, unlock) PLUS one check after the lock is held: the path must still be the inode we
+/// locked. The CC drain trims the tract's head by renaming the remainder over the tract while it holds this same lock;
+/// a writer that opened the old inode and waited on the lock would otherwise append to the replaced file and the frame
+/// would be lost. On a mismatch: unlock, close, re-open the path. Not a vendored file: miniTID's own write path.
+fn append_frame_locked(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+    for _ in 0..64 {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o664)
+            .open(path)?;
+        let fd = f.as_raw_fd();
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let same = match (f.metadata(), std::fs::metadata(path)) {
+            (Ok(a), Ok(b)) => a.ino() == b.ino() && a.dev() == b.dev(),
+            _ => false,
+        };
+        if !same {
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            continue;
+        }
+        // #1189: the first append to this path in this process repairs a torn tail (under the lock).
+        if tract_durability().first_append(path) {
+            if let Err(e) = repair_torn_tail_locked(&mut f, path) {
+                eprintln!("<4>miniTID: torn-tail check of {path} failed (nothing truncated): {e}");
+            }
+        }
+        let result = f.write_all(data).and_then(|_| {
+            if tract_durability().sync_due(path) {
+                f.sync_data()
+            } else {
+                Ok(())
+            }
+        });
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return result;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "tract path kept changing under the lock",
+    ))
+}
+
+/// #1189: per-path fdatasync cadence + "checked once" state (process-wide).
+struct TractDurability {
+    every: u64,
+    interval: Option<std::time::Duration>,
+    paths: Mutex<HashMap<String, (u64, std::time::Instant, bool)>>, // pending, last_sync, checked
+}
+
+fn tract_durability() -> &'static TractDurability {
+    static D: std::sync::OnceLock<TractDurability> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        let num = |name: &str, default: u64| -> u64 {
+            env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+        };
+        let ms = num("NG_TRACT_FSYNC_INTERVAL_MS", 1000);
+        TractDurability {
+            every: num("NG_TRACT_FSYNC_EVERY_FRAMES", 64),
+            interval: if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) },
+            paths: Mutex::new(HashMap::new()),
+        }
+    })
+}
+
+impl TractDurability {
+    fn first_append(&self, path: &str) -> bool {
+        let mut m = self.paths.lock().unwrap_or_else(|p| p.into_inner());
+        let e = m.entry(path.to_string()).or_insert((0, std::time::Instant::now(), false));
+        let first = !e.2;
+        e.2 = true;
+        first
+    }
+
+    fn sync_due(&self, path: &str) -> bool {
+        let mut m = self.paths.lock().unwrap_or_else(|p| p.into_inner());
+        let e = m.entry(path.to_string()).or_insert((0, std::time::Instant::now(), true));
+        e.0 += 1;
+        let due = (self.every > 0 && e.0 >= self.every)
+            || self.interval.map_or(false, |iv| e.1.elapsed() >= iv);
+        if due {
+            e.0 = 0;
+            e.1 = std::time::Instant::now();
+        }
+        due
+    }
+}
+
+/// A whole CRC-valid BTF frame at buf[i..] (magic "BT", version 1, type 1..3, LE length, payload CRC32): its length.
+fn btf_valid_frame_at(buf: &[u8], i: usize, max_frame: usize) -> Option<usize> {
+    let h = buf.get(i..i + 24)?;
+    if h[0] != 0x42 || h[1] != 0x54 || h[2] != 1 || !(1..=3).contains(&h[3]) {
+        return None;
+    }
+    let total = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
+    if total < 24 || total > max_frame || i + total > buf.len() {
+        return None;
+    }
+    let crc = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
+    (crc32fast::hash(&buf[i + 24..i + total]) == crc).then_some(total)
+}
+
+/// Under the caller's flock: cut a torn tail (bytes after the last whole valid frame), keeping it in <path>.damaged.
+fn repair_torn_tail_locked(f: &mut std::fs::File, path: &str) -> std::io::Result<Option<(u64, u64)>> {
+    use std::io::{Read as _, Seek as _, Write as _};
+    let max_frame = env::var("NG_TRACT_DRAIN_CHUNK_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v >= 24)
+        .unwrap_or(64 * 1024 * 1024);
+    let size = f.metadata()?.len();
+    if size == 0 {
+        return Ok(None);
+    }
+    let win = size.min(4 * 1024 * 1024);
+    let base = size - win;
+    let mut buf = vec![0u8; win as usize];
+    f.seek(std::io::SeekFrom::Start(base))?;
+    f.read_exact(&mut buf)?;
+    let (mut i, mut last) = (0usize, None);
+    while i + 24 <= buf.len() {
+        if let Some(n) = btf_valid_frame_at(&buf, i, max_frame) {
+            i += n;
+            last = Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    let end = match last {
+        Some(e) if e < buf.len() => e,
+        _ => return Ok(None), // clean, or no valid frame to anchor on: not provably torn
+    };
+    if buf[end] == b'{' || f.metadata()?.len() != size {
+        return Ok(None);
+    }
+    let tail = &buf[end..];
+    let cut_at = base + end as u64;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let mut rec = format!(
+        "#ng-tract-damaged v1 offset={cut_at} length={} reason=torn-tail ts={ts:.6}\n",
+        tail.len()
+    )
+    .into_bytes();
+    rec.extend_from_slice(tail);
+    rec.push(b'\n');
+    let mut d = std::fs::OpenOptions::new().append(true).create(true).open(format!("{path}.damaged"))?;
+    d.write_all(&rec)?;
+    d.sync_all()?;
+    f.set_len(cut_at)?;
+    f.sync_data()?;
+    eprintln!(
+        "<4>miniTID: {path}: TORN TAIL repaired: {} byte(s) after the last valid frame (offset {cut_at}) copied to {path}.damaged and truncated",
+        tail.len()
+    );
+    Ok(Some((cut_at, tail.len() as u64)))
 }
 
 /// Deposit both sides of one turn as raw experience (LAW 7) -- no
@@ -1550,72 +1935,282 @@ fn deposit_experience_entry(path: &str, source: &str, content: String) -> std::i
 /// record -- the daemon's own dual-pass chains consecutive conversational
 /// deposits via a delayed synapse regardless of physical turn boundaries.
 /// Fails soft: this must never affect the proxied response to the client.
-/// `Err` when either entry could not be written; the caller counts it.  The
-/// path is a parameter so tests need not mutate process env.
-fn deposit_turn(
+/// Returns the USER frame's write result (None when there was no user text to
+/// write), so the caller can release a claim whose frame never landed (#1173
+/// law review 2026-10-24: a failed append must not silently lose the prompt).
+/// A failed ASSISTANT frame cannot be retried (the next request carries a new
+/// answer); it is logged at ERROR here, never dropped silently (LAW 7).
+fn deposit_turn(user_message: Option<String>, assistant_text: String) -> Option<std::io::Result<()>> {
+    deposit_turn_at(&cc_gateway_tract_path(), user_message, assistant_text)
+}
+
+fn deposit_turn_at(
     path: &str,
     user_message: Option<String>,
     assistant_text: String,
-) -> std::io::Result<()> {
+) -> Option<std::io::Result<()>> {
     if let Some(dir) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(dir)?;
+        let _ = std::fs::create_dir_all(dir);
     }
-    let user = user_message.map_or(Ok(()), |user_text| {
-        deposit_experience_entry(path, "cc_gateway", user_text)
-    });
-    let assistant = deposit_experience_entry(path, "cc_gateway", assistant_text);
-    user.and(assistant)
+    let user_result = user_message.map(|user_text| deposit_experience_entry(path, "cc_gateway", user_text));
+    if let Err(e) = deposit_experience_entry(path, "cc_gateway", assistant_text) {
+        // "<3>": journald's syslog-level prefix (SyslogLevelPrefix=, on by default) -> priority err.
+        eprintln!("<3>miniTID deposit ERROR: assistant frame NOT written to {path}: {e} (this answer is lost from the tract)");
+        TURN_DEPOSITS_LOST.fetch_add(1, Ordering::Relaxed); // Card 9 merge: a definite loss, counted (#714)
+    }
+    user_result
 }
 
-/// Await the response accumulator, then deposit the turn, counting a lost
-/// deposit on `lost`.  A panicked or cancelled accumulator leaves no
-/// response to reconstruct, so nothing of the turn is deposited; on a
-/// /v1/messages request that is one lost turn and is counted (#717).  Other
-/// requests carry no turn, so theirs is not.  The proxied response is never
-/// affected.
-async fn deposit_turn_when_accumulated(
-    accumulator: tokio::task::JoinHandle<Vec<u8>>,
-    path: &str,
-    is_messages: bool,
-    user_message: Option<String>,
-    lost: &AtomicU64,
-) {
-    let accumulated = match accumulator.await {
-        Ok(bytes) => bytes,
-        Err(join_error) => {
-            if is_messages {
-                count_lost_deposit(Err(std::io::Error::other(join_error)), lost);
-            }
+/// #1173 law review 2026-10-24 (LAW 7): after the user frame was attempted, a
+/// failed write must not lose the prompt for the whole turn. Before #1173 the
+/// next tool round trip re-deposited it by accident; with once-per-turn nothing
+/// would. So on Err: release the claim (the next request of this turn deposits
+/// the prompt again) and log one ERROR line naming the session key (a digest,
+/// no text) and the failure. Returns true when a claim was released.
+fn settle_user_deposit(
+    tracker: &Mutex<UserDepositTracker>,
+    decision: Option<&UserDeposit>,
+    user_result: Option<&std::io::Result<()>>,
+) -> bool {
+    let Some(Err(e)) = user_result else {
+        return false;
+    };
+    let (who, released) = match decision {
+        Some(d @ UserDeposit::Deposit(DepositClaim::Session { key, .. })) => {
+            release_user_deposit(tracker, d);
+            (format!("session={key}"), true)
+        }
+        Some(d @ UserDeposit::Deposit(DepositClaim::Recent { digest, .. })) => {
+            release_user_deposit(tracker, d);
+            (format!("recent text_sha256={}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>()), true)
+        }
+        _ => ("untracked (MINITID_USER_DEPOSIT_ONCE=0)".to_string(), false),
+    };
+    if released {
+        USER_CLAIMS_RELEASED.fetch_add(1, Ordering::Relaxed); // Card 9 merge: named on the counts line
+    }
+    let next = if released {
+        "claim RELEASED: the next request of this turn deposits the prompt"
+    } else {
+        "nothing to release: the next request deposits the prompt anyway"
+    };
+    eprintln!("<3>miniTID deposit ERROR: user frame NOT written ({who}): {e}; {next}");
+    released
+}
+
+// ── #1173: the user prompt once per human turn ──────────────────────────────
+
+const DEFAULT_USER_DEPOSIT_RECENT_WINDOW_S: u64 = 1_800;
+const MIN_USER_DEPOSIT_RECENT_WINDOW_S: u64 = 1;
+const MAX_USER_DEPOSIT_RECENT_WINDOW_S: u64 = 86_400;
+
+/// MINITID_USER_DEPOSIT_ONCE (LAW 5): default on. "0" restores the old
+/// behaviour (the user text deposited on every request) without a rebuild.
+fn user_deposit_once() -> bool {
+    configured_user_deposit_once(env::var("MINITID_USER_DEPOSIT_ONCE").ok().as_deref())
+}
+
+fn configured_user_deposit_once(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("0"))
+}
+
+/// MINITID_USER_DEPOSIT_RECENT_WINDOW_S (LAW 5): how long a text seen on a
+/// request WITHOUT session identity suppresses another deposit of the same
+/// text (sliding: every sighting restarts it). Default 1800 s.
+fn user_deposit_recent_window_s() -> u64 {
+    configured_user_deposit_recent_window_s(
+        env::var("MINITID_USER_DEPOSIT_RECENT_WINDOW_S").ok().as_deref(),
+    )
+}
+
+fn configured_user_deposit_recent_window_s(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(MIN_USER_DEPOSIT_RECENT_WINDOW_S, MAX_USER_DEPOSIT_RECENT_WINDOW_S))
+        .unwrap_or(DEFAULT_USER_DEPOSIT_RECENT_WINDOW_S)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DepositMark {
+    marker: [u8; 32],
+    count: usize,
+    last_access: u64,
+    /// The id of the claim that set `marker` (a same-turn request updates count/last_access, never this).
+    claim: u64,
+}
+
+/// What a request does with its user text. A Deposit holds the claim that
+/// must be released if the deposit never happens.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UserDeposit {
+    /// Deposit the user text. `release` undoes the claim when nothing was written.
+    Deposit(DepositClaim),
+    /// Same human turn as the last user deposit for this session key.
+    SkipSameTurn,
+    /// The same text was seen within the recent window (no session identity).
+    SkipRecent,
+    /// The tracker is switched off (MINITID_USER_DEPOSIT_ONCE=0): always deposit.
+    Untracked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DepositClaim {
+    Session { key: String, prev: Option<DepositMark>, id: u64 },
+    Recent { digest: [u8; 32], prev: Option<(u64, u64)>, id: u64 },
+}
+
+/// Per-session (and, for requests without identity, per-text) memory of the
+/// last user deposit. Bounded like SessionStore: least recently used entries
+/// are evicted at `capacity`.
+struct UserDepositTracker {
+    sessions: HashMap<String, DepositMark>,
+    /// digest -> (last seen, id of the claim that last deposited it)
+    recent: HashMap<[u8; 32], (u64, u64)>,
+    access_clock: u64,
+    claim_clock: u64,
+    capacity: usize,
+}
+
+impl UserDepositTracker {
+    fn new(capacity: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            recent: HashMap::new(),
+            access_clock: 0,
+            claim_clock: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn next_access(&mut self) -> u64 {
+        self.access_clock = self.access_clock.saturating_add(1);
+        self.access_clock
+    }
+
+    fn next_claim(&mut self) -> u64 {
+        self.claim_clock = self.claim_clock.saturating_add(1);
+        self.claim_clock
+    }
+
+    fn evict_session_if_full(&mut self) {
+        if self.sessions.len() < self.capacity {
             return;
         }
-    };
-    let assistant_text = reconstruct_assistant_text(&accumulated);
-    count_lost_deposit(deposit_turn(path, user_message, assistant_text), lost);
-}
-
-/// A request's human turn, held from extraction until proxy() hands it to the
-/// turn deposit.  If proxy() ends first -- the upstream send fails (502), an
-/// earlier `?` returns, or the handler future is dropped mid-await because
-/// the client disconnected -- the turn is never deposited, and dropping the
-/// guard counts it on `lost` (#717, #719).  A stopped process runs no Drop
-/// (there is no graceful shutdown), so its in-flight turns are not counted.
-/// Text deposit_turn would not write (none, or whitespace) is not a loss.
-struct UndepositedTurn<'a> {
-    user_message: Option<String>,
-    lost: &'a AtomicU64,
-}
-
-impl UndepositedTurn<'_> {
-    /// Release the turn to the deposit, which counts its own loss from here.
-    fn hand_off(mut self) -> Option<String> {
-        self.user_message.take()
+        let victim = self
+            .sessions
+            .iter()
+            .min_by(|(ka, a), (kb, b)| a.last_access.cmp(&b.last_access).then_with(|| ka.cmp(kb)))
+            .map(|(k, _)| k.clone());
+        if let Some(k) = victim {
+            self.sessions.remove(&k);
+        }
     }
-}
 
-impl Drop for UndepositedTurn<'_> {
-    fn drop(&mut self) {
-        if self.user_message.as_deref().is_some_and(|text| !text.trim().is_empty()) {
-            self.lost.fetch_add(1, Ordering::Relaxed);
+    fn evict_recent_if_full(&mut self) {
+        if self.recent.len() < self.capacity {
+            return;
+        }
+        let victim = self
+            .recent
+            .iter()
+            .min_by(|(ka, a), (kb, b)| a.0.cmp(&b.0).then_with(|| ka.cmp(kb)))
+            .map(|(k, _)| *k);
+        if let Some(k) = victim {
+            self.recent.remove(&k);
+        }
+    }
+
+    /// A request WITH session identity: deposit only when the human turn
+    /// advanced since this key's last user deposit (marker_advances, the KISS
+    /// gate's rule). The first request of an unknown key deposits.
+    fn claim_session(&mut self, key: String, marker: [u8; 32], count: usize) -> UserDeposit {
+        let access = self.next_access();
+        let id = self.next_claim();
+        match self.sessions.get_mut(&key) {
+            Some(mark) => {
+                if !marker_advances(&mark.marker, mark.count, &marker, count) {
+                    // Same turn. Keep the count current so a later genuine
+                    // re-send is measured against what was last visible.
+                    mark.count = count;
+                    mark.last_access = access;
+                    return UserDeposit::SkipSameTurn;
+                }
+                let prev = *mark;
+                *mark = DepositMark { marker, count, last_access: access, claim: id };
+                UserDeposit::Deposit(DepositClaim::Session { key, prev: Some(prev), id })
+            }
+            None => {
+                self.evict_session_if_full();
+                self.sessions
+                    .insert(key.clone(), DepositMark { marker, count, last_access: access, claim: id });
+                UserDeposit::Deposit(DepositClaim::Session { key, prev: None, id })
+            }
+        }
+    }
+
+    /// A request WITHOUT session identity (or Claude's compaction request):
+    /// deposit a text only when it was not seen within `window_s`. Every
+    /// sighting restarts the window, so a burst with gaps shorter than the
+    /// window is one deposit.
+    fn claim_recent(&mut self, text: &str, now: u64, window_s: u64) -> UserDeposit {
+        let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        let id = self.next_claim();
+        match self.recent.get_mut(&digest) {
+            Some(seen) if now.saturating_sub(seen.0) < window_s => {
+                seen.0 = now;
+                UserDeposit::SkipRecent
+            }
+            Some(seen) => {
+                let prev = *seen;
+                *seen = (now, id);
+                UserDeposit::Deposit(DepositClaim::Recent { digest, prev: Some(prev), id })
+            }
+            None => {
+                self.evict_recent_if_full();
+                self.recent.insert(digest, (now, id));
+                UserDeposit::Deposit(DepositClaim::Recent { digest, prev: None, id })
+            }
+        }
+    }
+
+    /// Undo a claim whose deposit never happened, so the next request of the
+    /// same turn deposits the text instead (nothing lost, LAW 7). Only while
+    /// the entry still carries THIS claim's id: a same-turn request in between
+    /// (which only touches count / last seen) does not block the release, and a
+    /// newer claim is never undone.
+    fn release(&mut self, claim: &DepositClaim) {
+        match claim {
+            DepositClaim::Session { key, prev, id } => {
+                if self.sessions.get(key).map(|m| m.claim) == Some(*id) {
+                    match prev {
+                        Some(p) => {
+                            self.sessions.insert(key.clone(), *p);
+                        }
+                        None => {
+                            self.sessions.remove(key);
+                        }
+                    }
+                }
+            }
+            DepositClaim::Recent { digest, prev, id } => {
+                if self.recent.get(digest).map(|r| r.1) == Some(*id) {
+                    match prev {
+                        Some(p) => {
+                            self.recent.insert(*digest, *p);
+                        }
+                        None => {
+                            self.recent.remove(digest);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1629,6 +2224,87 @@ fn deposit_pith_failure(path: &str, failure: &PithFailure) -> std::io::Result<()
         std::fs::create_dir_all(dir)?;
     }
     deposit_experience_entry(path, "cc_gateway", failure.deposit_text())
+}
+
+/// Decide what this /v1/messages request does with its user text. `body` is the
+/// ORIGINAL request (before any rewrite), `user_text` its latest genuine human
+/// text (extract_last_user_message). Never fails: a poisoned lock deposits.
+fn user_deposit_for_request(
+    body: Option<&Value>,
+    headers: &HeaderMap,
+    user_text: &str,
+    tracker: &Mutex<UserDepositTracker>,
+    enabled: bool,
+    now: u64,
+    window_s: u64,
+) -> UserDeposit {
+    if !enabled {
+        return UserDeposit::Untracked;
+    }
+    let Ok(mut t) = tracker.lock() else {
+        return UserDeposit::Untracked;
+    };
+    let messages = body.and_then(|b| b.get("messages")).and_then(Value::as_array);
+    let compaction = headers.contains_key("x-cc-compaction-request")
+        || messages.map(|m| latest_user_role_is_compaction_request(m)).unwrap_or(false);
+    if !compaction {
+        if let (Some(b), Some(m)) = (body, messages) {
+            if let (Some(key), Some((marker, count))) = (session_key(b, headers), human_turn_marker(m)) {
+                return t.claim_session(key, marker, count);
+            }
+        }
+    }
+    t.claim_recent(user_text, now, window_s)
+}
+
+/// Holds a request's user-deposit decision until the deposit is written. Dropped
+/// without `take()` -- the upstream send failed, the client went away and axum
+/// dropped the handler future, or the accumulator task died -- it RELEASES the
+/// claim, so the next request of the same turn deposits the prompt (LAW 7).
+struct UserDepositGuard {
+    state: Arc<AppState>,
+    decision: Option<UserDeposit>,
+}
+
+impl UserDepositGuard {
+    /// Disarm: the deposit is about to be written.
+    fn take(&mut self) -> Option<UserDeposit> {
+        self.decision.take()
+    }
+}
+
+impl Drop for UserDepositGuard {
+    fn drop(&mut self) {
+        if let Some(decision) = self.decision.take() {
+            if matches!(decision, UserDeposit::Deposit(_)) {
+                release_user_deposit(&self.state.user_deposits, &decision);
+                USER_CLAIMS_RELEASED.fetch_add(1, Ordering::Relaxed); // Card 9 merge: named on the counts line
+                eprintln!("miniTID deposit: user=released via=no_deposit");
+            }
+        }
+    }
+}
+
+fn release_user_deposit(tracker: &Mutex<UserDepositTracker>, decision: &UserDeposit) {
+    if let UserDeposit::Deposit(claim) = decision {
+        if let Ok(mut t) = tracker.lock() {
+            t.release(claim);
+        }
+    }
+}
+
+fn user_deposit_label(decision: &UserDeposit) -> (&'static str, &'static str) {
+    match decision {
+        UserDeposit::Deposit(DepositClaim::Session { .. }) => ("deposited", "session"),
+        UserDeposit::Deposit(DepositClaim::Recent { .. }) => ("deposited", "recent"),
+        UserDeposit::SkipSameTurn => ("skipped_same_turn", "session"),
+        UserDeposit::SkipRecent => ("skipped_recent", "recent"),
+        UserDeposit::Untracked => ("deposited", "off"),
+    }
+}
+
+fn user_deposit_writes(decision: &UserDeposit) -> bool {
+    matches!(decision, UserDeposit::Deposit(_) | UserDeposit::Untracked)
 }
 
 /// Reconstruct the assistant's full generated text from accumulated SSE
@@ -1827,27 +2503,60 @@ async fn proxy(
 
     // Extract the latest genuine user message from the original bytes, before any
     // rewrite. Trailing user-role entries may be tool results or injected harness context.
-    // Until it is handed to the deposit, any exit from proxy() counts it lost.
-    let pending_turn = UndepositedTurn {
-        user_message: if is_messages {
-            extract_last_user_message(&body_bytes)
-        } else {
-            None
-        },
-        lost: &TURN_DEPOSITS_LOST,
+    // #1173: parsed once here; the same original body feeds the deposit decision.
+    let original: Option<Value> = if is_messages {
+        serde_json::from_slice(&body_bytes).ok()
+    } else {
+        None
     };
+    let last_user_message = original.as_ref().and_then(last_user_message_of);
+    // #1173: decide (and claim) the user-text deposit from the ORIGINAL request,
+    // before any rewrite. Released below when no deposit happens.
+    let user_deposit = match &last_user_message {
+        Some(text) => {
+            Some(user_deposit_for_request(
+                original.as_ref(),
+                &headers,
+                text,
+                &state.user_deposits,
+                user_deposit_once(),
+                now_secs(),
+                user_deposit_recent_window_s(),
+            ))
+        }
+        None => None,
+    };
+    drop(original); // #1173: the decision is made; do not hold the parsed body across the upstream call
+    // #1173: from here every path that does not write the deposit releases the claim (the guard's Drop),
+    // including axum dropping this future when the client goes away mid-request.
+    let mut user_deposit = UserDepositGuard { state: Arc::clone(&state), decision: user_deposit };
+    let deposit_state = Arc::clone(&state); // #1173: settle_user_deposit releases through it after a failed append
 
-    // Every /v1/messages request goes through Pith; there is no off switch.
+    // Every /v1/messages request goes through Pith.  Card 9: what is FORWARDED
+    // is the zero-replay switch's call (pith_zero_replay): on, Pith's composed
+    // request; off (the default), the original bytes, byte-for-byte, with Pith
+    // still run so its output is counted and, under #433, kept for review.
     // Claude's native summary request is the one deliberate exemption: it
     // reaches the provider byte-for-byte and consumes no human-turn gate
     // decision.  A Pith failure is deposited raw off the response path, and
-    // the per-request counts line is built and written off it too.
+    // the per-request counts line and review record are built off it too.
     let body_bytes = if is_messages {
+        let zero_replay = pith_zero_replay();
         let rewrite =
             rewrite_request_body(&body_bytes, &headers, &state.sessions, peninsula_sock_path())
                 .await;
         let path = request_path_class(&rewrite);
         let stripped = rewrite.stripped;
+        let review_dir = pith_review_dir();
+        let review_session = review_dir.as_ref().and_then(|_| {
+            serde_json::from_slice::<Value>(&body_bytes)
+                .ok()
+                .and_then(|b| session_key(&b, &headers))
+        });
+        let failure_for_review = rewrite
+            .failure
+            .as_ref()
+            .map(|f| PithFailure::new(f.what, f.why.clone()));
         if let Some(failure) = rewrite.failure {
             tokio::spawn(async move {
                 count_lost_deposit(
@@ -1857,16 +2566,46 @@ async fn proxy(
             });
         }
         let original = body_bytes.clone();
-        let forwarded: axum::body::Bytes = rewrite.body.map(Into::into).unwrap_or(body_bytes);
+        let composed: Option<axum::body::Bytes> = rewrite.body.map(Into::into);
+        let pith_bytes = composed.as_ref().map_or(0, |c| c.len());
+        let forwarded = select_forwarded(composed.as_ref(), body_bytes, zero_replay);
         let counted = forwarded.clone();
         tokio::spawn(async move {
             let deposits_lost = (
                 FAILURE_DEPOSITS_LOST.load(Ordering::Relaxed),
                 TURN_DEPOSITS_LOST.load(Ordering::Relaxed),
             );
+            if let Some(dir) = review_dir {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let msgs_in = serde_json::from_slice::<Value>(&original)
+                    .ok()
+                    .and_then(|b| b["messages"].as_array().map(Vec::len))
+                    .unwrap_or(0);
+                let record = review_record(
+                    now.as_secs_f64(),
+                    zero_replay,
+                    path,
+                    stripped,
+                    review_session.as_deref(),
+                    msgs_in,
+                    composed.as_deref(),
+                    failure_for_review.as_ref(),
+                );
+                let written = tokio::task::spawn_blocking(move || {
+                    write_review_record(&dir, now.as_secs(), &record)
+                })
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+                count_lost_deposit(written, &REVIEW_RECORDS_LOST);
+            }
             eprintln!(
-                "{}",
-                request_counts_line(path, stripped, &original, &counted, deposits_lost)
+                "{} mode={} pith_bytes={pith_bytes} released={} review_lost={}",
+                request_counts_line(path, stripped, &original, &counted, deposits_lost),
+                if zero_replay { "live" } else { "shadow" },
+                USER_CLAIMS_RELEASED.load(Ordering::Relaxed),
+                REVIEW_RECORDS_LOST.load(Ordering::Relaxed),
             );
         });
         forwarded
@@ -1894,6 +2633,7 @@ async fn proxy(
     }
     rb = rb.body(body_bytes.to_vec());
 
+    // #1173: a send error returns here; the guard releases the claim as it drops.
     let upstream_resp = rb
         .send()
         .await
@@ -1931,16 +2671,35 @@ async fn proxy(
         accumulated
     });
 
-    let last_user_message = pending_turn.hand_off();
     tokio::spawn(async move {
-        deposit_turn_when_accumulated(
-            accumulator_task,
-            &cc_gateway_tract_path(),
-            is_messages,
-            last_user_message,
-            &TURN_DEPOSITS_LOST,
-        )
-        .await;
+        let accumulated = match accumulator_task.await {
+            Ok(bytes) => bytes,
+            // task panicked -- nothing to deposit, never crash the proxy;
+            // #1173: the guard (moved in here) releases the claim as it drops.
+            // #717 path 1 (Card 9 merge): the answer is lost; on a turn it is counted.
+            Err(_) => {
+                if is_messages {
+                    TURN_DEPOSITS_LOST.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+        };
+        let assistant_text = reconstruct_assistant_text(&accumulated);
+        let user_deposit = user_deposit.take();
+        let (user_label, via) = match &user_deposit {
+            Some(decision) => user_deposit_label(decision),
+            None => ("none", "-"),
+        };
+        let user_text = match &user_deposit {
+            Some(decision) if user_deposit_writes(decision) => last_user_message,
+            _ => None,
+        };
+        if is_messages {
+            eprintln!("miniTID deposit: user={user_label} via={via}");
+        }
+        let user_result = deposit_turn(user_text, assistant_text);
+        // #1173 law review 2026-10-24: a failed user-frame append releases the claim and logs at ERROR.
+        settle_user_deposit(&deposit_state.user_deposits, user_deposit.as_ref(), user_result.as_ref());
     });
 
     let out_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -1967,6 +2726,7 @@ async fn main() {
     let state = Arc::new(AppState {
         client: Client::builder().build().expect("reqwest client"),
         sessions: Mutex::new(SessionStore::new(session_capacity())),
+        user_deposits: Mutex::new(UserDepositTracker::new(session_capacity())),
         upstream_fallback: upstream.clone(),
     });
 
@@ -3630,9 +4390,13 @@ mod tests {
     }
 
     #[test]
-    fn unwritable_turn_deposit_is_counted_once_and_named() {
-        // #714: the turn path's own counter.  A turn is one loss however many
-        // of its two entries failed, and an empty turn writes nothing.
+    fn unwritable_turn_frames_are_named_and_the_assistant_loss_counted() {
+        // Card 9 merge (#714 + #1173): a user frame that cannot be written is
+        // returned to the caller (settle_user_deposit releases its claim, so the
+        // prompt is re-deposited -- not a loss); an assistant frame that cannot
+        // be written is a definite loss and counts on TURN_DEPOSITS_LOST.  The
+        // counter is process-wide (other tests run in parallel), so this checks
+        // that it rose by at least the two losses made here.
         let dir = std::env::temp_dir().join(format!("minitid_lost_turn_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3642,96 +4406,142 @@ mod tests {
         let tract_is_dir = dir.join("turns.tract");
         std::fs::create_dir_all(&tract_is_dir).unwrap();
 
-        let lost = AtomicU64::new(0);
+        let before = TURN_DEPOSITS_LOST.load(Ordering::Relaxed);
         for path in [&no_dir, &tract_is_dir] {
-            let result = deposit_turn(
+            let user = deposit_turn_at(
                 path.to_str().unwrap(),
                 Some("a human turn".to_string()),
                 "an assistant reply".to_string(),
             );
-            assert!(result.is_err(), "{}", path.display());
-            count_lost_deposit(result, &lost);
+            assert!(matches!(user, Some(Err(_))), "{}", path.display());
         }
-        assert_eq!(lost.load(Ordering::Relaxed), 2);
-        let line = request_counts_line("pith", 0, b"not json", b"not json", (0, 2));
-        assert!(line.ends_with(" failure_deposits_lost=0 turn_deposits_lost=2"), "{line}");
+        assert!(TURN_DEPOSITS_LOST.load(Ordering::Relaxed) >= before + 2);
 
-        let empty = deposit_turn(tract_is_dir.to_str().unwrap(), None, "  ".to_string());
-        count_lost_deposit(empty, &lost);
-        assert_eq!(lost.load(Ordering::Relaxed), 2, "nothing to write is not a loss");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn failed_accumulator_is_counted_as_one_lost_turn() {
-        // #717 path (1): a panicked or cancelled accumulator used to return
-        // uncounted.  Drives the helper proxy() spawns, with real JoinErrors.
-        let dir = std::env::temp_dir().join(format!("minitid_lost_accum_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let tract = dir.join("cc_gateway").join("turns.tract");
-        let path = tract.to_str().unwrap();
-        let lost = AtomicU64::new(0);
-
-        let panicked = tokio::spawn(async { panic!("accumulator panicked") });
-        deposit_turn_when_accumulated(panicked, path, true, Some("hi".into()), &lost).await;
-        assert_eq!(lost.load(Ordering::Relaxed), 1, "panic");
-
-        let cancelled = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            Vec::new()
-        });
-        cancelled.abort();
-        deposit_turn_when_accumulated(cancelled, path, true, None, &lost).await;
-        assert_eq!(lost.load(Ordering::Relaxed), 2, "cancellation");
-
-        let not_a_turn = tokio::spawn(async { panic!("accumulator panicked") });
-        deposit_turn_when_accumulated(not_a_turn, path, false, None, &lost).await;
-        assert_eq!(lost.load(Ordering::Relaxed), 2, "a non-/v1/messages request carries no turn");
-        assert!(!tract.exists(), "a failed accumulator deposits nothing");
-
-        let finished = tokio::spawn(async { Vec::new() });
-        deposit_turn_when_accumulated(finished, path, true, Some("hi".into()), &lost).await;
-        assert_eq!(lost.load(Ordering::Relaxed), 2, "a written turn is not a loss");
-        assert!(tract.exists(), "the finished turn is deposited");
+        // Nothing to write is neither a user result nor a loss.
+        assert!(deposit_turn_at(tract_is_dir.to_str().unwrap(), None, "  ".to_string()).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn a_turn_that_never_reaches_the_deposit_is_counted_once() {
-        // #717 path (2) and #719: a failed send, an early `?`, or the handler
-        // future dropped mid-await each end proxy() before the hand-off,
-        // which used to lose the turn uncounted.  All of them drop the guard.
-        use futures_util::FutureExt;
-        let lost = AtomicU64::new(0);
-        let turn = |text: Option<&str>| UndepositedTurn {
-            user_message: text.map(str::to_string),
-            lost: &lost,
-        };
+    fn a_released_claim_is_counted_and_a_written_one_is_not() {
+        // Card 9 merge: #1173 releases the claim of a user frame that failed to
+        // write (the prompt is re-deposited by the next request of the turn);
+        // the release is named on the counts line via USER_CLAIMS_RELEASED.
+        let tracker = Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY));
+        let decision = tracker.lock().unwrap().claim_session("k".into(), [7u8; 32], 1);
+        assert!(matches!(decision, UserDeposit::Deposit(_)));
+        let before = USER_CLAIMS_RELEASED.load(Ordering::Relaxed);
+        let failed: std::io::Result<()> = Err(std::io::Error::other("disk full"));
+        assert!(settle_user_deposit(&tracker, Some(&decision), Some(&failed)));
+        assert!(USER_CLAIMS_RELEASED.load(Ordering::Relaxed) >= before + 1);
+        // The released key deposits again on its next request.
+        let again = tracker.lock().unwrap().claim_session("k".into(), [7u8; 32], 1);
+        assert!(matches!(again, UserDeposit::Deposit(_)), "released, so the prompt is not lost");
+        // A written frame releases nothing.
+        assert!(!settle_user_deposit(&tracker, Some(&again), Some(&Ok(()))));
+    }
 
-        // An early return (the failed send, or `?`) just drops the guard.
-        let early_return = |pending: UndepositedTurn| -> Result<(), ()> {
-            let _pending = pending;
-            Err(())
-        };
-        assert!(early_return(turn(Some("a human turn"))).is_err());
-        assert_eq!(lost.load(Ordering::Relaxed), 1, "early return");
+    #[test]
+    fn zero_replay_switch_is_off_unless_exactly_one() {
+        assert!(!configured_pith_zero_replay(None));
+        for off in ["", "0", "true", "yes", "on", " 2 "] {
+            assert!(!configured_pith_zero_replay(Some(off)), "{off:?}");
+        }
+        assert!(configured_pith_zero_replay(Some("1")));
+        assert!(configured_pith_zero_replay(Some(" 1 ")));
+    }
 
-        // A future parked at an await, then dropped: what hyper does to the
-        // handler on client disconnect (that part is not tested here).
-        let pending = turn(Some("a human turn"));
-        let mut parked = Box::pin(async move {
-            let _pending = pending;
-            std::future::pending::<()>().await;
-        });
-        assert!((&mut parked).now_or_never().is_none(), "parked at the await");
-        drop(parked);
-        assert_eq!(lost.load(Ordering::Relaxed), 2, "future dropped mid-await");
+    #[test]
+    fn shadow_forwards_the_original_and_live_forwards_the_composition() {
+        let original = axum::body::Bytes::from_static(b"{\"messages\":[1,2,3]}");
+        let composed = axum::body::Bytes::from_static(b"{\"messages\":[9]}");
+        assert_eq!(select_forwarded(Some(&composed), original.clone(), false), original);
+        assert_eq!(select_forwarded(Some(&composed), original.clone(), true), composed);
+        // A Pith failure has no composition: both modes forward the original.
+        assert_eq!(select_forwarded(None, original.clone(), true), original);
+        assert_eq!(select_forwarded(None, original.clone(), false), original);
+    }
 
-        // A handed-off turn is the deposit's to count, not the guard's.
-        assert_eq!(turn(Some("a human turn")).hand_off().as_deref(), Some("a human turn"));
-        drop(turn(None));
-        drop(turn(Some("  \n")));
-        assert_eq!(lost.load(Ordering::Relaxed), 2, "handed off, or no human text");
+    #[tokio::test]
+    async fn shadow_mode_forwards_original_bytes_while_pith_composes() {
+        // End to end over a real rewrite: the fake daemon answers, Pith composes
+        // a request that drops the history, and shadow mode still forwards the
+        // inbound bytes unchanged; live mode forwards the composition.
+        let sock = format!("/tmp/minitid-test-shadow-{}.sock", std::process::id());
+        let daemon = spawn_fake_daemon(sock.clone(), daemon_response("fresh context", 2));
+        let request_body = body("shadow-session", history_then_live_turn(3));
+        let inbound = serde_json::to_vec(&request_body).unwrap();
+        let rewrite = rewrite_request_body(&inbound, &headers(None), &test_sessions(), sock).await;
+        daemon.join().unwrap();
+        let composed: Option<axum::body::Bytes> = rewrite.body.map(Into::into);
+        let composed_ref = composed.as_ref().expect("Pith composed a request");
+        assert_ne!(composed_ref.as_ref(), inbound.as_slice(), "the composition differs");
+        let original = axum::body::Bytes::from(inbound.clone());
+        assert_eq!(select_forwarded(composed.as_ref(), original.clone(), false).as_ref(), inbound.as_slice());
+        assert_eq!(select_forwarded(composed.as_ref(), original, true), composed_ref.clone());
+    }
+
+    #[test]
+    fn review_dir_is_off_when_unset_or_blank() {
+        assert_eq!(configured_pith_review_dir(None), None);
+        assert_eq!(configured_pith_review_dir(Some("   ")), None);
+        assert_eq!(configured_pith_review_dir(Some(" /x/y ")).as_deref(), Some("/x/y"));
+    }
+
+    #[test]
+    fn utc_day_matches_known_dates() {
+        assert_eq!(utc_yyyymmdd(0), "19700101");
+        assert_eq!(utc_yyyymmdd(951_782_400), "20000229"); // leap day
+        assert_eq!(utc_yyyymmdd(1_793_318_399), "20261029"); // 2026-10-29 23:59:59Z
+        assert_eq!(utc_yyyymmdd(1_793_318_400), "20261030"); // 2026-10-30 00:00:00Z
+    }
+
+    #[test]
+    fn review_record_keeps_the_composition_or_the_failure_raw() {
+        let composed = serde_json::to_vec(&json!({"model": "m", "messages": [{"role": "user", "content": "x"}]})).unwrap();
+        let ok = review_record(1.5, false, "pith", 2, Some("sess"), 7, Some(&composed), None);
+        assert_eq!(ok["mode"], "shadow");
+        assert_eq!(ok["path"], "pith");
+        assert_eq!(ok["stripped"], 2);
+        assert_eq!(ok["msgs_in"], 7);
+        assert_eq!(ok["composed_messages"], json!([{"role": "user", "content": "x"}]));
+        assert!(ok["failure"].is_null());
+        let digest = ok["session_sha256"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(!digest.contains("sess"), "the session id is digested, never stored");
+
+        let why = PithFailure::new("daemon", "socket absent");
+        let bad = review_record(2.0, true, "failure", 0, None, 3, None, Some(&why));
+        assert_eq!(bad["mode"], "live");
+        assert_eq!(bad["failure"], json!({"what": "daemon", "why": "socket absent"}));
+        assert!(bad["composed_messages"].is_null());
+        assert!(bad["session_sha256"].is_null());
+    }
+
+    #[test]
+    fn review_records_append_one_line_each_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("minitid_review_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = dir.join("pith-review");
+        let d = d.to_str().unwrap();
+        write_review_record(d, 1_793_289_000, &json!({"n": 1})).unwrap();
+        write_review_record(d, 1_793_289_000, &json!({"n": 2, "text": "a\nb"})).unwrap();
+        let file = format!("{d}/pith-review-20261029.jsonl");
+        let lines: Vec<Value> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines, vec![json!({"n": 1}), json!({"n": 2, "text": "a\nb"})]);
+        let mode = |p: &str| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(d), 0o700);
+        // A record that cannot be written is an Err (proxy() counts it).
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"file").unwrap();
+        assert!(write_review_record(blocker.join("sub").to_str().unwrap(), 0, &json!({})).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3917,6 +4727,448 @@ mod tests {
         assert_eq!(result, Some("still a real question".to_string()));
     }
 
+    // ── #1173: the user prompt once per human turn ──────────────────────────
+
+    fn tracker() -> Mutex<UserDepositTracker> {
+        Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY))
+    }
+
+    /// One agentic turn: the human prompt, then `rounds` tool round trips.
+    fn agentic(prompts: &[&str], rounds: usize) -> Vec<Value> {
+        let mut m = conversation(prompts);
+        for i in 0..rounds {
+            m.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("tu_{i}"), "name": "Bash", "input": {}}]}));
+            m.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("tu_{i}"), "content": "out"}]}));
+        }
+        m
+    }
+
+    fn decide(t: &Mutex<UserDepositTracker>, b: &Value, h: &HeaderMap, now: u64) -> UserDeposit {
+        let text = last_user_message_of(b).expect("a genuine user text");
+        user_deposit_for_request(Some(b), h, &text, t, true, now, DEFAULT_USER_DEPOSIT_RECENT_WINDOW_S)
+    }
+
+    #[test]
+    fn test_user_deposit_once_per_agentic_turn() {
+        let t = tracker();
+        let h = headers(None);
+        assert!(matches!(decide(&t, &body("s1", agentic(&["fix it"], 0)), &h, 0), UserDeposit::Deposit(_)));
+        for r in 1..=12 {
+            assert_eq!(decide(&t, &body("s1", agentic(&["fix it"], r)), &h, r as u64), UserDeposit::SkipSameTurn);
+        }
+        // the next human turn deposits once, then its tool rounds skip
+        assert!(matches!(decide(&t, &body("s1", agentic(&["fix it", "now test"], 0)), &h, 20), UserDeposit::Deposit(_)));
+        assert_eq!(decide(&t, &body("s1", agentic(&["fix it", "now test"], 3)), &h, 21), UserDeposit::SkipSameTurn);
+    }
+
+    #[test]
+    fn test_user_deposit_subagent_and_session_are_separate_keys() {
+        let t = tracker();
+        let b = body("s1", agentic(&["same words"], 0));
+        assert!(matches!(decide(&t, &b, &headers(None), 0), UserDeposit::Deposit(_)));
+        assert!(matches!(decide(&t, &b, &headers(Some("agent-a")), 0), UserDeposit::Deposit(_)));
+        assert!(matches!(decide(&t, &body("s2", agentic(&["same words"], 0)), &headers(None), 0), UserDeposit::Deposit(_)));
+        assert_eq!(decide(&t, &b, &headers(Some("agent-a")), 1), UserDeposit::SkipSameTurn);
+    }
+
+    #[test]
+    fn test_user_deposit_genuine_resend_deposits_compaction_shrink_does_not() {
+        let t = tracker();
+        let h = headers(None);
+        assert!(matches!(decide(&t, &body("s1", conversation(&["a", "go"])), &h, 0), UserDeposit::Deposit(_)));
+        // the human types the same prompt again: one more genuine user message is visible
+        assert!(matches!(decide(&t, &body("s1", conversation(&["a", "go", "go"])), &h, 1), UserDeposit::Deposit(_)));
+        // history compacted: fewer messages, same latest text -> same turn
+        assert_eq!(decide(&t, &body("s1", conversation(&["go"])), &h, 2), UserDeposit::SkipSameTurn);
+    }
+
+    #[test]
+    fn test_user_deposit_without_session_uses_recent_window_sliding() {
+        let t = tracker();
+        let h = headers(None);
+        let b = json!({"messages": [{"role": "user", "content": "no identity here"}]});
+        assert!(matches!(decide(&t, &b, &h, 1_000), UserDeposit::Deposit(DepositClaim::Recent { .. })));
+        assert_eq!(decide(&t, &b, &h, 1_000 + 1_799), UserDeposit::SkipRecent);
+        // sliding: the sighting at +1799 restarts the window
+        assert_eq!(decide(&t, &b, &h, 1_000 + 1_799 + 1_799), UserDeposit::SkipRecent);
+        assert!(matches!(decide(&t, &b, &h, 1_000 + 1_799 + 1_799 + 1_800), UserDeposit::Deposit(_)));
+        let other = json!({"messages": [{"role": "user", "content": "a different text"}]});
+        assert!(matches!(decide(&t, &other, &h, 5_000), UserDeposit::Deposit(_)));
+    }
+
+    #[test]
+    fn test_user_deposit_compaction_request_uses_recent_path() {
+        let t = tracker();
+        let mut h = headers(None);
+        let b = body("s1", conversation(&["keep going"]));
+        assert!(matches!(decide(&t, &b, &h, 0), UserDeposit::Deposit(DepositClaim::Session { .. })));
+        h.insert("x-cc-compaction-request", "1".parse().unwrap());
+        // not the session path: the compaction request never consumes or advances the session mark
+        assert!(matches!(decide(&t, &b, &h, 0), UserDeposit::Deposit(DepositClaim::Recent { .. })));
+        assert_eq!(decide(&t, &b, &h, 10), UserDeposit::SkipRecent);
+        assert_eq!(decide(&t, &b, &headers(None), 11), UserDeposit::SkipSameTurn);
+    }
+
+    #[test]
+    fn test_user_deposit_release_lets_the_retry_deposit() {
+        let t = tracker();
+        let h = headers(None);
+        let b = body("s1", agentic(&["do the thing"], 0));
+        let first = decide(&t, &b, &h, 0);
+        assert!(matches!(first, UserDeposit::Deposit(_)));
+        release_user_deposit(&t, &first); // the upstream send failed: nothing written
+        let retry = decide(&t, &b, &h, 1);
+        assert!(matches!(retry, UserDeposit::Deposit(_)), "the retry must deposit the prompt");
+        assert_eq!(decide(&t, &b, &h, 2), UserDeposit::SkipSameTurn);
+        // a stale release (an older claim) never undoes a newer one
+        release_user_deposit(&t, &first);
+        assert_eq!(decide(&t, &b, &h, 3), UserDeposit::SkipSameTurn);
+        // the recent path releases too
+        let nb = json!({"messages": [{"role": "user", "content": "x"}]});
+        let c = decide(&t, &nb, &h, 100);
+        release_user_deposit(&t, &c);
+        assert!(matches!(decide(&t, &nb, &h, 101), UserDeposit::Deposit(_)));
+    }
+
+    /// #1173 law review 2026-10-24 (LAW 7): a user frame that fails to land releases the claim,
+    /// so the next tool round trip of the same turn deposits the prompt; a frame that lands keeps it.
+    #[test]
+    fn test_user_deposit_failed_append_releases_the_claim() {
+        let t = tracker();
+        let h = headers(None);
+        let b = body("s1", agentic(&["write this down"], 0));
+        let first = decide(&t, &b, &h, 0);
+        assert!(matches!(first, UserDeposit::Deposit(DepositClaim::Session { .. })));
+        // an unwritable tract path: its parent is a regular FILE, so open() fails (ENOTDIR)
+        let dir = std::env::temp_dir().join(format!("minitid_failappend_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not_a_dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad = blocker.join("turns.tract");
+        let result = deposit_turn_at(bad.to_str().unwrap(), Some("write this down".into()), "answer".into());
+        assert!(matches!(result, Some(Err(_))), "the user frame write must report its failure");
+        assert!(settle_user_deposit(&t, Some(&first), result.as_ref()), "the claim must be released");
+        // the next round trip of the SAME turn deposits the prompt (before: lost for the whole turn)
+        let retry = decide(&t, &body("s1", agentic(&["write this down"], 1)), &h, 1);
+        assert!(matches!(retry, UserDeposit::Deposit(_)), "the prompt must be retried, not lost");
+        // and it lands at a good path: the claim is kept, the following rounds skip
+        let good = dir.join("ok").join("turns.tract");
+        let ok = deposit_turn_at(good.to_str().unwrap(), Some("write this down".into()), "answer".into());
+        assert!(matches!(ok, Some(Ok(()))));
+        assert!(!settle_user_deposit(&t, Some(&retry), ok.as_ref()));
+        assert_eq!(decide(&t, &body("s1", agentic(&["write this down"], 2)), &h, 2), UserDeposit::SkipSameTurn);
+        assert!(std::fs::metadata(&good).unwrap().len() > 0, "both frames written");
+        // the recent path releases too; no user text -> nothing to settle
+        let nb = json!({"messages": [{"role": "user", "content": "no id"}]});
+        let c = decide(&t, &nb, &h, 100);
+        let r = deposit_turn_at(bad.to_str().unwrap(), Some("no id".into()), String::new());
+        assert!(settle_user_deposit(&t, Some(&c), r.as_ref()));
+        assert!(matches!(decide(&t, &nb, &h, 101), UserDeposit::Deposit(_)));
+        assert!(deposit_turn_at(bad.to_str().unwrap(), None, String::new()).is_none());
+        assert!(!settle_user_deposit(&t, None, None));
+        // untracked (switch off): nothing to release, still reported
+        let e: std::io::Result<()> = Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        assert!(!settle_user_deposit(&t, Some(&UserDeposit::Untracked), Some(&e)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_user_deposit_disabled_is_untracked_and_writes() {
+        let t = tracker();
+        let b = body("s1", agentic(&["p"], 0));
+        let d = user_deposit_for_request(Some(&b), &headers(None), "p", &t, false, 0, 1_800);
+        assert_eq!(d, UserDeposit::Untracked);
+        assert!(user_deposit_writes(&d));
+        assert!(!user_deposit_writes(&UserDeposit::SkipSameTurn));
+        assert!(!user_deposit_writes(&UserDeposit::SkipRecent));
+    }
+
+    #[test]
+    fn test_user_deposit_env_parsing() {
+        assert!(configured_user_deposit_once(None));
+        assert!(configured_user_deposit_once(Some("1")));
+        assert!(!configured_user_deposit_once(Some("0")));
+        assert!(!configured_user_deposit_once(Some(" 0 ")));
+        assert_eq!(configured_user_deposit_recent_window_s(None), 1_800);
+        assert_eq!(configured_user_deposit_recent_window_s(Some("junk")), 1_800);
+        assert_eq!(configured_user_deposit_recent_window_s(Some("0")), 1);
+        assert_eq!(configured_user_deposit_recent_window_s(Some("999999")), 86_400);
+        assert_eq!(configured_user_deposit_recent_window_s(Some("600")), 600);
+    }
+
+    #[test]
+    fn test_user_deposit_tracker_is_bounded() {
+        let t = Mutex::new(UserDepositTracker::new(16));
+        let h = headers(None);
+        for i in 0..100 {
+            let _ = decide(&t, &body(&format!("s{i}"), conversation(&["hi"])), &h, i);
+            let _ = decide(&t, &json!({"messages": [{"role": "user", "content": format!("t{i}")}]}), &h, i);
+        }
+        let g = t.lock().unwrap();
+        assert!(g.sessions.len() <= 16 && g.recent.len() <= 16);
+    }
+
+    #[test]
+    fn test_marker_advances_is_the_gate_rule() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert!(marker_advances(&a, 3, &b, 3));
+        assert!(marker_advances(&a, 3, &a, 4));
+        assert!(!marker_advances(&a, 3, &a, 3));
+        assert!(!marker_advances(&a, 3, &a, 2));
+    }
+
+    #[test]
+    fn test_user_deposit_release_survives_a_same_turn_request_in_between() {
+        // review finding 4: a same-key request that lands between the claim and the failed send only updates the
+        // count / last access; the release must still undo the claim.
+        let t = tracker();
+        let h = headers(None);
+        let first = decide(&t, &body("s1", agentic(&["p"], 0)), &h, 0);
+        assert!(matches!(first, UserDeposit::Deposit(_)));
+        assert_eq!(decide(&t, &body("s1", agentic(&["p"], 1)), &h, 1), UserDeposit::SkipSameTurn);
+        release_user_deposit(&t, &first);
+        assert!(matches!(decide(&t, &body("s1", agentic(&["p"], 2)), &h, 2), UserDeposit::Deposit(_)));
+        // the recent path: a sighting in between slides `seen` but keeps the claim id
+        let nb = json!({"messages": [{"role": "user", "content": "x"}]});
+        let c = decide(&t, &nb, &h, 100);
+        assert_eq!(decide(&t, &nb, &h, 101), UserDeposit::SkipRecent);
+        release_user_deposit(&t, &c);
+        assert!(matches!(decide(&t, &nb, &h, 102), UserDeposit::Deposit(_)));
+    }
+
+    #[test]
+    fn test_append_frame_locked_follows_a_rename_under_the_lock() {
+        // #1176: the drain holds LOCK_EX on the tract inode, renames the trimmed remainder over the tract, then
+        // unlocks. A writer that opened the OLD inode and waited on the lock must land in the NEW tract.
+        use std::os::unix::io::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("minitid_rename_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("turns.tract");
+        std::fs::write(&path, b"consumedREMAINDER").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let p2 = path.to_str().unwrap().to_string();
+        let writer = std::thread::spawn(move || append_frame_locked(&p2, b"LATE").unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!writer.is_finished(), "the append must wait for the lock");
+        let tmp = dir.join("turns.tract.trim-tmp");
+        std::fs::write(&tmp, b"REMAINDER").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+        writer.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"REMAINDERLATE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn btf_test_frame(i: u8, body: usize) -> Vec<u8> {
+        let payload: Vec<u8> = (0..body).map(|k| (k as u8) ^ i).collect();
+        let mut v = vec![0x42, 0x54, 1, 3];
+        v.extend_from_slice(&((24 + body) as u32).to_le_bytes());
+        v.extend_from_slice(&(i as f64).to_le_bytes());
+        v.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        v.extend_from_slice(&[1, 0, 0, 0]);
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    #[test]
+    fn test_append_frame_locked_repairs_a_torn_tail_once_and_keeps_its_bytes() {
+        // #1189: a crash left half a frame at the end; the restarted writer's first append cuts ONLY that tail, after
+        // copying it byte-exact to <tract>.damaged, and then appends whole frames.
+        let dir = std::env::temp_dir().join(format!("minitid_torn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("turns.tract");
+        let p = path.to_str().unwrap();
+        let good: Vec<u8> = (0..10u8).flat_map(|i| btf_test_frame(i, 200)).collect();
+        let torn = btf_test_frame(77, 200)[..90].to_vec();
+        let mut data = good.clone();
+        data.extend_from_slice(&torn);
+        std::fs::write(&path, &data).unwrap();
+        append_frame_locked(p, &btf_test_frame(11, 200)).unwrap();
+        append_frame_locked(p, &btf_test_frame(12, 200)).unwrap();
+        let mut want = good.clone();
+        want.extend(btf_test_frame(11, 200));
+        want.extend(btf_test_frame(12, 200));
+        assert_eq!(std::fs::read(&path).unwrap(), want);
+        let dmg = std::fs::read(dir.join("turns.tract.damaged")).unwrap();
+        let nl = dmg.iter().position(|&b| b == b'\n').unwrap();
+        let head = String::from_utf8_lossy(&dmg[..nl]).to_string();
+        assert!(head.starts_with(&format!("#ng-tract-damaged v1 offset={} length=90 reason=torn-tail", good.len())));
+        assert_eq!(&dmg[nl + 1..nl + 91], &torn[..]);
+        assert_eq!(dmg.len(), nl + 92);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_append_frame_locked_never_cuts_without_a_valid_anchor() {
+        let path = std::env::temp_dir().join(format!("minitid_noanchor_{}.tract", std::process::id()));
+        std::fs::write(&path, vec![0u8; 5000]).unwrap();
+        append_frame_locked(path.to_str().unwrap(), b"x").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 5001);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_append_frame_locked_plain_append_creates_and_appends() {
+        let path = std::env::temp_dir().join(format!("minitid_append_{}.tract", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        append_frame_locked(path.to_str().unwrap(), b"a").unwrap();
+        append_frame_locked(path.to_str().unwrap(), b"b").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ab");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// End to end through proxy(): a mock upstream on 127.0.0.1, HOME pointed at
+    /// a temp dir (read_upstream then falls back to the mock; never the real API),
+    /// the tract at a temp path. 1 human prompt x 6 tool round trips + a second
+    /// prompt: the tract holds each prompt ONCE and every non-empty assistant text.
+    /// A failed send releases the claim, so its retry deposits the prompt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_user_deposit_end_to_end_through_proxy() {
+        use ng_tract::read::{ReadResult, TractReader};
+        use ng_tract::TractEntry;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        static SLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        async fn upstream() -> Response<Body> {
+            if SLOW.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await; // the client gives up first
+            }
+            let n = HITS.fetch_add(1, Ordering::SeqCst);
+            let sse = format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta", "text": format!("answer {n}")}})
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
+            r
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(upstream)).await.unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("minitid_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".config/minitid")).unwrap();
+        let tract = dir.join("turns.tract");
+        std::env::set_var("HOME", &dir);
+        std::env::set_var("CC_GATEWAY_TRACT_PATH", &tract);
+        std::env::remove_var("MINITID_PITH_PENINSULA");
+        std::env::remove_var("MINITID_USER_DEPOSIT_ONCE");
+        let upstream_file = dir.join(".config/minitid/upstream");
+
+        let state = Arc::new(AppState {
+            client: Client::builder().build().unwrap(),
+            sessions: Mutex::new(SessionStore::new(DEFAULT_SESSION_CAPACITY)),
+            user_deposits: Mutex::new(UserDepositTracker::new(DEFAULT_SESSION_CAPACITY)),
+            upstream_fallback: mock.clone(),
+        });
+        async fn send(state: &Arc<AppState>, b: &Value) -> axum::http::StatusCode {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(b).unwrap()))
+                .unwrap();
+            match proxy(State(Arc::clone(state)), req).await {
+                Ok(resp) => {
+                    let st = resp.status();
+                    let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+                    st
+                }
+                Err((st, _)) => st,
+            }
+        }
+        // Card 9 merge: the card stack deposits every Pith failure raw on the same tract (#714); there is
+        // no daemon here, so every request also leaves one. This test is about the turn frames.
+        fn all_frames(path: &std::path::Path) -> Vec<String> {
+            let data = std::fs::read(path).unwrap_or_default();
+            let mut r = TractReader::new(&data);
+            let mut out = Vec::new();
+            while let Some(x) = r.next_entry() {
+                if let Ok(ReadResult::Entry(TractEntry::Experience(e))) = x {
+                    out.push(String::from_utf8_lossy(&e.content).to_string());
+                }
+            }
+            out
+        }
+        fn frames(path: &std::path::Path) -> Vec<String> {
+            all_frames(path)
+                .into_iter()
+                .filter(|c| !c.starts_with("miniTID Pith peninsula failed: "))
+                .collect()
+        }
+        async fn settle(path: &std::path::Path, want: usize) -> Vec<String> {
+            for _ in 0..200 {
+                let f = frames(path);
+                if f.len() >= want {
+                    return f;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            frames(path)
+        }
+
+        // 1) a failed send (closed port) first: nothing written, the claim released
+        std::fs::write(&upstream_file, "http://127.0.0.1:9").unwrap();
+        assert_eq!(send(&state, &body("e2e", agentic(&["first prompt"], 0))).await,
+                   axum::http::StatusCode::BAD_GATEWAY);
+        std::fs::remove_file(&upstream_file).unwrap(); // back to the mock (fallback)
+        // 1b) the client goes away while the upstream is still thinking: axum drops proxy()'s future (here: the
+        //     timeout drops it). The claim must be released by the guard (review finding 1).
+        SLOW.store(true, Ordering::SeqCst);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body("e2e", agentic(&["first prompt"], 0))).unwrap()))
+            .unwrap();
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            proxy(State(Arc::clone(&state)), req),
+        )
+        .await;
+        assert!(dropped.is_err(), "the request must still be pending when the client gives up");
+        SLOW.store(false, Ordering::SeqCst);
+        assert!(frames(&tract).is_empty());
+        // 2) the retry and 6 tool round trips of the same human turn
+        let mut want = 0;
+        for r in 0..=6 {
+            assert!(send(&state, &body("e2e", agentic(&["first prompt"], r))).await.is_success());
+            want += if r == 0 { 2 } else { 1 };
+            settle(&tract, want).await;
+        }
+        // 3) the next human turn and 2 round trips
+        for r in 0..=2 {
+            assert!(send(&state, &body("e2e", agentic(&["first prompt", "second prompt"], r))).await.is_success());
+            want += if r == 0 { 2 } else { 1 };
+            settle(&tract, want).await;
+        }
+        let f = settle(&tract, want).await;
+        assert_eq!(f.iter().filter(|c| *c == "first prompt").count(), 1, "{f:?}");
+        assert_eq!(f.iter().filter(|c| *c == "second prompt").count(), 1, "{f:?}");
+        assert_eq!(f.iter().filter(|c| c.starts_with("answer ")).count(), 10, "{f:?}");
+        assert_eq!(f.len(), 12, "{f:?}");
+        assert!(
+            all_frames(&tract).iter().any(|c| c.starts_with("miniTID Pith peninsula failed: ")),
+            "the Pith failures (no daemon) are deposited raw alongside the turn"
+        );
+        // the prompt precedes its turn's first answer
+        let p1 = f.iter().position(|c| c == "first prompt").unwrap();
+        assert_eq!(p1, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_deposit_turn_writes_two_experience_entries() {
         use ng_tract::read::{ReadResult, TractReader};
@@ -3926,11 +5178,12 @@ mod tests {
             std::env::temp_dir().join(format!("minitid_test_tract_{}.tract", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
-        deposit_turn(
+        deposit_turn_at(
             tmp.to_str().unwrap(),
             Some("what is the numpy issue".to_string()),
             "it's a stray .pth file".to_string(),
         )
+        .expect("a user frame was attempted")
         .expect("both entries are written");
 
         let data = std::fs::read(&tmp).expect("tract file should exist");

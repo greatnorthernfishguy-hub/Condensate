@@ -32,6 +32,8 @@ sha2        = { version = "0.10",                                     optional =
 ng_tract    = { path = "vendor/ng_tract", default-features = false, optional = true }
 futures-util = { version = "0.3", optional = true }
 tokio-stream = { version = "0.1", optional = true }
+# [2026-10-25] #1189: miniTID validates BTF frames (CRC32) for its torn-tail repair.
+crc32fast   = { version = "1", optional = true }
 
 [features]
 # Default: preload-only (no PyO3). This is the LD_PRELOAD membrane build.
@@ -46,7 +48,7 @@ tokio-stream = { version = "0.1", optional = true }
 default = []
 python = ["pyo3"]
 preload = []
-minitid = ["dep:tokio", "dep:axum", "dep:reqwest", "dep:serde_json", "dep:sha2", "dep:ng_tract", "dep:futures-util", "dep:tokio-stream"]
+minitid = ["dep:tokio", "dep:axum", "dep:reqwest", "dep:serde_json", "dep:sha2", "dep:ng_tract", "dep:futures-util", "dep:tokio-stream", "dep:crc32fast"]
 
 [profile.release]
 opt-level = 3
