@@ -44,6 +44,18 @@
 //       turn_deposits_lost=; G3 loss counters injectable (LossCounters, await_accumulator) with exact
 //       tests, incl. real panicked/cancelled accumulators; G5 the e2e test also clears
 //       MINITID_PENINSULA_SOCK. G2/G4 were already fixed by LE F2/F6. 103 passed, 0 failed (x3).
+//       NON-BLOCKING SHADOW (Josh 2026-10-29 "Yes to all 3", after the :9091 canary found every Pith call
+//       timing out -- #1201: miniTID's 1.5 s read / 2 s cap vs the daemon's 5 s graph_busy lock wait):
+//       pith_pass() is the per-request Pith work (rewrite, raw failure deposit, review record, counts line);
+//       live mode awaits it with the unchanged live limits (PithDaemon::from(sock): 1.5 s read, 2 s total);
+//       shadow mode forwards the original bytes AT ONCE and runs it in the background (shadow_pith) with
+//       MINITID_PITH_SHADOW_TIMEOUT_MS (LAW 5, default 15000, clamped 1000-120000), single-flight
+//       (SHADOW_IN_FLIGHT / ShadowSlot): a request arriving while one runs is skipped -- counted
+//       (`shadow_skipped=`), logged, and recorded under #433 as path "shadow_skipped" -- never queued on the
+//       daemon's lock (the 2026-10-04 66-request pile-up). A not-fresh daemon answer now names the daemon's
+//       state and warnings (not_fresh_reason: e.g. state=unavailable warnings=graph_busy). Second canary
+//       (:9091, 3 turns / 5 requests): shadow, records written, each failure now the daemon's own answer.
+//       107 passed, 0 failed (x3).
 // [2026-09-29] Z2 zone manager (Claude Opus 5.5, Claude Code) — Card 7b:
 //   a turn miniTID read but could not deposit is counted and named
 //   (#717, #719)
@@ -949,18 +961,63 @@ fn peninsula_sock_path() -> String {
     })
 }
 
+/// Card 9: where and how long to ask the daemon.  A bare socket path converts
+/// to the live limits (1.5 s per read, 2 s overall) -- unchanged since the
+/// stack -- so a live request never waits longer on Pith.  Shadow mode, which
+/// nothing waits on, uses shadow() with MINITID_PITH_SHADOW_TIMEOUT_MS.
+#[derive(Clone, Debug)]
+struct PithDaemon {
+    sock: String,
+    read: std::time::Duration,
+    total: std::time::Duration,
+}
+
+impl From<String> for PithDaemon {
+    fn from(sock: String) -> Self {
+        Self {
+            sock,
+            read: std::time::Duration::from_millis(1500),
+            total: std::time::Duration::from_millis(2000),
+        }
+    }
+}
+
+impl PithDaemon {
+    fn shadow(sock: String, total_ms: u64) -> Self {
+        let total = std::time::Duration::from_millis(total_ms);
+        Self { sock, read: total, total }
+    }
+}
+
+const DEFAULT_PITH_SHADOW_TIMEOUT_MS: u64 = 15_000;
+
+/// MINITID_PITH_SHADOW_TIMEOUT_MS (LAW 5): how long a background shadow Pith
+/// call may wait for the daemon (whose own graph-lock wait is
+/// CC_NG_PROVIDER_LOCK_WAIT_S, default 5 s).  Default 15 s, clamped 1-120 s.
+fn pith_shadow_timeout_ms() -> u64 {
+    configured_pith_shadow_timeout_ms(env::var("MINITID_PITH_SHADOW_TIMEOUT_MS").ok().as_deref())
+}
+
+fn configured_pith_shadow_timeout_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(1_000, 120_000))
+        .unwrap_or(DEFAULT_PITH_SHADOW_TIMEOUT_MS)
+}
+
 /// Call the CC daemon's read-only `provider_context` handler.  The request
 /// carries the current instruction as its only cue; it never sends
 /// transcript history.  Accept only the producer's closed fresh states.
 /// `Err` says why, for the raw failure deposit.
 async fn daemon_provider_context(
     current_instruction: String,
-    sock: String,
+    daemon: impl Into<PithDaemon>,
 ) -> Result<String, String> {
+    let PithDaemon { sock, read, total } = daemon.into();
     let fut = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let mut stream = UnixStream::connect(&sock)
             .map_err(|e| format!("daemon socket unavailable: {e}"))?;
-        let t = std::time::Duration::from_millis(1500);
+        let t = read;
         stream
             .set_read_timeout(Some(t))
             .map_err(|e| format!("daemon socket setup failed: {e}"))?;
@@ -996,14 +1053,30 @@ async fn daemon_provider_context(
         if buf.last() != Some(&b'\n') {
             return Err("daemon closed without a complete response line".to_string());
         }
-        parse_provider_response(&buf)
-            .ok_or_else(|| "daemon response was not a fresh provider_context envelope".to_string())
+        parse_provider_response(&buf).ok_or_else(|| not_fresh_reason(&buf))
     });
-    match tokio::time::timeout(std::time::Duration::from_millis(2000), fut).await {
+    match tokio::time::timeout(total, fut).await {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => Err(format!("daemon worker failed: {e}")),
-        Err(_) => Err("daemon did not answer within 2000 ms".to_string()),
+        Err(_) => Err(format!("daemon did not answer within {} ms", total.as_millis())),
     }
+}
+
+/// Card 9: why a daemon answer was not a fresh context, naming the daemon's own
+/// closed state and warnings (e.g. `state=unavailable warnings=graph_busy`, #1201)
+/// so the review record and the raw failure deposit say what the daemon said.
+fn not_fresh_reason(buf: &[u8]) -> String {
+    let base = "daemon response was not a fresh provider_context envelope";
+    let Ok(v) = serde_json::from_slice::<Value>(buf) else {
+        return format!("{base} (unparsable)");
+    };
+    let state = v.get("state").and_then(Value::as_str).unwrap_or("?");
+    let warnings = v
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|w| w.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    format!("{base}: state={state} warnings={warnings}")
 }
 
 fn provider_context_request(current_instruction: &str) -> Value {
@@ -1466,7 +1539,7 @@ fn pith_failure_outcome(
 async fn apply_pith_peninsula(
     messages: &[Value],
     decision: GateDecision,
-    sock: String,
+    sock: PithDaemon,
 ) -> PithOutcome {
     let Some(current_instruction) = messages.iter().rev().find_map(genuine_user_text) else {
         return pith_failure_outcome(
@@ -2481,8 +2554,9 @@ async fn rewrite_request_body(
     body_bytes: &[u8],
     headers: &HeaderMap,
     sessions: &Mutex<SessionStore>,
-    sock: String,
+    sock: impl Into<PithDaemon>,
 ) -> PithRewrite {
+    let sock: PithDaemon = sock.into();
     let mut body = match serde_json::from_slice::<Value>(body_bytes) {
         Ok(body) => body,
         Err(err) => {
@@ -2609,6 +2683,148 @@ fn request_counts_line(
     )
 }
 
+/// Card 9: one Pith pass over a /v1/messages request -- rewrite, raw failure
+/// deposit, #433 review record and counts line (the last two off the response
+/// path).  Returns the bytes to forward (select_forwarded).
+async fn pith_pass(
+    state: Arc<AppState>,
+    body_bytes: axum::body::Bytes,
+    headers: HeaderMap,
+    zero_replay: bool,
+    daemon: PithDaemon,
+) -> axum::body::Bytes {
+    let rewrite =
+        rewrite_request_body(&body_bytes, &headers, &state.sessions, daemon)
+            .await;
+    let path = request_path_class(&rewrite);
+    let stripped = rewrite.stripped;
+    let review_dir = pith_review_dir();
+    let review_session = review_dir.as_ref().and_then(|_| {
+        serde_json::from_slice::<Value>(&body_bytes)
+            .ok()
+            .and_then(|b| session_key(&b, &headers))
+    });
+    let failure_for_review = rewrite
+        .failure
+        .as_ref()
+        .map(|f| PithFailure::new(f.what, f.why.clone()));
+    if let Some(failure) = rewrite.failure {
+        tokio::spawn(async move {
+            count_lost_deposit(
+                deposit_pith_failure(&cc_gateway_tract_path(), &failure),
+                &FAILURE_DEPOSITS_LOST,
+            );
+        });
+    }
+    let original = body_bytes.clone();
+    let composed: Option<axum::body::Bytes> = rewrite.body.map(Into::into);
+    let pith_bytes = composed.as_ref().map_or(0, |c| c.len());
+    let forwarded = select_forwarded(composed.as_ref(), body_bytes, zero_replay);
+    let counted = forwarded.clone();
+    tokio::spawn(async move {
+        let deposits_lost = (
+            FAILURE_DEPOSITS_LOST.load(Ordering::Relaxed),
+            TURN_DEPOSITS_LOST.load(Ordering::Relaxed),
+        );
+        if let Some(dir) = review_dir {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let msgs_in = serde_json::from_slice::<Value>(&original)
+                .ok()
+                .and_then(|b| b["messages"].as_array().map(Vec::len))
+                .unwrap_or(0);
+            let record = review_record(
+                now.as_secs_f64(),
+                zero_replay,
+                path,
+                stripped,
+                review_session.as_deref(),
+                msgs_in,
+                composed.as_deref(),
+                failure_for_review.as_ref(),
+            );
+            let written = tokio::task::spawn_blocking(move || {
+                write_review_record(&dir, now.as_secs(), &record)
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+            count_lost_deposit(written, &REVIEW_RECORDS_LOST);
+        }
+        eprintln!(
+            "{} mode={} pith_bytes={pith_bytes} released={} review_lost={} shadow_skipped={}",
+            request_counts_line(path, stripped, &original, &counted, deposits_lost),
+            if zero_replay { "live" } else { "shadow" },
+            USER_CLAIMS_RELEASED.load(Ordering::Relaxed),
+            REVIEW_RECORDS_LOST.load(Ordering::Relaxed),
+            SHADOW_SKIPPED.load(Ordering::Relaxed),
+        );
+    });
+    forwarded
+}
+
+/// Shadow Pith calls in flight (at most one): a request arriving while one runs
+/// is recorded as skipped instead of queueing on the daemon's graph lock (the
+/// 2026-10-04 SIGUSR1 dump: 66 queued provider_context requests starved autosave).
+static SHADOW_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Shadow requests not run because one was already in flight (counts line `shadow_skipped=`).
+static SHADOW_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Clears SHADOW_IN_FLIGHT when the background pass ends, however it ends.
+struct ShadowSlot;
+
+impl Drop for ShadowSlot {
+    fn drop(&mut self) {
+        SHADOW_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Take the single shadow slot, or None when a shadow pass is already running.
+fn try_shadow_slot() -> Option<ShadowSlot> {
+    SHADOW_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| ShadowSlot)
+}
+
+/// Card 9 shadow mode: run pith_pass in the background with the shadow
+/// timeout; the caller has already forwarded the original bytes.  A skipped
+/// request is counted, logged on a counts line and (under #433) recorded.
+fn shadow_pith(state: Arc<AppState>, body_bytes: axum::body::Bytes, headers: HeaderMap) {
+    let Some(slot) = try_shadow_slot() else {
+        let skipped = SHADOW_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        tokio::spawn(async move {
+            if let Some(dir) = pith_review_dir() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let original = serde_json::from_slice::<Value>(&body_bytes).ok();
+                let msgs_in = original
+                    .as_ref()
+                    .and_then(|b| b["messages"].as_array().map(Vec::len))
+                    .unwrap_or(0);
+                let session = original.as_ref().and_then(|b| session_key(b, &headers));
+                let why = PithFailure::new("shadow", "a previous shadow Pith call was still in flight");
+                let record = review_record(
+                    now.as_secs_f64(), false, "shadow_skipped", 0, session.as_deref(), msgs_in, None, Some(&why),
+                );
+                let written = tokio::task::spawn_blocking(move || write_review_record(&dir, now.as_secs(), &record))
+                    .await
+                    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+                count_lost_deposit(written, &REVIEW_RECORDS_LOST);
+            }
+            eprintln!("miniTID request path=shadow_skipped mode=shadow shadow_skipped={skipped}");
+        });
+        return;
+    };
+    let daemon = PithDaemon::shadow(peninsula_sock_path(), pith_shadow_timeout_ms());
+    tokio::spawn(async move {
+        let _slot = slot;
+        pith_pass(state, body_bytes, headers, false, daemon).await;
+    });
+}
+
 // ── Proxy handler ────────────────────────────────────────────────────────────
 
 async fn proxy(
@@ -2659,83 +2875,29 @@ async fn proxy(
     let mut user_deposit = UserDepositGuard { state: Arc::clone(&state), decision: user_deposit };
     let deposit_state = Arc::clone(&state); // #1173: settle_user_deposit releases through it after a failed append
 
-    // Every /v1/messages request goes through Pith.  Card 9: what is FORWARDED
-    // is the zero-replay switch's call (pith_zero_replay): on, Pith's composed
-    // request; off (the default), the original bytes, byte-for-byte, with Pith
-    // still run so its output is counted and, under #433, kept for review.
-    // Claude's native summary request is the one deliberate exemption: it
-    // reaches the provider byte-for-byte and consumes no human-turn gate
-    // decision.  A Pith failure is deposited raw off the response path, and
-    // the per-request counts line and review record are built off it too.
+    // Every /v1/messages request goes through Pith (pith_pass).  Card 9: the
+    // zero-replay switch decides what is FORWARDED and whether the request
+    // waits.  On: the request waits (live limits, 2 s) and Pith's composition is
+    // forwarded when it composed one.  Off (the default, shadow): the original
+    // bytes are forwarded at once, byte-for-byte, and Pith runs in the
+    // background (shadow_pith), single-flight, so its output is still counted
+    // and, under #433, kept for review -- no request waits on it.  Claude's
+    // native summary request is the one deliberate exemption: it reaches the
+    // provider byte-for-byte and consumes no human-turn gate decision.
     let body_bytes = if is_messages {
-        let zero_replay = pith_zero_replay();
-        let rewrite =
-            rewrite_request_body(&body_bytes, &headers, &state.sessions, peninsula_sock_path())
-                .await;
-        let path = request_path_class(&rewrite);
-        let stripped = rewrite.stripped;
-        let review_dir = pith_review_dir();
-        let review_session = review_dir.as_ref().and_then(|_| {
-            serde_json::from_slice::<Value>(&body_bytes)
-                .ok()
-                .and_then(|b| session_key(&b, &headers))
-        });
-        let failure_for_review = rewrite
-            .failure
-            .as_ref()
-            .map(|f| PithFailure::new(f.what, f.why.clone()));
-        if let Some(failure) = rewrite.failure {
-            tokio::spawn(async move {
-                count_lost_deposit(
-                    deposit_pith_failure(&cc_gateway_tract_path(), &failure),
-                    &FAILURE_DEPOSITS_LOST,
-                );
-            });
+        if pith_zero_replay() {
+            pith_pass(
+                Arc::clone(&state),
+                body_bytes,
+                headers.clone(),
+                true,
+                PithDaemon::from(peninsula_sock_path()),
+            )
+            .await
+        } else {
+            shadow_pith(Arc::clone(&state), body_bytes.clone(), headers.clone());
+            body_bytes
         }
-        let original = body_bytes.clone();
-        let composed: Option<axum::body::Bytes> = rewrite.body.map(Into::into);
-        let pith_bytes = composed.as_ref().map_or(0, |c| c.len());
-        let forwarded = select_forwarded(composed.as_ref(), body_bytes, zero_replay);
-        let counted = forwarded.clone();
-        tokio::spawn(async move {
-            let deposits_lost = (
-                FAILURE_DEPOSITS_LOST.load(Ordering::Relaxed),
-                TURN_DEPOSITS_LOST.load(Ordering::Relaxed),
-            );
-            if let Some(dir) = review_dir {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                let msgs_in = serde_json::from_slice::<Value>(&original)
-                    .ok()
-                    .and_then(|b| b["messages"].as_array().map(Vec::len))
-                    .unwrap_or(0);
-                let record = review_record(
-                    now.as_secs_f64(),
-                    zero_replay,
-                    path,
-                    stripped,
-                    review_session.as_deref(),
-                    msgs_in,
-                    composed.as_deref(),
-                    failure_for_review.as_ref(),
-                );
-                let written = tokio::task::spawn_blocking(move || {
-                    write_review_record(&dir, now.as_secs(), &record)
-                })
-                .await
-                .unwrap_or_else(|e| Err(std::io::Error::other(e)));
-                count_lost_deposit(written, &REVIEW_RECORDS_LOST);
-            }
-            eprintln!(
-                "{} mode={} pith_bytes={pith_bytes} released={} review_lost={}",
-                request_counts_line(path, stripped, &original, &counted, deposits_lost),
-                if zero_replay { "live" } else { "shadow" },
-                USER_CLAIMS_RELEASED.load(Ordering::Relaxed),
-                REVIEW_RECORDS_LOST.load(Ordering::Relaxed),
-            );
-        });
-        forwarded
     } else {
         body_bytes
     };
@@ -4640,6 +4802,76 @@ mod tests {
         let failed: std::io::Result<()> = Err(std::io::Error::other("disk full"));
         assert!(!settle_user_deposit_counted(&tracker, Some(&UserDeposit::Untracked), Some(&failed), &c));
         assert_eq!((released.load(Ordering::Relaxed), lost.load(Ordering::Relaxed)), (0, 1));
+    }
+
+    #[test]
+    fn a_not_fresh_answer_names_the_daemons_state_and_warnings() {
+        let busy = br#"{"ok":false,"state":"unavailable","warnings":["graph_busy"],"assemblies":0}"#;
+        assert_eq!(
+            not_fresh_reason(busy),
+            "daemon response was not a fresh provider_context envelope: state=unavailable warnings=graph_busy"
+        );
+        assert!(not_fresh_reason(b"nope").ends_with("(unparsable)"));
+        assert!(not_fresh_reason(br#"{"ok":false}"#).ends_with("state=? warnings="));
+    }
+
+    #[test]
+    fn live_limits_are_unchanged_and_shadow_uses_its_own() {
+        let live = PithDaemon::from("/x.sock".to_string());
+        assert_eq!((live.read.as_millis(), live.total.as_millis()), (1500, 2000));
+        let shadow = PithDaemon::shadow("/x.sock".to_string(), 15_000);
+        assert_eq!((shadow.read.as_millis(), shadow.total.as_millis()), (15_000, 15_000));
+        assert_eq!(configured_pith_shadow_timeout_ms(None), 15_000);
+        assert_eq!(configured_pith_shadow_timeout_ms(Some("x")), 15_000);
+        assert_eq!(configured_pith_shadow_timeout_ms(Some("10")), 1_000, "clamped up");
+        assert_eq!(configured_pith_shadow_timeout_ms(Some("999999")), 120_000, "clamped down");
+        assert_eq!(configured_pith_shadow_timeout_ms(Some(" 30000 ")), 30_000);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_never_answers_is_cut_off_at_the_given_limit() {
+        // The 2026-10-29 canary: the daemon held the request past miniTID's limit.
+        // The limit must be the one passed in, live or shadow.
+        use std::os::unix::net::UnixListener;
+        let sock = format!("/tmp/minitid-test-silent-{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let hold = std::thread::spawn(move || {
+            let held = listener.accept().map(|(s, _)| s);
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            drop(held);
+        });
+        let daemon = PithDaemon {
+            sock: sock.clone(),
+            read: std::time::Duration::from_millis(5_000),
+            total: std::time::Duration::from_millis(300),
+        };
+        let t = std::time::Instant::now();
+        let err = daemon_provider_context("hi".into(), daemon).await.unwrap_err();
+        assert!(t.elapsed() < std::time::Duration::from_millis(1_000), "{:?}", t.elapsed());
+        assert_eq!(err, "daemon did not answer within 300 ms");
+        hold.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn one_shadow_pass_at_a_time() {
+        // Other tests' proxy() calls run shadow passes too; wait for a free slot.
+        let slot = (0..500)
+            .find_map(|_| try_shadow_slot().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                None
+            }))
+            .expect("the slot frees");
+        assert!(try_shadow_slot().is_none(), "a second pass is refused while one runs");
+        drop(slot);
+        assert!(
+            (0..500).any(|_| try_shadow_slot().map(drop).is_some() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }),
+            "dropping the slot frees it"
+        );
     }
 
     #[test]
